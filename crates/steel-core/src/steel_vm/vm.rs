@@ -654,14 +654,12 @@ impl Synchronizer {
                             }
 
                             for frame in &live_ctx.stack_frames {
-                                for value in frame.function.captures() {
-                                    context.push_back(value.clone());
-                                }
+                                context.push_back(SteelVal::Closure(frame.function.clone()));
                             }
 
-                            for value in live_ctx.current_frame.function.captures() {
-                                context.push_back(value.clone());
-                            }
+                            context.push_back(SteelVal::Closure(
+                                live_ctx.current_frame.function.clone(),
+                            ));
 
                             for value in &live_ctx.thread_local_storage {
                                 context.push_back(value.clone());
@@ -682,15 +680,14 @@ impl Synchronizer {
                                             }
 
                                             for frame in &live_ctx.stack_frames {
-                                                for value in frame.function.captures() {
-                                                    context.push_back(value.clone());
-                                                }
+                                                context.push_back(SteelVal::Closure(
+                                                    frame.function.clone(),
+                                                ));
                                             }
 
-                                            for value in live_ctx.current_frame.function.captures()
-                                            {
-                                                context.push_back(value.clone());
-                                            }
+                                            context.push_back(SteelVal::Closure(
+                                                live_ctx.current_frame.function.clone(),
+                                            ));
 
                                             for value in &live_ctx.thread_local_storage {
                                                 context.push_back(value.clone());
@@ -968,6 +965,7 @@ impl SteelThread {
         // dbg!(&self.stack_frames);
         // dbg!(&self.current_frame);
 
+        let mut result_roots = Vec::with_capacity(instructions.len());
         let result = instructions
             .iter()
             .zip(spans.iter())
@@ -977,6 +975,10 @@ impl SteelThread {
                     constant_map.clone(),
                     Shared::clone(x.1),
                 )
+                .map(|value| {
+                    result_roots.push(value.mark_rooted());
+                    value
+                })
             })
             .collect();
 
