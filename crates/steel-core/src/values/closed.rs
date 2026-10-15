@@ -2140,7 +2140,7 @@ impl Heap {
                     queue.push(pointer);
                 }
             }
-            let mut local_queue = Vec::new();
+            let mut local_queue = Vec::with_capacity(4096);
             let mut marker = MarkAndSweepContextRefQueue {
                 queue: &queue,
                 local_queue: &mut local_queue,
