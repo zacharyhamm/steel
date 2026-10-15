@@ -2216,8 +2216,8 @@ where
         }
     }
 
-    // Since we've converted it, we should turn it into a lambda
-    syn.ty = TokenType::Lambda;
+    // Preserve the let origin so lowering does not introduce a return boundary.
+    syn.ty = TokenType::Let;
 
     let mut function: ThinVec<ExprKind> =
         thin_vec![LambdaFunction::new(arguments, body, syn).into()];

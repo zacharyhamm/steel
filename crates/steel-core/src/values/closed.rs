@@ -559,13 +559,68 @@ pub struct WillExecutor {
     // * Value is a weak reference: then you use weak references
     // * value is contained within _other_ will executors, so the will executors need to have references to
     //   each other to check if ther value is contained within other ones.
-    values: Mutex<Vec<Option<Pair>>>,
+    values: Mutex<Vec<Option<PendingWill>>>,
 
     // The incoming queue. We'll drain on this when the reified buffer of values
     // is empty since we need to scan the values to find the right one.
-    incoming: Receiver<Pair>,
+    incoming: Receiver<PendingWill>,
 
-    sender: Sender<Pair>,
+    sender: Sender<PendingWill>,
+}
+
+#[cfg(feature = "sync")]
+struct PendingWill {
+    pair: Pair,
+    ready: bool,
+}
+
+#[cfg(feature = "sync")]
+impl PendingWill {
+    fn is_unreachable(&self) -> bool {
+        match self.pair.car_ref() {
+            SteelVal::Closure(gc) => Gc::strong_count(gc) == 1,
+            SteelVal::VectorV(steel_vector) => Gc::strong_count(&steel_vector.0) == 1,
+            SteelVal::StringV(steel_string) => Gc::strong_count(&steel_string.0) == 1,
+            SteelVal::SymbolV(steel_string) => Gc::strong_count(&steel_string.0) == 1,
+            SteelVal::Custom(gc) => Gc::strong_count(gc) == 1,
+            SteelVal::HashMapV(steel_hash_map) => Gc::strong_count(&steel_hash_map.0) == 1,
+            SteelVal::HashSetV(steel_hash_set) => Gc::strong_count(&steel_hash_set.0) == 1,
+            SteelVal::CustomStruct(gc) => Gc::strong_count(gc) == 1,
+            SteelVal::PortV(steel_port) => Gc::strong_count(&steel_port.port) == 1,
+            SteelVal::IterV(gc) => Gc::strong_count(gc) == 1,
+            SteelVal::ReducerV(gc) => Gc::strong_count(gc) == 1,
+            SteelVal::FutureV(gc) => Gc::strong_count(gc) == 1,
+            SteelVal::StreamV(gc) => Gc::strong_count(gc) == 1,
+            SteelVal::BoxedFunction(gc) => Gc::strong_count(gc) == 1,
+            SteelVal::ContinuationFunction(continuation) => {
+                StandardShared::strong_count(&continuation.inner) == 1
+            }
+            SteelVal::ListV(generic_list) => generic_list.strong_count() == 1,
+            SteelVal::Pair(gc) => Gc::strong_count(gc) == 1,
+
+            // In theory, if this is a weak value, this can be the thing to check
+            // the values.
+            SteelVal::MutableVector(heap_ref) => {
+                WeakShared::weak_count(&heap_ref.inner) == 1
+                    || !heap_ref.inner.upgrade().unwrap().read().is_reachable()
+            }
+            SteelVal::BoxedIterator(gc) => Gc::strong_count(gc) == 1,
+            SteelVal::SyntaxObject(gc) => Gc::strong_count(gc) == 1,
+            SteelVal::Boxed(gc) => Gc::strong_count(gc) == 1,
+            SteelVal::HeapAllocated(heap_ref) => {
+                WeakShared::weak_count(&heap_ref.inner) == 1
+                    || !heap_ref.inner.upgrade().unwrap().read().is_reachable()
+            }
+            SteelVal::Reference(gc) => Gc::strong_count(gc) == 1,
+            SteelVal::BigNum(gc) => Gc::strong_count(gc) == 1,
+            SteelVal::BigRational(gc) => Gc::strong_count(gc) == 1,
+            SteelVal::Complex(gc) => Gc::strong_count(gc) == 1,
+            SteelVal::ByteVector(steel_byte_vector) => {
+                Gc::strong_count(&steel_byte_vector.vec) == 1
+            }
+            _ => false,
+        }
+    }
 }
 
 #[cfg(not(feature = "sync"))]
@@ -620,53 +675,8 @@ impl WillExecutor {
         // Periodically run a compaction on this
         for pair_slot in guard.iter_mut() {
             if let Some(value) = pair_slot {
-                let is_sole_reference = match value.car_ref() {
-                    SteelVal::Closure(gc) => Gc::strong_count(gc) == 1,
-                    SteelVal::VectorV(steel_vector) => Gc::strong_count(&steel_vector.0) == 1,
-                    SteelVal::StringV(steel_string) => Gc::strong_count(&steel_string.0) == 1,
-                    SteelVal::SymbolV(steel_string) => Gc::strong_count(&steel_string.0) == 1,
-                    SteelVal::Custom(gc) => Gc::strong_count(gc) == 1,
-                    SteelVal::HashMapV(steel_hash_map) => Gc::strong_count(&steel_hash_map.0) == 1,
-                    SteelVal::HashSetV(steel_hash_set) => Gc::strong_count(&steel_hash_set.0) == 1,
-                    SteelVal::CustomStruct(gc) => Gc::strong_count(gc) == 1,
-                    SteelVal::PortV(steel_port) => Gc::strong_count(&steel_port.port) == 1,
-                    SteelVal::IterV(gc) => Gc::strong_count(gc) == 1,
-                    SteelVal::ReducerV(gc) => Gc::strong_count(gc) == 1,
-                    SteelVal::FutureV(gc) => Gc::strong_count(gc) == 1,
-                    SteelVal::StreamV(gc) => Gc::strong_count(gc) == 1,
-                    SteelVal::BoxedFunction(gc) => Gc::strong_count(gc) == 1,
-                    SteelVal::ContinuationFunction(continuation) => {
-                        StandardShared::strong_count(&continuation.inner) == 1
-                    }
-                    SteelVal::ListV(generic_list) => generic_list.strong_count() == 1,
-                    SteelVal::Pair(gc) => Gc::strong_count(gc) == 1,
-
-                    // In theory, if this is a weak value, this can be the thing to check
-                    // the values.
-                    SteelVal::MutableVector(heap_ref) => {
-                        WeakShared::weak_count(&heap_ref.inner) == 1
-                            || !heap_ref.inner.upgrade().unwrap().read().is_reachable()
-                    }
-                    SteelVal::BoxedIterator(gc) => Gc::strong_count(gc) == 1,
-                    SteelVal::SyntaxObject(gc) => Gc::strong_count(gc) == 1,
-                    SteelVal::Boxed(gc) => Gc::strong_count(gc) == 1,
-                    SteelVal::HeapAllocated(heap_ref) => {
-                        WeakShared::weak_count(&heap_ref.inner) == 1
-                            || !heap_ref.inner.upgrade().unwrap().read().is_reachable()
-                    }
-                    SteelVal::Reference(gc) => Gc::strong_count(gc) == 1,
-                    SteelVal::BigNum(gc) => Gc::strong_count(gc) == 1,
-                    SteelVal::BigRational(gc) => Gc::strong_count(gc) == 1,
-                    SteelVal::Complex(gc) => Gc::strong_count(gc) == 1,
-                    SteelVal::ByteVector(steel_byte_vector) => {
-                        Gc::strong_count(&steel_byte_vector.vec) == 1
-                    }
-                    _ => false,
-                };
-
-                if is_sole_reference {
-                    let value = core::mem::take(pair_slot).unwrap();
-                    return Some(value);
+                if value.ready || value.is_unreachable() {
+                    return Some(pair_slot.take().unwrap().pair);
                 }
             }
         }
@@ -684,9 +694,12 @@ impl WillExecutor {
         }
 
         self.sender
-            .send(Pair {
-                car: key,
-                cdr: func,
+            .send(PendingWill {
+                pair: Pair {
+                    car: key,
+                    cdr: func,
+                },
+                ready: false,
             })
             .unwrap();
 
@@ -695,6 +708,16 @@ impl WillExecutor {
 }
 
 impl Custom for WillExecutor {
+    #[cfg(feature = "sync")]
+    fn gc_visit_children(&self, context: &mut MarkAndSweepContext) {
+        let mut values = self.values.lock().unwrap();
+        values.extend(self.incoming.try_iter().map(Some));
+        for pending in values.iter().flatten() {
+            context.push_back(pending.pair.car());
+            context.push_back(pending.pair.cdr());
+        }
+    }
+
     fn into_serializable_steelval(&mut self) -> Option<crate::rvals::SerializableSteelVal> {
         Some(crate::rvals::SerializableSteelVal::Void)
     }
@@ -1000,6 +1023,7 @@ fn parallel_mark_counts_each_slot_exactly_once() {
                     local_queue: &mut local_queue,
                     queue: &queue,
                     stats: MarkAndSweepStats::default(),
+                    will_executors: Vec::new(),
                 };
 
                 barrier.wait();
@@ -1138,9 +1162,6 @@ impl<T: HeapAble + Sync + Send + 'static> FreeList<T> {
         // Allocate into this field
         let mut heap_guard = guard.write();
 
-        // TODO: If the guard is registered with a will executor,
-        // then we shouldn't mark this value as eligible to be
-        // freed?
         heap_guard.value = value;
 
         heap_guard.reachable = true;
@@ -2107,8 +2128,10 @@ impl Heap {
                 queue: &queue,
                 local_queue: &mut local_queue,
                 stats: MarkAndSweepStats::default(),
+                will_executors: Vec::new(),
             };
             marker.visit();
+            marker.retain_wills();
             context.queue.clear();
             marker.stats
         };
@@ -2333,10 +2356,53 @@ pub struct MarkAndSweepContextRefQueue<'a> {
     local_queue: &'a mut Vec<SteelValPointer>,
     queue: &'a crossbeam_queue::SegQueue<SteelValPointer>,
     stats: MarkAndSweepStats,
+    will_executors: Vec<&'a MutContainer<Box<dyn CustomType>>>,
 }
 
 #[cfg(feature = "sync")]
 impl<'a> MarkAndSweepContextRefQueue<'a> {
+    fn retain_wills(&mut self) {
+        let mut processed = 0;
+        while processed < self.will_executors.len() {
+            let end = self.will_executors.len();
+            // Record eligibility before retention changes the heap's reachability marks.
+            for custom in &self.will_executors[processed..end] {
+                let guard = custom.read();
+                let executor = guard.as_any_ref().downcast_ref::<WillExecutor>().unwrap();
+                let mut values = executor.values.lock().unwrap();
+                values.extend(executor.incoming.try_iter().map(Some));
+                for pending in values.iter_mut().flatten() {
+                    pending.ready |= pending.is_unreachable();
+                }
+            }
+            for index in processed..end {
+                let custom = self.will_executors[index];
+                self.visit_custom_children(custom);
+            }
+            self.visit();
+            processed = end;
+        }
+    }
+
+    fn visit_custom_children(&mut self, custom_type: &MutContainer<Box<dyn CustomType>>) {
+        let mut queue = Vec::new();
+        let mut temporary_queue = MarkAndSweepContext {
+            queue: &mut queue,
+            stats: MarkAndSweepStats::default(),
+        };
+
+        custom_type.read().visit_children(&mut temporary_queue);
+
+        self.stats.memory_reached_count += temporary_queue.stats.memory_reached_count;
+        self.stats.object_count += temporary_queue.stats.object_count;
+        self.stats.vector_reached_count += temporary_queue.stats.vector_reached_count;
+
+        for value in queue {
+            self.push_back(&value);
+            self.save(value);
+        }
+    }
+
     pub(crate) fn mark_heap_reference(
         &mut self,
         heap_ref: &StandardSharedMut<HeapAllocated<SteelVal>>,
@@ -2725,24 +2791,16 @@ impl<'a> BreadthFirstSearchSteelValReferenceVisitor2<'a> for MarkAndSweepContext
         &mut self,
         custom_type: &'a MutContainer<Box<dyn CustomType>>,
     ) -> Self::Output {
-        // Use mark and sweep queue:
-        let mut queue = Vec::new();
-        let mut temporary_queue = MarkAndSweepContext {
-            queue: &mut queue,
-            stats: MarkAndSweepStats::default(),
-        };
-
-        // Intercept the downstream ones, keep them alive by using
-        // a local queue first, and then spilling over to the larger one.
-        custom_type.read().visit_children(&mut temporary_queue);
-
-        self.stats.memory_reached_count += temporary_queue.stats.memory_reached_count;
-        self.stats.object_count += temporary_queue.stats.object_count;
-        self.stats.vector_reached_count += temporary_queue.stats.vector_reached_count;
-
-        for value in queue {
-            self.push_back(&value);
-            self.save(value);
+        if custom_type.read().as_any_ref().is::<WillExecutor>() {
+            if !self
+                .will_executors
+                .iter()
+                .any(|other| std::ptr::eq(*other, custom_type))
+            {
+                self.will_executors.push(custom_type);
+            }
+        } else {
+            self.visit_custom_children(custom_type);
         }
     }
 
