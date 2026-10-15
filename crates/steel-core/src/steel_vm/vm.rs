@@ -631,7 +631,7 @@ impl Synchronizer {
     }
 
     pub(crate) unsafe fn enumerate_stacks(&mut self, context: &mut MarkAndSweepContext) {
-        // TODO: Continue...
+        // Gather owning roots for traversal and finalizer retention in Heap::mark.
         let guard = self.threads.lock().unwrap();
 
         // Wait for all the threads to be legal
@@ -666,8 +666,6 @@ impl Synchronizer {
                             for value in &live_ctx.thread_local_storage {
                                 context.push_back(value.clone());
                             }
-
-                            context.visit();
                         }
 
                         break;
@@ -697,8 +695,6 @@ impl Synchronizer {
                                             for value in &live_ctx.thread_local_storage {
                                                 context.push_back(value.clone());
                                             }
-
-                                            context.visit();
 
                                             break;
                                         }
