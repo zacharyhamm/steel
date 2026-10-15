@@ -624,6 +624,84 @@ mod embedding_regressions {
     }
 
     #[test]
+    fn execution_results_survive_later_collections() {
+        let mut engine = Engine::new();
+        register_gc(&mut engine);
+        let results = engine
+            .run("(box 42) (vector 42) (probe-gc) (probe-gc) (probe-gc)")
+            .unwrap();
+        assert_eq!(
+            results[0].as_box_to_inner(),
+            Some(crate::SteelVal::IntV(42))
+        );
+        let crate::SteelVal::MutableVector(vector) = &results[1] else {
+            panic!("expected a mutable vector");
+        };
+        assert_eq!(vector.get(), [crate::SteelVal::IntV(42)]);
+    }
+
+    #[test]
+    fn execution_result_roots_are_released_after_success_and_error() {
+        use crate::steel_vm::register_fn::RegisterFn;
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct Probe {
+            _owner: Arc<()>,
+        }
+        impl crate::rvals::Custom for Probe {}
+
+        let count = Arc::new(());
+        let factory = count.clone();
+        let mut engine = Engine::new();
+        engine.register_fn("probe-value", move || Probe {
+            _owner: factory.clone(),
+        });
+        register_gc(&mut engine);
+        for last in ["void", "(error \"later expression\")"] {
+            let result = engine.run(format!(
+                "(box (probe-value)) (vector (probe-value)) (probe-gc) {last}"
+            ));
+            assert_eq!(result.is_err(), last != "void");
+            drop(result);
+            engine.run("(probe-gc) (probe-gc)").unwrap();
+            assert_eq!(Arc::strong_count(&count), 2, "{last}");
+        }
+    }
+
+    #[test]
+    fn lowered_lets_round_trip_through_syntax_case() {
+        let mut engine = Engine::new();
+        engine
+            .run(
+                r#"
+                (define-syntax (identity stx)
+                  (syntax-case stx () [(_ expression) #'expression]))
+                (define-syntax with-let
+                  (syntax-rules () [(_) (identity (let ((x 1)) x))]))
+                (define-syntax with-nested-lets
+                  (syntax-rules ()
+                    [(_) (identity (let ((x (let ((y 1)) y))) (let ((z x)) z)))]))
+                (define-syntax with-return
+                  (syntax-rules ()
+                    [(_) (identity (let ((x 1)) (let () (return! x))))]))
+                "#,
+            )
+            .unwrap();
+        for expression in [
+            "(with-let)",
+            "(with-nested-lets)",
+            "((lambda () (with-return) 99))",
+        ] {
+            assert_eq!(
+                engine.run(expression).unwrap(),
+                [crate::SteelVal::IntV(1)],
+                "{expression}"
+            );
+        }
+    }
+
+    #[test]
     fn pending_channel_values_survive_collection() {
         let mut engine = Engine::new();
         register_gc(&mut engine);
@@ -762,7 +840,9 @@ mod embedding_regressions {
             engine.run("(define joined (thread-join! worker))").unwrap();
             assert_eq!(engine.run(reader).unwrap(), [crate::SteelVal::IntV(42)]);
             assert!(engine.run("(thread-join! worker)").is_err());
-            engine.run("(set! joined #f) (probe-gc)").unwrap();
+            // set! returns the old value, which stays rooted until the execution ends.
+            engine.run("(set! joined #f)").unwrap();
+            engine.run("(probe-gc)").unwrap();
             assert_eq!(Arc::strong_count(&count), 2);
         }
     }

@@ -1,4 +1,5 @@
 use steel_parser::parser::SyntaxObject;
+use thin_vec::thin_vec;
 
 use crate::gc::Gc;
 use crate::values::lists::List;
@@ -12,6 +13,31 @@ use super::visitors::VisitorMut;
 use super::{ast::Atom, span::Span, visitors::ConsumingVisitor};
 
 use core::convert::TryFrom;
+
+fn restore_lowered_let(l: &super::ast::List) -> Option<super::ast::List> {
+    let lambda = l.first_func()?;
+    if lambda.location.ty != steel_parser::tokens::TokenType::Let {
+        return None;
+    }
+
+    let bindings = lambda
+        .args
+        .iter()
+        .zip(l.args.iter().skip(1))
+        .map(|(name, value)| {
+            ExprKind::List(super::ast::List::new(thin_vec![
+                name.clone(),
+                value.clone(),
+            ]))
+        })
+        .collect();
+
+    Some(super::ast::List::new(thin_vec![
+        ExprKind::Atom(Atom::new(lambda.location.clone())),
+        ExprKind::List(super::ast::List::new(bindings)),
+        lambda.body.clone(),
+    ]))
+}
 
 pub struct TryFromExprKindForSteelVal {
     inside_quote: bool,
@@ -132,6 +158,10 @@ impl ConsumingVisitor for TryFromExprKindForSteelVal {
     }
 
     fn visit_list(&mut self, l: super::ast::List) -> Self::Output {
+        if let Some(restored) = restore_lowered_let(&l) {
+            return self.visit_list(restored);
+        }
+
         if !l.improper {
             let items: core::result::Result<List<_>, SteelErr> =
                 l.args.into_iter().map(|x| self.visit(x)).collect();
@@ -438,6 +468,10 @@ impl VisitorMut for SyntaxObjectFromExprKindRef {
     }
 
     fn visit_list(&mut self, l: &steel_parser::ast::List) -> Self::Output {
+        if let Some(restored) = restore_lowered_let(l) {
+            return self.visit_list(&restored);
+        }
+
         let raw = TryFromExprKindForSteelVal::try_from_expr_kind_quoted(ExprKind::List(l.clone()))?;
 
         let items: core::result::Result<List<_>, SteelErr> =
@@ -712,6 +746,10 @@ impl ConsumingVisitor for SyntaxObjectFromExprKind {
     }
 
     fn visit_list(&mut self, l: super::ast::List) -> Self::Output {
+        if let Some(restored) = restore_lowered_let(&l) {
+            return self.visit_list(restored);
+        }
+
         let raw = TryFromExprKindForSteelVal::try_from_expr_kind_quoted(ExprKind::List(l.clone()))?;
 
         let (items, span) = if !l.improper {
@@ -869,6 +907,55 @@ mod tests {
     use super::*;
 
     use thin_vec::thin_vec;
+
+    #[test]
+    fn syntax_converters_restore_lowered_lets_with_spans() {
+        use steel_parser::parser::{Parser, SourceId};
+
+        for source in [
+            "(let ((x 1) (y 2)) x)",
+            "(let ((x (let ((y 1)) y))) (let () x))",
+        ] {
+            let source_id = Some(SourceId::fresh());
+            let expr = Parser::new(source, source_id).next().unwrap().unwrap();
+            let unlowered = Parser::new(source, source_id)
+                .without_lowering()
+                .next()
+                .unwrap()
+                .unwrap();
+            let expected = SyntaxObjectFromExprKindRef::try_from_expr_kind_ref(&unlowered).unwrap();
+            for converted in [
+                SyntaxObjectFromExprKind::try_from_expr_kind(expr.clone()).unwrap(),
+                SyntaxObjectFromExprKindRef::try_from_expr_kind_ref(&expr).unwrap(),
+            ] {
+                assert_syntax_matches(&converted, &expected);
+            }
+            let ExprKind::List(application) = expr else {
+                panic!("expected a lowered let application");
+            };
+            assert_eq!(
+                application.first_func().unwrap().location.ty,
+                TokenType::Let
+            );
+        }
+    }
+
+    fn assert_syntax_matches(actual: &SteelVal, expected: &SteelVal) {
+        match (actual, expected) {
+            (SteelVal::SyntaxObject(actual), SteelVal::SyntaxObject(expected)) => {
+                assert_eq!(actual.raw, expected.raw);
+                assert_eq!(actual.syntax_loc(), expected.syntax_loc());
+                assert_syntax_matches(&actual.syntax, &expected.syntax);
+            }
+            (SteelVal::ListV(actual), SteelVal::ListV(expected)) => {
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(expected.iter()) {
+                    assert_syntax_matches(actual, expected);
+                }
+            }
+            _ => assert_eq!(actual, expected),
+        }
+    }
 
     #[test]
     fn nested_quotes_handled_correctly() {

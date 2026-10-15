@@ -593,6 +593,32 @@ struct PendingWill {
 }
 
 #[cfg(feature = "sync")]
+fn traced_identity(value: &SteelVal) -> Option<usize> {
+    match value {
+        SteelVal::Closure(gc) => Some(gc.as_ptr() as usize),
+        SteelVal::VectorV(vector) => Some(vector.0.as_ptr() as usize),
+        SteelVal::Custom(gc) => Some(gc.as_ptr() as usize),
+        SteelVal::HashMapV(map) => Some(map.0.as_ptr() as usize),
+        SteelVal::HashSetV(set) => Some(set.0.as_ptr() as usize),
+        SteelVal::CustomStruct(gc) => Some(gc.as_ptr() as usize),
+        SteelVal::IterV(gc) => Some(gc.as_ptr() as usize),
+        SteelVal::ReducerV(gc) => Some(gc.as_ptr() as usize),
+        SteelVal::StreamV(gc) => Some(gc.as_ptr() as usize),
+        SteelVal::ContinuationFunction(continuation) => {
+            Some(StandardShared::as_ptr(&continuation.inner) as usize)
+        }
+        SteelVal::ListV(list) => Some(list.as_ptr_usize()),
+        SteelVal::Pair(gc) => Some(gc.as_ptr() as usize),
+        SteelVal::MutableVector(vector) => Some(vector.as_ptr_usize()),
+        SteelVal::SyntaxObject(gc) => Some(gc.as_ptr() as usize),
+        SteelVal::BoxedIterator(gc) => Some(gc.as_ptr() as usize),
+        SteelVal::Boxed(gc) => Some(gc.as_ptr() as usize),
+        SteelVal::HeapAllocated(heap_ref) => Some(heap_ref.as_ptr_usize()),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "sync")]
 impl PendingWill {
     fn is_unreachable(&self) -> bool {
         match self.pair.car_ref() {
@@ -819,6 +845,151 @@ pub fn will_register(
     Ok(SteelVal::Void)
 }
 
+#[cfg(all(test, feature = "sync"))]
+mod will_tests {
+    use super::*;
+    use crate::steel_vm::engine::Engine;
+
+    fn engine_with_gc() -> Engine {
+        let mut engine = Engine::new();
+        let mut primitives = Engine::new_raw_no_kernel();
+        crate::steel_vm::primitives::register_builtin_modules(&mut primitives, true);
+        let meta = primitives.builtin_modules().get("steel/meta").unwrap();
+        engine.register_value("probe-gc", meta.inner_map()["#%gc-collect"].clone());
+        engine
+    }
+
+    fn readiness(engine: &Engine, name: &str) -> Vec<bool> {
+        let value = engine.extract_value(name).unwrap();
+        let executor = WillExecutor::as_ref(&value).unwrap();
+        let values = executor.values.lock().unwrap();
+        values
+            .iter()
+            .flatten()
+            .map(|pending| pending.ready)
+            .collect()
+    }
+
+    #[test]
+    fn untraced_will_keys_keep_reference_count_eligibility() {
+        let mut engine = engine_with_gc();
+        engine
+            .run("(define executor (make-will-executor))")
+            .unwrap();
+        let executor_value = engine.extract_value("executor").unwrap();
+        let executor = WillExecutor::as_ref(&executor_value).unwrap();
+        let key = SteelVal::StringV("native key".into());
+        executor
+            .register(key.clone(), SteelVal::FuncV(|args| Ok(args[0].clone())))
+            .unwrap();
+        engine.run("(probe-gc)").unwrap();
+        assert_eq!(readiness(&engine, "executor"), [false]);
+        drop(key);
+        engine.run("(probe-gc)").unwrap();
+        assert_eq!(readiness(&engine, "executor"), [true]);
+        assert_eq!(
+            engine.run("(will-execute executor)").unwrap(),
+            [SteelVal::StringV("native key".into())]
+        );
+    }
+
+    #[test]
+    fn executing_closures_remain_ordinary_will_roots() {
+        use crate::steel_vm::register_fn::RegisterFn;
+
+        let mut engine = engine_with_gc();
+        engine.register_fn("will-ready?", |value: SteelVal| {
+            WillExecutor::as_ref(&value)
+                .unwrap()
+                .values
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .any(|pending| pending.ready)
+        });
+        engine
+            .run(
+                r#"
+                (define executor (make-will-executor))
+                (define live
+                  (lambda ()
+                    (set! live #f)
+                    (probe-gc)
+                    (will-ready? executor)))
+                (will-register executor live (lambda (value) 42))
+                "#,
+            )
+            .unwrap();
+        assert_eq!(engine.run("(live)").unwrap(), [SteelVal::BoolV(false)]);
+        engine.run("(probe-gc)").unwrap();
+        assert_eq!(readiness(&engine, "executor"), [true]);
+    }
+
+    #[test]
+    fn cyclic_will_keys_follow_ordinary_reachability() {
+        let mut engine = engine_with_gc();
+        engine
+            .run(
+                r#"
+                (define executor (make-will-executor))
+                (define calls 0)
+                (define live
+                  (let ((items (vector #f 42)))
+                    (define key (list items))
+                    (vector-set! items 0 key)
+                    key))
+                (will-register executor live
+                  (lambda (value)
+                    (probe-gc)
+                    (set! calls (+ calls 1))
+                    (vector-ref (car value) 1)))
+                (probe-gc) (probe-gc) (probe-gc)
+                "#,
+            )
+            .unwrap();
+        assert_eq!(readiness(&engine, "executor"), [false]);
+        engine
+            .run("(set! live #f) (probe-gc) (probe-gc) (probe-gc)")
+            .unwrap();
+        // set! returns the cycle, so this execution still retained an ordinary root.
+        assert_eq!(readiness(&engine, "executor"), [false]);
+        engine.run("(probe-gc) (probe-gc)").unwrap();
+        // Check readiness before calling the blocking will-execute primitive.
+        assert_eq!(readiness(&engine, "executor"), [true]);
+        assert_eq!(
+            engine.run("(will-execute executor)").unwrap(),
+            [SteelVal::IntV(42)]
+        );
+        engine.run("(probe-gc) (probe-gc)").unwrap();
+        assert!(readiness(&engine, "executor").is_empty());
+        assert_eq!(engine.run("calls").unwrap(), [SteelVal::IntV(1)]);
+    }
+
+    #[test]
+    fn executors_discovered_during_retention_use_ordinary_reachability() {
+        let mut engine = engine_with_gc();
+        engine
+            .run(
+                r#"
+                (define outer (make-will-executor))
+                (let ((inner (make-will-executor)) (key (box 42)))
+                  (will-register inner key unbox)
+                  (will-register outer key (lambda (value) inner)))
+                (probe-gc) (probe-gc)
+                "#,
+            )
+            .unwrap();
+        assert_eq!(readiness(&engine, "outer"), [true]);
+        engine.run("(define inner (will-execute outer))").unwrap();
+        assert_eq!(readiness(&engine, "inner"), [true]);
+        assert_eq!(
+            engine.run("(will-execute inner)").unwrap(),
+            [SteelVal::IntV(42)]
+        );
+    }
+}
+
 // Not considered part of the reachability graph? i.e. we simply don't traverse it.
 pub struct WeakBox {
     value: HeapRef<SteelVal>,
@@ -1042,6 +1213,7 @@ fn parallel_mark_counts_each_slot_exactly_once() {
                     queue: &queue,
                     stats: MarkAndSweepStats::default(),
                     will_executors: Vec::new(),
+                    reachable: rustc_hash::FxHashSet::default(),
                 };
 
                 barrier.wait();
@@ -2105,7 +2277,11 @@ impl Heap {
             context.push_back(root.clone());
         }
 
+        #[cfg(feature = "sync")]
+        let mut reachable = rustc_hash::FxHashSet::default();
         for function in function_stack {
+            #[cfg(feature = "sync")]
+            reachable.insert(function as *const ByteCodeLambda as usize);
             for value in function.captures() {
                 context.push_back(value.clone());
             }
@@ -2136,18 +2312,17 @@ impl Heap {
         #[cfg(feature = "sync")]
         let stats = {
             let queue = crossbeam_queue::SegQueue::new();
-            for value in context.queue.iter() {
-                if let Some(pointer) = SteelValPointer::from_value(value) {
-                    queue.push(pointer);
-                }
-            }
             let mut local_queue = Vec::with_capacity(4096);
             let mut marker = MarkAndSweepContextRefQueue {
                 queue: &queue,
                 local_queue: &mut local_queue,
                 stats: MarkAndSweepStats::default(),
                 will_executors: Vec::new(),
+                reachable,
             };
+            for value in context.queue.iter() {
+                marker.push_back(value);
+            }
             marker.visit();
             marker.retain_wills();
             context.queue.clear();
@@ -2375,11 +2550,14 @@ pub struct MarkAndSweepContextRefQueue<'a> {
     queue: &'a crossbeam_queue::SegQueue<SteelValPointer>,
     stats: MarkAndSweepStats,
     will_executors: Vec<&'a MutContainer<Box<dyn CustomType>>>,
+    reachable: rustc_hash::FxHashSet<usize>,
 }
 
 #[cfg(feature = "sync")]
 impl<'a> MarkAndSweepContextRefQueue<'a> {
     fn retain_wills(&mut self) {
+        // Retention must not change eligibility, even for executors discovered later.
+        let reachable = std::mem::take(&mut self.reachable);
         let mut processed = 0;
         while processed < self.will_executors.len() {
             let end = self.will_executors.len();
@@ -2390,7 +2568,10 @@ impl<'a> MarkAndSweepContextRefQueue<'a> {
                 let mut values = executor.values.lock().unwrap();
                 values.extend(executor.incoming.try_iter().map(Some));
                 for pending in values.iter_mut().flatten() {
-                    pending.ready |= pending.is_unreachable();
+                    pending.ready |= traced_identity(pending.pair.car_ref()).map_or_else(
+                        || pending.is_unreachable(),
+                        |identity| !reachable.contains(&identity),
+                    );
                 }
             }
             for index in processed..end {
@@ -2705,6 +2886,10 @@ impl<'a> BreadthFirstSearchSteelValReferenceVisitor2<'a> for MarkAndSweepContext
     fn push_back(&mut self, value: &SteelVal) {
         self.stats.object_count += 1;
 
+        if let Some(identity) = traced_identity(value) {
+            self.reachable.insert(identity);
+        }
+
         match value {
             SteelVal::BoolV(_)
             | SteelVal::NumV(_)
@@ -2764,6 +2949,8 @@ impl<'a> BreadthFirstSearchSteelValReferenceVisitor2<'a> for MarkAndSweepContext
 
         match &(*continuation) {
             ContinuationMark::Closed(continuation) => {
+                self.reachable
+                    .insert(continuation.current_frame.function.as_ptr() as usize);
                 for value in &continuation.stack {
                     self.save(value.clone());
                     self.push_back(value);
@@ -2775,6 +2962,7 @@ impl<'a> BreadthFirstSearchSteelValReferenceVisitor2<'a> for MarkAndSweepContext
                 }
 
                 for frame in &continuation.stack_frames {
+                    self.reachable.insert(frame.function.as_ptr() as usize);
                     for value in &frame.function.captures {
                         self.save(value.clone());
                         self.push_back(value);
