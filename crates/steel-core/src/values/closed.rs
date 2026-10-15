@@ -496,14 +496,15 @@ pub struct RootToken {
 }
 
 impl Drop for RootToken {
-    #[cfg(not(feature = "sync"))]
     fn drop(&mut self) {
-        ROOTS.with(|x| x.borrow_mut().free(self))
-    }
+        #[cfg(not(feature = "sync"))]
+        let value = ROOTS.with(|x| x.borrow_mut().free(self));
 
-    #[cfg(feature = "sync")]
-    fn drop(&mut self) {
-        GLOBAL_ROOTS.lock().unwrap().free(self)
+        #[cfg(feature = "sync")]
+        let value = GLOBAL_ROOTS.lock().unwrap().free(self);
+
+        // Native values can own more roots, so drop them after releasing the registry.
+        drop(value);
     }
 }
 
@@ -531,8 +532,8 @@ impl Roots {
         RootToken { generation, offset }
     }
 
-    fn free(&mut self, token: &RootToken) {
-        self.roots.remove(&(token.generation, token.offset));
+    fn free(&mut self, token: &RootToken) -> Option<SteelVal> {
+        self.roots.remove(&(token.generation, token.offset))
     }
 
     fn increment_generation(&mut self) {

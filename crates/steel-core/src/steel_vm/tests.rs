@@ -624,6 +624,150 @@ mod embedding_regressions {
     }
 
     #[test]
+    fn pending_channel_values_survive_collection() {
+        let mut engine = Engine::new();
+        register_gc(&mut engine);
+        engine
+            .run(
+                "(define channels (channels/new))
+                 (define sender (channels-sender channels))
+                 (define receiver (channels-receiver channels))",
+            )
+            .unwrap();
+
+        for receive in ["channel/recv", "channel/try-recv"] {
+            engine
+                .run(
+                    "(channel/send sender (box 42))
+                     (channel/send sender (vector (box 43)))
+                     (probe-gc) (probe-gc)",
+                )
+                .unwrap();
+            assert_eq!(
+                engine.run("(receivers-select receiver)").unwrap(),
+                [crate::SteelVal::IntV(0)]
+            );
+            assert_eq!(
+                engine.run(format!("(unbox ({receive} receiver))")).unwrap(),
+                [crate::SteelVal::IntV(42)]
+            );
+            engine.run("(probe-gc)").unwrap();
+            assert_eq!(
+                engine
+                    .run(format!("(unbox (vector-ref ({receive} receiver) 0))"))
+                    .unwrap(),
+                [crate::SteelVal::IntV(43)]
+            );
+            assert_eq!(
+                engine
+                    .run("(empty-channel-object? (channel/try-recv receiver))")
+                    .unwrap(),
+                [crate::SteelVal::BoolV(true)]
+            );
+        }
+    }
+
+    #[test]
+    fn channel_values_release_roots_after_consumption_or_disconnect() {
+        use crate::{
+            rvals::IntoSteelVal,
+            steel_vm::vm::threads::{
+                channel_recv, channel_send, channel_try_recv, disconnected_channel_objectp,
+                Channels,
+            },
+        };
+        use std::sync::Arc;
+
+        struct Probe(#[allow(dead_code)] Arc<()>);
+        impl crate::rvals::Custom for Probe {}
+
+        let count = Arc::new(());
+        let channels = Channels::new();
+        let sender = channels.sender();
+        for receive in [channel_recv, channel_try_recv] {
+            channel_send(&sender, Probe(count.clone()).into_steelval().unwrap()).unwrap();
+            let value = receive(&channels.receiver()).unwrap();
+            assert_eq!(Arc::strong_count(&count), 2);
+            drop(value);
+            assert_eq!(Arc::strong_count(&count), 1);
+        }
+
+        channel_send(&sender, Probe(count.clone()).into_steelval().unwrap()).unwrap();
+        drop(channels);
+        assert_eq!(Arc::strong_count(&count), 1);
+        assert!(channel_send(&sender, Probe(count.clone()).into_steelval().unwrap()).is_err());
+        assert_eq!(Arc::strong_count(&count), 1);
+
+        let channels = Channels::new();
+        let receiver = channels.receiver();
+        channel_send(
+            &channels.sender(),
+            Probe(count.clone()).into_steelval().unwrap(),
+        )
+        .unwrap();
+        let rooted_receiver = receiver.as_rooted();
+        drop(receiver);
+        drop(channels);
+        assert_eq!(Arc::strong_count(&count), 2);
+        // Removing this root drops a channel whose queued message owns another root.
+        drop(rooted_receiver);
+        assert_eq!(Arc::strong_count(&count), 1);
+
+        let channels = Channels::new();
+        let receiver = channels.receiver();
+        drop(channels);
+        assert!(channel_recv(&receiver).is_err());
+        assert!(disconnected_channel_objectp(
+            &channel_try_recv(&receiver).unwrap()
+        ));
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn pending_thread_results_survive_collection_and_release_roots_after_join() {
+        use crate::steel_vm::{register_fn::RegisterFn, vm::threads::thread_finished};
+        use std::{
+            sync::Arc,
+            time::{Duration, Instant},
+        };
+
+        struct Probe(#[allow(dead_code)] Arc<()>);
+        impl crate::rvals::Custom for Probe {}
+
+        let count = Arc::new(());
+        let factory = count.clone();
+        let mut engine = Engine::new();
+        engine.register_fn("probe-value", move || Probe(factory.clone()));
+        register_gc(&mut engine);
+        for (payload, reader) in [
+            ("(box (cons 42 (probe-value)))", "(car (unbox joined))"),
+            ("(vector 42 (probe-value))", "(vector-ref joined 0)"),
+        ] {
+            let worker = engine
+                .run(format!(
+                    "(define worker (spawn-native-thread (lambda () {payload}))) worker"
+                ))
+                .unwrap()
+                .pop()
+                .unwrap();
+            engine.enter_safepoint(|| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while thread_finished(&worker).unwrap() != crate::SteelVal::BoolV(true) {
+                    assert!(Instant::now() < deadline, "worker did not finish");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+            engine.run("(probe-gc) (probe-gc)").unwrap();
+            assert_eq!(Arc::strong_count(&count), 3);
+            engine.run("(define joined (thread-join! worker))").unwrap();
+            assert_eq!(engine.run(reader).unwrap(), [crate::SteelVal::IntV(42)]);
+            assert!(engine.run("(thread-join! worker)").is_err());
+            engine.run("(set! joined #f) (probe-gc)").unwrap();
+            assert_eq!(Arc::strong_count(&count), 2);
+        }
+    }
+
+    #[test]
     fn garbage_collection_releases_discarded_native_values() {
         use crate::steel_vm::register_fn::RegisterFn;
         use std::sync::Arc;

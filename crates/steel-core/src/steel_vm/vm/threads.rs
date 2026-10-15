@@ -14,6 +14,7 @@ use crate::{
     },
     steel_vm::{builtin::BuiltInModule, engine::ModuleContainer, register_fn::RegisterFn},
     values::{
+        closed::RootedSteelVal,
         functions::SerializedLambdaPrototype,
         structs::{SendableVTableEntry, VTable},
     },
@@ -24,7 +25,7 @@ use super::*;
 
 pub struct ThreadHandle {
     pub(crate) handle:
-        Mutex<Option<std::thread::JoinHandle<core::result::Result<SteelVal, String>>>>,
+        Mutex<Option<std::thread::JoinHandle<core::result::Result<RootedSteelVal, String>>>>,
 
     pub(crate) thread: std::thread::Thread,
 
@@ -116,6 +117,7 @@ pub(crate) fn thread_join_impl(handle: &ThreadHandle) -> Result<SteelVal> {
         handle
             .join()
             .map_err(|_| SteelErr::new(ErrorKind::Generic, "thread panicked!".to_string()))?
+            .map(|value| value.value().clone())
             .map_err(|x| SteelErr::new(ErrorKind::Generic, x.to_string()))
     } else {
         stop!(ContractViolation => "thread handle has already been joined!");
@@ -828,11 +830,11 @@ fn serialize_thread_impl(ctx: &mut VmCore, _args: &[SteelVal]) -> Result<SteelVa
 */
 
 pub struct SteelReceiver {
-    receiver: crossbeam_channel::Receiver<SteelVal>,
+    receiver: crossbeam_channel::Receiver<RootedSteelVal>,
 }
 
 pub struct SteelSender {
-    sender: crossbeam_channel::Sender<SteelVal>,
+    sender: crossbeam_channel::Sender<RootedSteelVal>,
 }
 
 pub struct Channels {
@@ -903,10 +905,10 @@ pub fn channels_receiver(value: &SteelVal) -> Result<SteelVal> {
 pub fn channel_send(sender: &SteelVal, value: SteelVal) -> Result<SteelVal> {
     SteelSender::as_ref(sender)?
         .sender
-        .send(value)
+        .send(value.as_rooted())
         .map_err(|e| {
             throw!(Generic => "channel disconnected -
-            unable to send value across channel: {:?}", e.0)()
+            unable to send value across channel: {:?}", e.0.value())()
         })
         .map(|_| SteelVal::Void)
 }
@@ -916,6 +918,7 @@ pub fn channel_recv(receiver: &SteelVal) -> Result<SteelVal> {
     SteelReceiver::as_ref(receiver)?
         .receiver
         .recv()
+        .map(|value| value.value().clone())
         .map_err(|_| {
             throw!(Generic => "Unable to receive on the channel.
                 The channel is empty and disconnected")()
@@ -929,7 +932,7 @@ pub fn channel_try_recv(receiver: &SteelVal) -> Result<SteelVal> {
     let value = SteelReceiver::as_ref(receiver)?.receiver.try_recv();
 
     match value {
-        Ok(v) => Ok(v),
+        Ok(v) => Ok(v.value().clone()),
         Err(crossbeam_channel::TryRecvError::Empty) => Ok(empty_channel()),
         Err(crossbeam_channel::TryRecvError::Disconnected) => Ok(disconnected_channel()),
     }
@@ -1106,6 +1109,7 @@ pub(crate) fn spawn_native_thread(ctx: &mut VmCore, args: &[SteelVal]) -> Option
         // like we're not getting it installed correctly, and things are dying
         thread
             .call_function(constant_map, func, Vec::new())
+            .map(|value| value.as_rooted())
             .map_err(|e| e.to_string())
     });
 
@@ -1118,6 +1122,7 @@ pub(crate) fn spawn_native_thread(ctx: &mut VmCore, args: &[SteelVal]) -> Option
         // like we're not getting it installed correctly, and things are dying
         thread
             .call_function(constant_map, func, Vec::new())
+            .map(|value| value.as_rooted())
             .map_err(|e| e.to_string())
     });
 
