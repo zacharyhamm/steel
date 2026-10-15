@@ -2863,7 +2863,7 @@ mod parser_tests {
                 ExprKind::LambdaFunction(Box::new(LambdaFunction::new(
                     thin_vec![atom("a")],
                     ExprKind::List(List::new(thin_vec![atom("+"), atom("a"), int(20)])),
-                    SyntaxObject::default(TokenType::Lambda),
+                    SyntaxObject::default(TokenType::Let),
                 ))),
                 int(10),
             ]))],

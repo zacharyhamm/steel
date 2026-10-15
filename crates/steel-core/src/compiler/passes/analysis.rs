@@ -2715,6 +2715,31 @@ where
 }
 
 // TODO: This will need to get changed in the event we actually modify _what_ the mutable pointer points to
+struct ContainsReturn;
+
+impl VisitorMutControlFlow for ContainsReturn {
+    fn visit_return(&mut self, _: &steel_parser::ast::Return) -> ControlFlow<()> {
+        ControlFlow::Break(())
+    }
+
+    fn visit_lambda_function(&mut self, lambda: &LambdaFunction) -> ControlFlow<()> {
+        if lambda.location.ty == TokenType::Let {
+            self.visit(&lambda.body)
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+
+    fn visit_quote(&mut self, _: &Quote) -> ControlFlow<()> {
+        ControlFlow::Continue(())
+    }
+}
+
+fn has_return_boundary(lambda: &LambdaFunction) -> bool {
+    // Lowered lets share their enclosing return boundary; explicit lambdas keep their own.
+    lambda.location.ty != TokenType::Let && ContainsReturn.visit(&lambda.body).is_break()
+}
+
 // Right now, if we want to modify a call site, we can only change it to a call site - what we _should_ do is have it be able to point
 // back to any arbitrary value, and subsequently change l to point to that value by doing another level of the recursion
 // Something like:
@@ -2753,7 +2778,7 @@ where
                 }
 
                 if let ExprKind::List(l) = &list {
-                    if l.is_anonymous_function_call() {
+                    if l.first_func().is_some_and(|f| !has_return_boundary(f)) {
                         // TODO: rerunning analysis might be worth it here - we want to be able to trigger a re run if a mutation would cause a change
                         // In the state of the analysis
                         if (self.func)(self.analysis, list) {
@@ -4953,7 +4978,7 @@ impl<'a> VisitorMutRefUnit for FlattenAnonymousFunctionCalls<'a> {
         let mut changed = false;
 
         // This is an anonymous function call
-        if let Some(function_a) = l.first_func_mut() {
+        if let Some(function_a) = l.first_func_mut().filter(|f| !has_return_boundary(f)) {
             // The body is also just an anonymous function call
             if let ExprKind::List(inner_l) = &mut function_a.body {
                 let arg_ids = function_a
@@ -4968,7 +4993,9 @@ impl<'a> VisitorMutRefUnit for FlattenAnonymousFunctionCalls<'a> {
                         .all(|x| !ExprContainsIds::contains(self.analysis, &arg_ids, x));
 
                     if all_dont_contain_references {
-                        if let Some(function_b) = inner_l.first_func_mut() {
+                        if let Some(function_b) =
+                            inner_l.first_func_mut().filter(|f| !has_return_boundary(f))
+                        {
                             // Then we should be able to flatten the function into one
 
                             // TODO: Check that any of the vars we're using are used in the body expression

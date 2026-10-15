@@ -459,10 +459,6 @@ fn set(var: ExprKind, expr: ExprKind) -> ExprKind {
     )))
 }
 
-fn apply_ident(func: ExprKind) -> ExprKind {
-    ExprKind::List(List::new(thin_vec![func]))
-}
-
 fn convert_exprs_to_let(begin: Box<Begin>) -> ExprKind {
     // let defines = collect_defines_from_current_scope(&exprs);
 
@@ -487,7 +483,7 @@ fn convert_exprs_to_let(begin: Box<Begin>) -> ExprKind {
                         LambdaFunction::new(
                             thin_vec![d.name],
                             accum,
-                            SyntaxObject::default(TokenType::Lambda),
+                            SyntaxObject::default(TokenType::Let),
                         )
                         .into(),
                     );
@@ -605,34 +601,13 @@ fn convert_exprs_to_let(begin: Box<Begin>) -> ExprKind {
                 };
             }
             // Evaluate nonconstant initializers in body order, after earlier effects.
-            ExpressionType::DefineFlat(name) | ExpressionType::DefineFlatStar(name) => {
+            ExpressionType::DefineFlat(_) | ExpressionType::DefineFlatStar(_) => {
                 if let ExprKind::Define(d) = &exprs[i] {
                     top_level_arguments.push(d.name.clone());
                     top_level_dummy_args.push(ExprKind::Atom(Atom::new(SyntaxObject::default(
                         IntLiteral::Small(0).into(),
                     ))));
-                    let name_prime = ExprKind::atom(compact_str::format_compact!(
-                        "_____{}{}",
-                        name.resolve(),
-                        i
-                    ));
-
-                    // Make this a (set! x (x'))
-                    // Applying the function
-                    let set_expr = set(d.name.clone(), apply_ident(name_prime.clone()));
-
-                    // Set this to be an empty function (lambda () <expr>)
-                    new_args.push(
-                        LambdaFunction::new(
-                            ThinVec::new(),
-                            arg.clone(),
-                            SyntaxObject::default(TokenType::Lambda),
-                        )
-                        .into(),
-                    );
-
-                    bound_names.push(name_prime);
-                    set_expressions.push(set_expr);
+                    set_expressions.push(set(d.name.clone(), arg));
                 } else {
                     panic!("expected define, found: {}", &exprs[i]);
                 };
@@ -667,7 +642,7 @@ fn convert_exprs_to_let(begin: Box<Begin>) -> ExprKind {
             set_expressions,
             SyntaxObject::default(TokenType::Begin),
         ))),
-        SyntaxObject::default(TokenType::Lambda),
+        SyntaxObject::default(TokenType::Let),
     );
 
     new_args.insert(0, ExprKind::LambdaFunction(Box::new(inner_lambda)));
@@ -677,7 +652,7 @@ fn convert_exprs_to_let(begin: Box<Begin>) -> ExprKind {
     let outer_lambda = LambdaFunction::new(
         top_level_arguments,
         inner_application,
-        SyntaxObject::default(TokenType::Lambda),
+        SyntaxObject::default(TokenType::Let),
     );
 
     top_level_dummy_args.insert(0, ExprKind::LambdaFunction(Box::new(outer_lambda)));

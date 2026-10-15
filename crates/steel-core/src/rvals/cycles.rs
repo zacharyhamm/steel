@@ -1941,13 +1941,11 @@ impl<'a> RecursiveEqualityHandler<'a> {
             match (left, right) {
                 (ListV(l), ListV(r)) => {
                     // If we've reached the same object, we're good
-                    if l.ptr_eq(&r) {
+                    if l.ptr_eq(&r) || super::slow_path_eq_lists(&l, &r) {
                         continue;
                     }
 
-                    if self.should_visit((l.as_ptr_usize(), 0))
-                        && self.should_visit((r.as_ptr_usize(), 0))
-                    {
+                    if self.should_visit((l.as_ptr_usize(), r.as_ptr_usize())) {
                         if l.len() != r.len() {
                             return false;
                         }
@@ -1958,7 +1956,8 @@ impl<'a> RecursiveEqualityHandler<'a> {
                             match (lvalue, rvalue) {
                                 (SteelVal::ListV(llist), SteelVal::ListV(rlist))
                                     if (llist.is_empty() && rlist.is_empty())
-                                        || llist.ptr_eq(rlist) =>
+                                        || llist.ptr_eq(rlist)
+                                        || super::slow_path_eq_lists(llist, rlist) =>
                                 {
                                     continue;
                                 }
@@ -1984,9 +1983,7 @@ impl<'a> RecursiveEqualityHandler<'a> {
                         continue;
                     }
 
-                    if self.should_visit((l.as_ptr() as usize, 0))
-                        && self.should_visit((r.as_ptr() as usize, 0))
-                    {
+                    if self.should_visit((l.as_ptr() as usize, r.as_ptr() as usize)) {
                         self.left.push_back(l.car());
                         self.right.push_back(r.car());
 
@@ -2035,13 +2032,9 @@ impl<'a> RecursiveEqualityHandler<'a> {
                     }
 
                     // Should we visit these?
-                    if self.should_visit((l.0.as_ptr() as usize, 0))
-                        && self.should_visit((r.0.as_ptr() as usize, 0))
-                    {
+                    if self.should_visit((l.0.as_ptr() as usize, r.0.as_ptr() as usize)) {
                         self.left.visit_immutable_vector(l);
                         self.right.visit_immutable_vector(r);
-                    } else {
-                        return false;
                     }
 
                     continue;
@@ -2176,9 +2169,7 @@ impl<'a> RecursiveEqualityHandler<'a> {
                         continue;
                     }
 
-                    if self.should_visit((l.0.as_ptr() as usize, 0))
-                        && self.should_visit((r.0.as_ptr() as usize, 0))
-                    {
+                    if self.should_visit((l.0.as_ptr() as usize, r.0.as_ptr() as usize)) {
                         if l.len() != r.len() {
                             return false;
                         }
@@ -2225,9 +2216,7 @@ impl<'a> RecursiveEqualityHandler<'a> {
                         continue;
                     }
 
-                    if self.should_visit((l.0.as_ptr() as usize, 0))
-                        && self.should_visit((r.0.as_ptr() as usize, 0))
-                    {
+                    if self.should_visit((l.0.as_ptr() as usize, r.0.as_ptr() as usize)) {
                         if l.len() != r.len() {
                             return false;
                         }
@@ -2252,9 +2241,7 @@ impl<'a> RecursiveEqualityHandler<'a> {
                         continue;
                     }
 
-                    if self.should_visit((l.as_ptr() as usize, 0))
-                        && self.should_visit((r.as_ptr() as usize, 0))
-                    {
+                    if self.should_visit((l.as_ptr() as usize, r.as_ptr() as usize)) {
                         // Check the top level equality indicators to make sure
                         // that these two types are the same
                         if !(l.type_descriptor == r.type_descriptor && l.name() == r.name()) {
@@ -2351,8 +2338,10 @@ impl<'a> RecursiveEqualityHandler<'a> {
                         continue;
                     }
 
-                    self.left.visit_boxed_value(l);
-                    self.right.visit_boxed_value(r);
+                    if self.should_visit((l.as_ptr() as usize, r.as_ptr() as usize)) {
+                        self.left.visit_boxed_value(l);
+                        self.right.visit_boxed_value(r);
+                    }
 
                     continue;
                 }
@@ -2361,8 +2350,10 @@ impl<'a> RecursiveEqualityHandler<'a> {
                         continue;
                     }
 
-                    self.left.visit_heap_allocated(l);
-                    self.right.visit_heap_allocated(r);
+                    if self.should_visit((l.as_ptr_usize(), r.as_ptr_usize())) {
+                        self.left.visit_heap_allocated(l);
+                        self.right.visit_heap_allocated(r);
+                    }
 
                     continue;
                 }
@@ -2372,9 +2363,7 @@ impl<'a> RecursiveEqualityHandler<'a> {
                         continue;
                     }
 
-                    if self.should_visit((l.as_ptr_usize(), 0))
-                        && self.should_visit((r.as_ptr_usize(), 0))
-                    {
+                    if self.should_visit((l.as_ptr_usize(), r.as_ptr_usize())) {
                         if l.borrow(|x| x.len()) != r.borrow(|x| x.len()) {
                             return false;
                         }

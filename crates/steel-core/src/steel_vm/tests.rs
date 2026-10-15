@@ -1139,6 +1139,16 @@ mod source_gc_tests {
 mod embedding_regressions {
     use crate::steel_vm::engine::Engine;
 
+    fn register_gc(engine: &mut Engine) {
+        let mut primitives = Engine::new_raw_no_kernel();
+        crate::steel_vm::primitives::register_builtin_modules(&mut primitives, true);
+        let meta = primitives.builtin_modules().get("steel/meta").unwrap();
+        engine.register_value(
+            "probe-gc",
+            meta.inner_map().get("#%gc-collect").unwrap().clone(),
+        );
+    }
+
     #[test]
     fn garbage_collection_releases_discarded_native_values() {
         use crate::steel_vm::register_fn::RegisterFn;
@@ -1160,13 +1170,7 @@ mod embedding_regressions {
                 .call_function_by_name_with_args("probe", vec![])
                 .unwrap();
         }
-        let mut primitives = Engine::new_raw_no_kernel();
-        crate::steel_vm::primitives::register_builtin_modules(&mut primitives, true);
-        let meta = primitives.builtin_modules().get("steel/meta").unwrap();
-        engine.register_value(
-            "probe-gc",
-            meta.inner_map().get("#%gc-collect").unwrap().clone(),
-        );
+        register_gc(&mut engine);
         engine
             .run(
                 r#"
@@ -1209,6 +1213,7 @@ mod embedding_regressions {
             "(equal? a b)",
             "(equal? (list a) (list b))",
             "(eq? a b)",
+            "(eqv? a b)",
         ] {
             assert_eq!(
                 engine.run(expression).unwrap(),
@@ -1220,5 +1225,266 @@ mod embedding_regressions {
             engine.run("(equal? a (range 51))").unwrap(),
             [crate::SteelVal::BoolV(true)]
         );
+    }
+
+    #[test]
+    fn equality_compares_pairs_of_nodes() {
+        let mut engine = Engine::new();
+        for constructor in [
+            "list",
+            "vector",
+            "immutable-vector",
+            "(lambda (x) (cons x 0))",
+            "(lambda (x) (hash 'value x))",
+        ] {
+            engine
+                .run(format!(
+                    "(define a ({constructor} 1)) (define b ({constructor} 1)) (define c ({constructor} 2))"
+                ))
+                .unwrap();
+            for (expression, expected) in [
+                ("(equal? (list a a) (list c b))", false),
+                ("(equal? (list c b) (list a a))", false),
+                ("(equal? (list a a) (list b b))", true),
+                ("(equal? (list b b) (list a a))", true),
+            ] {
+                assert_eq!(
+                    engine.run(expression).unwrap(),
+                    [crate::SteelVal::BoolV(expected)],
+                    "{constructor}: {expression}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn list_identity_preserves_repeated_cdr_sharing() {
+        let mut engine = Engine::new();
+        for size in [2, 4, 5, 16, 50] {
+            engine.run(format!("(define xs (range {size}))")).unwrap();
+            for expression in [
+                "(eq? (cdr xs) (cdr xs))",
+                "(eqv? (cdr xs) (cdr xs))",
+                "(equal? (cdr xs) (cdr xs))",
+                "(pair? (memq (cdr xs) (list (cdr xs))))",
+                "(not (eq? xs (cdr xs)))",
+            ] {
+                assert_eq!(
+                    engine.run(expression).unwrap(),
+                    [crate::SteelVal::BoolV(true)],
+                    "length {size}: {expression}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn list_equality_terminates_on_cycles() {
+        let mut engine = Engine::new();
+        engine
+            .run(
+                r#"
+                (define left (vector #f))
+                (define right (vector #f))
+                (vector-set! left 0 (list left 1))
+                (vector-set! right 0 (list right 1))
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            engine.run("(equal? left right)").unwrap(),
+            [crate::SteelVal::BoolV(true)]
+        );
+        engine.run("(vector-set! right 0 (list right 2))").unwrap();
+        assert_eq!(
+            engine.run("(equal? left right)").unwrap(),
+            [crate::SteelVal::BoolV(false)]
+        );
+        engine
+            .run(
+                r#"
+                (define left-box (box #f))
+                (define right-box (box #f))
+                (set-box! left-box (list left-box 1))
+                (set-box! right-box (list right-box 1))
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            engine.run("(equal? left-box right-box)").unwrap(),
+            [crate::SteelVal::BoolV(true)]
+        );
+        engine
+            .run("(set-box! right-box (list right-box 2))")
+            .unwrap();
+        assert_eq!(
+            engine.run("(equal? left-box right-box)").unwrap(),
+            [crate::SteelVal::BoolV(false)]
+        );
+    }
+
+    #[test]
+    fn internal_initializer_returns_from_enclosing_function() {
+        let mut engine = Engine::new();
+        engine
+            .run(
+                r#"
+                (define (example)
+                  (define (helper) 1)
+                  (define value (return! 9))
+                  10)
+                "#,
+            )
+            .unwrap();
+        assert_eq!(engine.run("(example)").unwrap(), [crate::SteelVal::IntV(9)]);
+        for body in [
+            "(let ((x 1)) (return! 9)) 10",
+            "(begin (define (helper) 1) (define value (return! 9)) value) 10",
+        ] {
+            let result = engine.run(format!("((lambda () {body}))")).unwrap();
+            assert_eq!(result.last(), Some(&crate::SteelVal::IntV(9)), "{body}");
+        }
+    }
+
+    #[test]
+    fn internal_initializers_preserve_order_dependencies_and_lambda_returns() {
+        let mut engine = Engine::new();
+        let result = engine
+            .run(
+                r#"
+                (define effects '())
+                (define (record value)
+                  (set! effects (append effects (list value)))
+                  value)
+                (define (example)
+                  (define (even-local? n) (if (= n 0) #t (odd-local? (- n 1))))
+                  (record 1)
+                  (define first (record 2))
+                  (record 3)
+                  (define second (record (+ first 2)))
+                  (define (odd-local? n) (if (= n 0) #f (even-local? (- n 1))))
+                  (define third ((lambda () (let ((x 5)) (return! x)) 99)))
+                  (define fourth ((lambda () ((lambda (x) x) (return! 6)))))
+                  (list first second third fourth (even-local? 10) effects))
+                (example)
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result.last().unwrap().to_string(),
+            "(2 4 5 6 #true (1 2 3 4))"
+        );
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn finalizers_retain_heap_payloads_across_collections() {
+        let mut engine = Engine::new();
+        register_gc(&mut engine);
+        engine
+            .run("(define executor (make-will-executor))")
+            .unwrap();
+        for (payload, reader, expected) in [
+            ("(vector 10 20)", "(vector-ref value 1)", 20),
+            ("(box 42)", "(unbox value)", 42),
+            (
+                "(list (box (vector 1 (box 2))))",
+                "(unbox (vector-ref (unbox (car value)) 1))",
+                2,
+            ),
+            (
+                "(vector (box (vector 7)))",
+                "(vector-ref (unbox (vector-ref value 0)) 0)",
+                7,
+            ),
+        ] {
+            engine
+                .run(format!(
+                    "(will-register executor {payload} (lambda (value) (probe-gc) {reader}))"
+                ))
+                .unwrap();
+            for _ in 0..3 {
+                engine
+                    .run("(probe-gc) (map (lambda (i) (box (vector i))) (range 1000)) void")
+                    .unwrap();
+            }
+            assert_eq!(
+                engine.run("(will-execute executor)").unwrap(),
+                [crate::SteelVal::IntV(expected)],
+                "{payload}"
+            );
+        }
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn finalizers_retain_callbacks_and_release_executed_payloads() {
+        use crate::steel_vm::register_fn::RegisterFn;
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct Probe {
+            _owner: Arc<()>,
+        }
+        impl crate::rvals::Custom for Probe {}
+
+        let count = Arc::new(());
+        let factory = count.clone();
+        let mut engine = Engine::new();
+        engine.register_fn("probe-value", move || Probe {
+            _owner: factory.clone(),
+        });
+        register_gc(&mut engine);
+        engine
+            .run(
+                r#"
+                (define executor (make-will-executor))
+                (define live (box (vector (probe-value) 17)))
+                (let ((capture (box (vector (probe-value) 25))))
+                  (will-register executor live
+                    (lambda (value)
+                      (probe-gc)
+                      (+ (vector-ref (unbox value) 1)
+                         (vector-ref (unbox capture) 1)))))
+                (probe-gc)
+                "#,
+            )
+            .unwrap();
+        assert_eq!(Arc::strong_count(&count), 4);
+        engine.run("(set! live #f) (probe-gc) (probe-gc)").unwrap();
+        assert_eq!(Arc::strong_count(&count), 4);
+        assert_eq!(
+            engine.run("(will-execute executor)").unwrap(),
+            [crate::SteelVal::IntV(42)]
+        );
+        engine.run("(probe-gc)").unwrap();
+        assert_eq!(Arc::strong_count(&count), 2);
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn finalizers_record_eligibility_before_retaining_other_wills() {
+        let mut engine = Engine::new();
+        register_gc(&mut engine);
+        engine
+            .run(
+                r#"
+                (define first (make-will-executor))
+                (define second (make-will-executor))
+                (let ((payload (box 42)))
+                  (will-register first payload unbox)
+                  (will-register second (vector payload)
+                    (lambda (value) (unbox (vector-ref value 0)))))
+                (probe-gc)
+                (probe-gc)
+                "#,
+            )
+            .unwrap();
+        for executor in ["first", "second"] {
+            assert_eq!(
+                engine.run(format!("(will-execute {executor})")).unwrap(),
+                [crate::SteelVal::IntV(42)]
+            );
+        }
     }
 }

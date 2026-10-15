@@ -2363,42 +2363,13 @@ impl SteelVal {
 // for pointer equality?
 #[inline]
 fn slow_path_eq_lists(
-    _l: &crate::values::lists::List<SteelVal>,
-    _r: &crate::values::lists::List<SteelVal>,
+    l: &crate::values::lists::List<SteelVal>,
+    r: &crate::values::lists::List<SteelVal>,
 ) -> bool {
-    false
-
-    /*
-
-    // If the next pointers are the same,
-    // then we need to check the values of the
-    // current node for equality. There is now the possibility
-    // that the previous version of this doesn't match up, and
-    // we need to keep the history of the previous values in order
-    // to do this properly.
-    //
-    // I think we can only really do this _if_ the next pointer
-    // exists. Otherwise this doesn't really make sense
-    let left_next = l.next_ptr_as_usize();
-    let right_next = r.next_ptr_as_usize();
-
-    if left_next.is_some() && right_next.is_some() && left_next == right_next && l.len() == r.len()
-    {
-        let left_iter = l.current_node_iter();
-        let right_iter = r.current_node_iter();
-
-        for (l, r) in left_iter.zip(right_iter) {
-            if l != r {
-                return false;
-            }
-        }
-
-        true
-    } else {
-        false
-    }
-
-    */
+    l.storage_ptr_eq(r)
+        && l.index() == r.index()
+        && l.len() == r.len()
+        && l.next_ptr_as_usize() == r.next_ptr_as_usize()
 }
 
 impl Hash for SteelVal {
