@@ -732,12 +732,21 @@ impl Compiler {
         expr_str: E,
         path: Option<PathBuf>,
     ) -> Result<RawProgramWithSymbols> {
+        self.compile_executable_with_source_name(expr_str, path.clone(), path)
+    }
+
+    pub(crate) fn compile_executable_with_source_name<E: AsRef<str> + Into<Cow<'static, str>>>(
+        &mut self,
+        expr_str: E,
+        source_name: Option<PathBuf>,
+        path: Option<PathBuf>,
+    ) -> Result<RawProgramWithSymbols> {
         #[cfg(feature = "profiling")]
         let now = Instant::now();
 
         let expr_str = expr_str.into();
 
-        let id = self.sources.add_source(expr_str.clone(), path.clone());
+        let id = self.sources.add_source(expr_str.clone(), source_name);
 
         // Could fail here
         let parsed: core::result::Result<Vec<ExprKind>, ParseError> = path

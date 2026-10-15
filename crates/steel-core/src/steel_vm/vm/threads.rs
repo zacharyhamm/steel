@@ -9,8 +9,8 @@ use crate::rvals::{from_serializable_value, SerializedHeapRefVector};
 use crate::{
     compiler::modules::{BUILT_INS, MANGLER_PREFIX, MANGLER_SEPARATOR},
     rvals::{
-        AsRefMutSteelVal, AsRefSteelVal as _, Custom, HeapSerializer, NativeRefSpec,
-        SerializableSteelVal, SerializationContext, SerializedHeapRef, SteelByteVector,
+        AsRefMutSteelVal, Custom, HeapSerializer, NativeRefSpec, SerializableSteelVal,
+        SerializationContext, SerializedHeapRef, SteelByteVector,
     },
     steel_vm::{builtin::BuiltInModule, engine::ModuleContainer, register_fn::RegisterFn},
     values::{

@@ -580,25 +580,6 @@ fn convert_exprs_to_let(begin: Box<Begin>) -> ExprKind {
 
                 // let name = Atom::new(SyntaxObject::new)
             }
-            ExpressionType::DefineFlat(name) => {
-                if let ExprKind::Define(d) = &exprs[i] {
-                    top_level_arguments.push(d.name.clone());
-                    top_level_dummy_args.push(ExprKind::Atom(Atom::new(SyntaxObject::default(
-                        IntLiteral::Small(0).into(),
-                    ))));
-                    let name_prime = ExprKind::atom(compact_str::format_compact!(
-                        "_____{}{}",
-                        name.resolve(),
-                        i
-                    ));
-                    let set_expr = set(d.name.clone(), name_prime.clone());
-                    bound_names.push(name_prime);
-                    set_expressions.push(set_expr);
-                    new_args.push(arg);
-                } else {
-                    panic!("expected define, found: {}", &exprs[i]);
-                };
-            }
             ExpressionType::DefineConst(_name) => {
                 if let ExprKind::Define(d) = &exprs[i] {
                     top_level_dummy_args.push(arg);
@@ -612,7 +593,8 @@ fn convert_exprs_to_let(begin: Box<Begin>) -> ExprKind {
                     panic!("expected define, found: {}", &exprs[i]);
                 };
             }
-            ExpressionType::DefineFlatStar(name) => {
+            // Evaluate nonconstant initializers in body order, after earlier effects.
+            ExpressionType::DefineFlat(name) | ExpressionType::DefineFlatStar(name) => {
                 if let ExprKind::Define(d) = &exprs[i] {
                     top_level_arguments.push(d.name.clone());
                     top_level_dummy_args.push(ExprKind::Atom(Atom::new(SyntaxObject::default(

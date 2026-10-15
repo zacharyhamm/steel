@@ -588,7 +588,10 @@ impl<'a> ConsumingVisitor for ConstantEvaluator<'a> {
 
         define.body = self.visit(define.body)?;
 
-        if let Some(c) = self.to_constant(&define.body) {
+        // Top-level definitions can be changed by a later REPL evaluation.
+        if self.bindings.borrow().parent.is_none() {
+            self.bindings.borrow_mut().bind_non_constant(identifier);
+        } else if let Some(c) = self.to_constant(&define.body) {
             self.bindings.borrow_mut().bind(identifier, c);
         } else {
             self.bindings.borrow_mut().bind_non_constant(identifier);

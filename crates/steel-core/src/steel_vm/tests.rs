@@ -608,3 +608,91 @@ mod find_closest_match_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod embedding_regressions {
+    use crate::steel_vm::engine::Engine;
+
+    #[test]
+    fn garbage_collection_releases_discarded_native_values() {
+        use crate::steel_vm::register_fn::RegisterFn;
+        use std::sync::Arc;
+        #[derive(Clone)]
+        struct Probe {
+            _owner: Arc<()>,
+        }
+        impl crate::rvals::Custom for Probe {}
+        let count = Arc::new(());
+        let factory = count.clone();
+        let mut engine = Engine::new();
+        engine.register_fn("probe-value", move || Probe {
+            _owner: factory.clone(),
+        });
+        engine.run("(define live (probe-value)) (define (probe) (define value (probe-value)) (define (read) value) (set! value (probe-value)) (vector (read)) void)").unwrap();
+        for _ in 0..1000 {
+            engine
+                .call_function_by_name_with_args("probe", vec![])
+                .unwrap();
+        }
+        let mut primitives = Engine::new_raw_no_kernel();
+        crate::steel_vm::primitives::register_builtin_modules(&mut primitives, true);
+        let meta = primitives.builtin_modules().get("steel/meta").unwrap();
+        engine.register_value(
+            "probe-gc",
+            meta.inner_map().get("#%gc-collect").unwrap().clone(),
+        );
+        engine
+            .run(
+                r#"
+            (define (probe-cycles)
+              (define rows (map (lambda (i) (hash "i" i "owner" (probe-value))) (range 100)))
+              (define (walk i) (if (< i (length rows)) (walk (+ i 1)) void))
+              (walk 0))
+        "#,
+            )
+            .unwrap();
+        for _ in 0..1000 {
+            engine
+                .call_function_by_name_with_args("probe-cycles", vec![])
+                .unwrap();
+        }
+        assert!(
+            Arc::strong_count(&count) < 10_000,
+            "unreachable recursive captures must be collected during sustained callbacks"
+        );
+        engine.run("(probe-gc)").unwrap();
+        assert_eq!(
+            Arc::strong_count(&count),
+            3,
+            "only the live value and factory may retain the payload"
+        );
+        engine.run("(set! live #f) (probe-gc)").unwrap();
+        assert_eq!(
+            Arc::strong_count(&count),
+            2,
+            "discarded payloads must be released before heap slots are reused"
+        );
+    }
+
+    #[test]
+    fn list_equality_checks_shared_prefixes_with_different_tails() {
+        let mut engine = Engine::new();
+        engine.run("(define prefix (range 50)) (define a (append prefix '(50))) (define b (append prefix '(51)))").unwrap();
+        for expression in [
+            "(equal? prefix a)",
+            "(equal? a b)",
+            "(equal? (list a) (list b))",
+            "(eq? a b)",
+        ] {
+            assert_eq!(
+                engine.run(expression).unwrap(),
+                [crate::SteelVal::BoolV(false)],
+                "{expression}"
+            );
+        }
+        assert_eq!(
+            engine.run("(equal? a (range 51))").unwrap(),
+            [crate::SteelVal::BoolV(true)]
+        );
+    }
+}

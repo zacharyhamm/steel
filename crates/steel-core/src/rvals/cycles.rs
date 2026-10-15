@@ -1941,12 +1941,12 @@ impl<'a> RecursiveEqualityHandler<'a> {
             match (left, right) {
                 (ListV(l), ListV(r)) => {
                     // If we've reached the same object, we're good
-                    if l.ptr_eq(&r) || l.storage_ptr_eq(&r) {
+                    if l.ptr_eq(&r) {
                         continue;
                     }
 
-                    if self.should_visit(l.identity_tuple())
-                        && self.should_visit(r.identity_tuple())
+                    if self.should_visit((l.as_ptr_usize(), 0))
+                        && self.should_visit((r.as_ptr_usize(), 0))
                     {
                         if l.len() != r.len() {
                             return false;
@@ -1958,8 +1958,7 @@ impl<'a> RecursiveEqualityHandler<'a> {
                             match (lvalue, rvalue) {
                                 (SteelVal::ListV(llist), SteelVal::ListV(rlist))
                                     if (llist.is_empty() && rlist.is_empty())
-                                        || llist.ptr_eq(rlist)
-                                        || llist.storage_ptr_eq(rlist) =>
+                                        || llist.ptr_eq(rlist) =>
                                 {
                                     continue;
                                 }
