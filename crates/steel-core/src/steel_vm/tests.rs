@@ -1212,7 +1212,11 @@ mod embedding_regressions {
             "(equal? prefix a)",
             "(equal? a b)",
             "(equal? (list a) (list b))",
+            "(eq? prefix a)",
             "(eq? a b)",
+            "(eq? (cdr a) (cdr b))",
+            "(eq? a (cdr a))",
+            "(eq? (cdr a) (cdr (cdr a)))",
             "(eqv? a b)",
         ] {
             assert_eq!(
@@ -1221,10 +1225,18 @@ mod embedding_regressions {
                 "{expression}"
             );
         }
-        assert_eq!(
-            engine.run("(equal? a (range 51))").unwrap(),
-            [crate::SteelVal::BoolV(true)]
-        );
+        for expression in [
+            "(equal? a (range 51))",
+            "(eq? (cdr a) (cdr a))",
+            "(eqv? (cdr a) (cdr a))",
+            "(equal? (cdr a) (cdr a))",
+        ] {
+            assert_eq!(
+                engine.run(expression).unwrap(),
+                [crate::SteelVal::BoolV(true)],
+                "{expression}"
+            );
+        }
     }
 
     #[test]
@@ -1510,6 +1522,42 @@ mod embedding_regressions {
         collection.unwrap();
         assert_eq!(result.unwrap(), 42);
         assert_eq!(joined.unwrap(), crate::SteelVal::IntV(42));
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn global_collection_handles_finalizers_capturing_their_executor() {
+        let mut engine = Engine::new();
+        register_gc(&mut engine);
+        engine
+            .run(
+                r#"
+                (define key-value (box 17))
+                (define callback-value (box 25))
+                (define executor (make-will-executor))
+                (let ((captured executor))
+                  (will-register executor
+                    (box (lambda () (unbox key-value)))
+                    (lambda (key)
+                      (if (eq? captured executor)
+                          (+ ((unbox key)) (unbox callback-value))
+                          0))))
+                "#,
+            )
+            .unwrap();
+        engine
+            .run("(define key-value (box 0)) (define callback-value (box 0))")
+            .unwrap();
+
+        for _ in 0..150 {
+            engine.run("(define shadowed 0)").unwrap();
+        }
+
+        engine.run("(probe-gc)").unwrap();
+        assert_eq!(
+            engine.run("(will-execute executor)").unwrap(),
+            [crate::SteelVal::IntV(42)]
+        );
     }
 
     #[cfg(feature = "sync")]

@@ -81,6 +81,9 @@ pub struct GlobalSlotRecycler {
     slots: HashSet<usize>,
 
     queue: Vec<SteelVal>,
+
+    #[cfg(feature = "sync")]
+    will_executors: Vec<GcMut<Box<dyn CustomType>>>,
 }
 
 impl GlobalSlotRecycler {
@@ -99,6 +102,8 @@ impl GlobalSlotRecycler {
     // push the values back, visit, mark visited, move on.
     pub fn recycle(&mut self, roots: &mut [SteelVal], symbol_map: &mut SymbolMap, heap: &mut Heap) {
         self.slots.clear();
+        #[cfg(feature = "sync")]
+        self.will_executors.clear();
 
         // TODO: Right now, after one pass, we'll ignore it forever.
         // we should move it to another stage that we check later.
@@ -318,6 +323,18 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
     }
     // TODO: Come back to this
     fn visit_custom_type(&mut self, custom_type: GcMut<Box<dyn CustomType>>) -> Self::Output {
+        #[cfg(feature = "sync")]
+        if custom_type.read().as_any_ref().is::<WillExecutor>() {
+            if self
+                .will_executors
+                .iter()
+                .any(|other| Gc::ptr_eq(other, &custom_type))
+            {
+                return;
+            }
+            self.will_executors.push(custom_type.clone());
+        }
+
         let mut queue = MarkAndSweepContext {
             queue: &mut self.queue,
             stats: MarkAndSweepStats::default(),

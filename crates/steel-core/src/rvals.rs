@@ -2366,10 +2366,7 @@ fn slow_path_eq_lists(
     l: &crate::values::lists::List<SteelVal>,
     r: &crate::values::lists::List<SteelVal>,
 ) -> bool {
-    l.storage_ptr_eq(r)
-        && l.index() == r.index()
-        && l.len() == r.len()
-        && l.next_ptr_as_usize() == r.next_ptr_as_usize()
+    l.storage_ptr_eq(r) && l.index() == r.index() && l.next_ptr_as_usize() == r.next_ptr_as_usize()
 }
 
 impl Hash for SteelVal {
