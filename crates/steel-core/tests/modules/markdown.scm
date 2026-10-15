@@ -40,7 +40,7 @@
                           set-event-text!
                           set-event-as-html!))
 
-(require "steel/fs/fs.scm")
+(require "fs/fs.scm")
 
 (provide parse
          parser

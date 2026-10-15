@@ -1,8 +1,8 @@
 (require "markdown.scm")
-(require "steel/fs/fs.scm")
+(require "fs/fs.scm")
 (require "front-matter.scm")
-(require "steel/sorting/quick-sort.scm")
-(require "steel/logging/log.scm")
+(require "sorting/quick-sort.scm")
+(require "logging/log.scm")
 
 (define highlighter (syntax-highlighter))
 
