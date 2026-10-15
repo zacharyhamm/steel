@@ -8,9 +8,11 @@ impl ControlOperations {
             let mut error_message = String::new();
 
             for arg in args {
-                let error_val = arg.to_string();
                 error_message.push(' ');
-                error_message.push_str(error_val.trim_matches('\"'));
+                match arg {
+                    SteelVal::StringV(value) => error_message.push_str(value.as_str()),
+                    _ => error_message.push_str(&arg.to_string()),
+                }
             }
 
             Ok(SteelVal::StringV(error_message.into()))
@@ -23,9 +25,11 @@ impl ControlOperations {
 
             if !args.is_empty() {
                 for arg in args {
-                    let error_val = arg.to_string();
                     error_message.push(' ');
-                    error_message.push_str(error_val.trim_matches('\"'));
+                    match arg {
+                        SteelVal::StringV(value) => error_message.push_str(value.as_str()),
+                        _ => error_message.push_str(&arg.to_string()),
+                    }
                 }
 
                 stop!(Generic => error_message);

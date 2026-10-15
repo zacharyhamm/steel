@@ -396,7 +396,12 @@ impl Analysis {
         let mutated_and_captured_vars = self
             .function_info
             .values()
-            .flat_map(|x| x.captured_vars.iter().map(|x| &x.1))
+            .flat_map(|x| {
+                x.captured_vars
+                    .iter()
+                    .chain(x.arguments.iter())
+                    .map(|x| &x.1)
+            })
             .chain(self.let_info.values().flat_map(|x| x.arguments.values()))
             .filter(|x| x.captured && x.mutated)
             .map(|x| x.id)
@@ -2398,7 +2403,7 @@ impl<'a> VisitorMutUnitRef<'a> for FunctionSizeEstimator {
             ExprKind::Return(r) => {
                 // TODO: @matt there needs to be a better way
                 // to pessimize this
-                self.count = std::usize::MAX;
+                self.count = usize::MAX;
                 self.visit_return(r)
             }
             ExprKind::Quote(q) => self.visit_quote(q),
@@ -2439,7 +2444,7 @@ impl<'a> VisitorMutUnitRef<'a> for FunctionSizeEstimator {
         self.map
             .insert(SyntaxObjectId(lambda_function.syntax_object_id), self.count);
 
-        if self.count != std::usize::MAX {
+        if self.count != usize::MAX {
             self.count = current_count;
         }
     }

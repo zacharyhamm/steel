@@ -187,7 +187,8 @@ impl<'a> CodeGenerator<'a> {
                 // stop!()
             };
 
-        if value < 0 {
+        // The immediate payload stores only 24 bits; larger constants use the constant pool.
+        if !(0..=0x00ff_ffff).contains(&value) {
             return None;
         }
 

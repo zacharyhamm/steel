@@ -1694,6 +1694,20 @@ impl Engine {
         })
     }
 
+    /// Give in-memory source a diagnostic name without granting a filesystem module origin.
+    pub fn emit_raw_program_with_source_name<E: AsRef<str> + Into<Cow<'static, str>>>(
+        &mut self,
+        expr: E,
+        source_name: PathBuf,
+    ) -> Result<RawProgramWithSymbols> {
+        self.with_sources_guard(|| {
+            self.virtual_machine
+                .compiler
+                .write()
+                .compile_executable_with_source_name(expr, Some(source_name), None)
+        })
+    }
+
     #[doc(hidden)]
     pub fn debug_build_strings(&mut self, program: RawProgramWithSymbols) -> Result<Vec<String>> {
         program.debug_generate_instructions(&mut self.virtual_machine.compiler.write().symbol_map)

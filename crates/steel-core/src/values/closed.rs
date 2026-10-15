@@ -2,9 +2,6 @@ use core::cell::RefCell;
 use std::collections::HashSet;
 
 #[cfg(feature = "sync")]
-use std::{sync::Arc, thread::JoinHandle};
-
-#[cfg(feature = "sync")]
 use std::sync::Mutex;
 
 #[cfg(feature = "sync")]
@@ -557,9 +554,6 @@ type HeapVector = StandardSharedMut<HeapAllocated<Vec<SteelVal>>>;
 type HeapElement<T> = StandardSharedMut<HeapAllocated<T>>;
 
 #[cfg(feature = "sync")]
-static MARKER: std::sync::LazyLock<ParallelMarker> = std::sync::LazyLock::new(ParallelMarker::new);
-
-#[cfg(feature = "sync")]
 pub struct WillExecutor {
     // Determining if these are reachable should be either:
     // * Value is a weak reference: then you use weak references
@@ -1030,7 +1024,7 @@ fn parallel_mark_counts_each_slot_exactly_once() {
 impl<T: HeapAble + Sync + Send + 'static> FreeList<T> {
     // TODO: Calculate the overhead!
     // How big is this?
-    const EXTEND_CHUNK: usize = 256 * 100;
+    const EXTEND_CHUNK: usize = 256;
 
     fn new() -> Self {
         // #[cfg(feature = "sync")]
@@ -1214,6 +1208,7 @@ impl<T: HeapAble + Sync + Send + 'static> FreeList<T> {
                     // Reset the values as well?
                     amount_dropped += 1;
                 }
+                guard.value = T::empty();
             }
         });
 
@@ -1275,7 +1270,7 @@ impl<T: HeapAble + Sync + Send + 'static> FreeList<T> {
 impl<T: HeapAble + 'static> FreeList<T> {
     // TODO: Calculate the overhead!
     // How big is this?
-    const EXTEND_CHUNK: usize = 256 * 100;
+    const EXTEND_CHUNK: usize = 256;
 
     fn new() -> Self {
         #[cfg(feature = "sync")]
@@ -1452,6 +1447,7 @@ impl<T: HeapAble + 'static> FreeList<T> {
                     guard.reachable = false;
                     amount_dropped += 1;
                 }
+                guard.value = T::empty();
             }
         });
 
@@ -1787,7 +1783,7 @@ impl Heap {
                 if self.memory_free_list.grow_count > RESET_LIMIT {
                     // Compact the free list.
                     self.memory_free_list.compact();
-                } else {
+                } else if self.memory_free_list.percent_full() > 0.95 {
                     self.memory_free_list.grow();
                 }
 
@@ -1889,7 +1885,7 @@ impl Heap {
                 if self.vector_free_list.grow_count > RESET_LIMIT {
                     // Compact the free list.
                     self.vector_free_list.compact();
-                } else {
+                } else if self.vector_free_list.percent_full() > 0.95 {
                     self.vector_free_list.grow();
                 }
 
@@ -1963,7 +1959,7 @@ impl Heap {
                 if self.vector_free_list.grow_count > RESET_LIMIT {
                     // Compact the free list.
                     self.vector_free_list.compact();
-                } else {
+                } else if self.vector_free_list.percent_full() > 0.95 {
                     self.vector_free_list.grow();
                 }
 
@@ -2096,121 +2092,35 @@ impl Heap {
             });
         }
 
-        // TODO: Can we do this in parallel? Divide up the iterator into separate components
-        // and do them that way?
-        log::debug!(target: "gc", "Stack size: {}", context.queue.len());
-
+        // Each confined interpreter has its own memory budget. Mark on its current
+        // thread instead of allocating a machine-sized worker pool at the first GC.
         #[cfg(feature = "sync")]
-        let count = MARKER.mark(context.queue);
-
+        let stats = {
+            let queue = crossbeam_queue::SegQueue::new();
+            for value in context.queue.iter() {
+                if let Some(pointer) = SteelValPointer::from_value(value) {
+                    queue.push(pointer);
+                }
+            }
+            let mut local_queue = Vec::new();
+            let mut marker = MarkAndSweepContextRefQueue {
+                queue: &queue,
+                local_queue: &mut local_queue,
+                stats: MarkAndSweepStats::default(),
+            };
+            marker.visit();
+            context.queue.clear();
+            marker.stats
+        };
         #[cfg(not(feature = "sync"))]
-        let count = {
+        let stats = {
             context.visit();
             context.stats
         };
-
-        // log::debug!(target: "gc", "Mark: Time taken: {:?}", now.elapsed());
-        count
-    }
-}
-
-#[cfg(feature = "sync")]
-#[derive(Clone)]
-struct ParallelMarker {
-    // Chunks of the roots for marking
-    senders: Arc<Mutex<Vec<MarkerWorker>>>,
-    queue: Arc<crossbeam_queue::SegQueue<SteelValPointer>>,
-}
-
-#[cfg(feature = "sync")]
-unsafe impl Sync for ParallelMarker {}
-#[cfg(feature = "sync")]
-unsafe impl Send for ParallelMarker {}
-
-#[cfg(feature = "sync")]
-struct MarkerWorker {
-    // Tell the thread to wake up
-    sender: Sender<()>,
-    ack: Receiver<MarkAndSweepStats>,
-    handle: JoinHandle<()>,
-}
-
-#[cfg(feature = "sync")]
-impl ParallelMarker {
-    pub fn new() -> Self {
-        // No parallelism
-        let parallelism = std::thread::available_parallelism()
-            .map(|x| x.get() + 1)
-            .unwrap_or(1);
-
-        let mut workers = Vec::with_capacity(parallelism);
-        let queue = Arc::new(crossbeam_queue::SegQueue::new());
-
-        for _ in 0..parallelism {
-            let cloned_queue = queue.clone();
-            let (sender, receiver) = crossbeam_channel::unbounded();
-            let (ack_sender, ack_receiver) = crossbeam_channel::unbounded();
-
-            let handle = std::thread::spawn(move || {
-                let cloned_queue = cloned_queue;
-                // This... might be too big?
-                let mut local_queue = Vec::with_capacity(4096);
-                for _ in receiver {
-                    let now = crate::time::Instant::now();
-
-                    let mut context = MarkAndSweepContextRefQueue {
-                        queue: &cloned_queue,
-                        local_queue: &mut local_queue,
-                        stats: MarkAndSweepStats::default(),
-                    };
-
-                    context.visit();
-
-                    log::debug!(target: "gc",
-                        "{:?}: {:?} -> {:?}",
-                        std::thread::current().id(),
-                        now.elapsed(),
-                        context.stats
-                    );
-
-                    ack_sender.send(context.stats).unwrap();
-                }
-            });
-
-            workers.push(MarkerWorker {
-                sender,
-                handle,
-                ack: ack_receiver,
-            });
-        }
-
-        Self {
-            senders: Arc::new(Mutex::new(workers)),
-            queue,
-        }
-    }
-
-    pub fn mark(&self, queue: &[SteelVal]) -> MarkAndSweepStats {
-        let guard = self.senders.lock().unwrap();
-
-        for value in queue.iter() {
-            if let Some(p) = SteelValPointer::from_value(value) {
-                // Start with a local queue first?
-                self.queue.push(p);
-            }
-        }
-
-        for worker in guard.iter() {
-            worker.sender.send(()).unwrap();
-        }
-
-        let mut count = MarkAndSweepStats::default();
-
-        for worker in guard.iter() {
-            count = count + worker.ack.recv().unwrap();
-        }
-
-        count
+        // Free slots must release their payloads even if no later allocation reuses them.
+        self.memory_free_list.strong_collection();
+        self.vector_free_list.strong_collection();
+        stats
     }
 }
 

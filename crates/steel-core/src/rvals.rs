@@ -1856,6 +1856,11 @@ pub struct SteelByteVector {
 }
 
 impl SteelByteVector {
+    /// Borrow the byte storage without materializing a list of Scheme integers.
+    pub fn with_bytes<R>(&self, function: impl FnOnce(&[u8]) -> R) -> R {
+        function(&self.vec.read())
+    }
+
     pub fn new(vec: Vec<u8>) -> Self {
         Self {
             vec: Gc::new_mut(vec),
@@ -2337,9 +2342,7 @@ impl SteelVal {
             (ContinuationFunction(l), ContinuationFunction(r)) => Continuation::ptr_eq(l, r),
             (ListV(l), ListV(r)) => {
                 // Happy path
-                l.ptr_eq(r) || l.storage_ptr_eq(r) || (l.is_empty() && r.is_empty()) || {
-                    slow_path_eq_lists(l, r)
-                }
+                l.ptr_eq(r) || (l.is_empty() && r.is_empty()) || { slow_path_eq_lists(l, r) }
             }
             (MutFunc(l), MutFunc(r)) => *l as usize == *r as usize,
             (BuiltIn(l), BuiltIn(r)) => *l as usize == *r as usize,
