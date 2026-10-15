@@ -833,6 +833,84 @@ mod embedding_regressions {
     }
 
     #[test]
+    fn let_family_preserves_returns_and_bindings() {
+        let mut engine = Engine::new();
+        for form in ["let*", "letrec", "letrec*"] {
+            for bindings in ["()", "((x 1))", "((x 1) (y (+ x 1)))"] {
+                let source = format!("((lambda () ({form} {bindings} (let () (return! 9))) 10))");
+                assert_eq!(
+                    engine.run(source.clone()).unwrap().last(),
+                    Some(&crate::SteelVal::IntV(9)),
+                    "{source}"
+                );
+            }
+            for body in [
+                format!("({form} ((x 1) (y (return! 9))) y)"),
+                format!("({form} () ({form} ((x 1)) (return! 9)))"),
+            ] {
+                let source = format!("((lambda () {body} 10))");
+                assert_eq!(
+                    engine.run(source.clone()).unwrap().last(),
+                    Some(&crate::SteelVal::IntV(9)),
+                    "{source}"
+                );
+            }
+            let source = format!(
+                "((lambda () ({form} ((x ((lambda () (return! 9))))) ((lambda () (return! x)))) 10))"
+            );
+            assert_eq!(
+                engine.run(source.clone()).unwrap().last(),
+                Some(&crate::SteelVal::IntV(10)),
+                "{source}"
+            );
+            let source = format!(
+                "(let ((effects '())) ({form} ((x (begin (set! effects (cons 1 effects)) 1)) (y (begin (set! effects (cons 2 effects)) (+ x 1)))) (list x y effects)))"
+            );
+            assert_eq!(
+                engine
+                    .run(source.clone())
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .to_string(),
+                "(1 2 (2 1))",
+                "{source}"
+            );
+        }
+        for form in ["letrec", "letrec*"] {
+            let source = format!(
+                "({form} ((even? (lambda (n) (if (= n 0) #t (odd? (- n 1))))) (odd? (lambda (n) (if (= n 0) #f (even? (- n 1)))))) (even? 10))"
+            );
+            assert_eq!(
+                engine.run(source.clone()).unwrap().last(),
+                Some(&crate::SteelVal::BoolV(true)),
+                "{source}"
+            );
+        }
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn garbage_collection_preserves_shared_graph() {
+        let mut engine = Engine::new();
+        register_gc(&mut engine);
+        engine
+            .run(
+                "(define (wrap n node) (if (= n 0) node (wrap (- n 1) (list node node))))
+             (define graph (wrap 22 (box 42)))
+             (probe-gc)",
+            )
+            .unwrap();
+        let result = engine
+            .run(
+                "(define (leaf n node) (if (= n 0) (unbox node) (leaf (- n 1) (car node))))
+             (leaf 22 graph)",
+            )
+            .unwrap();
+        assert_eq!(result.last(), Some(&crate::SteelVal::IntV(42)));
+    }
+
+    #[test]
     fn internal_initializers_preserve_order_dependencies_and_lambda_returns() {
         let mut engine = Engine::new();
         let result = engine

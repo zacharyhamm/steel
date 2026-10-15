@@ -638,15 +638,14 @@
   (syntax-rules ()
     [(let* ()
        body ...) ; base case
-     ((lambda ()
-        body ...))]
+     (let ()
+       body ...)]
     [(let* ([var val]
             rest ...)
        body ...) ; binding case
-     ((lambda (var)
-        (let* (rest ...)
-          body ...))
-      val)]))
+     (let ([var val])
+       (let* (rest ...)
+         body ...))]))
 
 (define-syntax #%letrec*-helper
   (syntax-rules ()
@@ -665,7 +664,7 @@
 ;; Alias for `letrec`.
 (define-syntax letrec*
   (syntax-rules ()
-    [(letrec* bindings body ...) ((lambda () (#%letrec*-helper bindings body ...)))]))
+    [(letrec* bindings body ...) (let () (#%letrec*-helper bindings body ...))]))
 
 ;;@doc
 ;; Syntax:
@@ -692,7 +691,7 @@
   (syntax-rules ()
     [(letrec bindings
        body ...)
-     ((lambda () (#%letrec*-helper bindings body ...)))]))
+     (let () (#%letrec*-helper bindings body ...))]))
 
 (define-syntax module
   (syntax-rules (provide gen-defines
