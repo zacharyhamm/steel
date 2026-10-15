@@ -851,6 +851,142 @@ mod embedding_regressions {
     }
 
     #[cfg(feature = "sync")]
+    fn check_other_thread_allocations(constructor: &str, reader: &str) {
+        use crate::steel_vm::{register_fn::RegisterFn, vm::threads::thread_join};
+        use std::{
+            panic::{catch_unwind, AssertUnwindSafe},
+            time::Duration,
+        };
+
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let mut engine = Engine::new();
+        register_gc(&mut engine);
+        engine.register_fn("probe-block", move || {
+            ready_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).is_ok()
+        });
+        let worker = engine
+            .run(format!(
+                r#"
+                (spawn-native-thread
+                  (lambda ()
+                    (define retained (map {constructor} (range 200)))
+                    (and (probe-block)
+                         (equal? (map {reader} retained) (range 200)))))
+                "#,
+            ))
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        // Join the worker even if incorrect free-slot accounting panics during allocation.
+        let allocation = catch_unwind(AssertUnwindSafe(|| {
+            engine
+                .virtual_machine
+                .enter_safepoint(|_| ready_rx.recv_timeout(Duration::from_secs(10)))
+                .unwrap();
+            engine
+                .run(format!(
+                    r#"
+                    (probe-gc)
+                    (define added (map {constructor} (range 1000)))
+                    (equal? (map {reader} added) (range 1000))
+                    "#,
+                ))
+                .unwrap()
+        }));
+        let _ = release_tx.send(());
+        engine.virtual_machine.synchronizer.resume_threads();
+        let retained = engine
+            .virtual_machine
+            .enter_safepoint(|_| thread_join(&worker));
+
+        assert_eq!(
+            allocation.unwrap().last(),
+            Some(&crate::SteelVal::BoolV(true))
+        );
+        assert_eq!(retained.unwrap(), crate::SteelVal::BoolV(true));
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn other_thread_roots_count_toward_box_allocations() {
+        check_other_thread_allocations("box", "unbox");
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn other_thread_roots_count_toward_vector_allocations() {
+        check_other_thread_allocations("vector", "(lambda (value) (vector-ref value 0))");
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn other_thread_finalizers_record_eligibility_before_retention() {
+        use crate::steel_vm::{register_fn::RegisterFn, vm::threads::thread_join};
+        use std::{
+            panic::{catch_unwind, AssertUnwindSafe},
+            time::Duration,
+        };
+
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let (result_tx, result_rx) = crossbeam_channel::bounded(1);
+        let mut engine = Engine::new();
+        register_gc(&mut engine);
+        engine.register_fn("probe-block", move || {
+            ready_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).is_ok()
+        });
+        engine.register_fn("probe-result", move |value: isize| {
+            result_tx.send(value).unwrap();
+            value
+        });
+        let worker = engine
+            .run(
+                r#"
+                (define executor (make-will-executor))
+                (let ((target (box #f)))
+                  (set-box! target (list target 42))
+                  (will-register executor target (lambda (value) (car (cdr (unbox value))))))
+                (let ((captured executor))
+                  (spawn-native-thread
+                    (lambda ()
+                      (and (probe-block)
+                           (probe-result (will-execute captured))))))
+                "#,
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let collection = catch_unwind(AssertUnwindSafe(|| {
+            engine
+                .virtual_machine
+                .enter_safepoint(|_| ready_rx.recv_timeout(Duration::from_secs(10)))
+                .unwrap();
+            engine.run("(probe-gc) (probe-gc)").unwrap();
+        }));
+        engine.virtual_machine.synchronizer.resume_threads();
+        let _ = release_tx.send(());
+        // Registration wakes will-execute even if GC failed to make the first will eligible.
+        engine
+            .run("(will-register executor (box 99) (lambda (value) (unbox value)))")
+            .unwrap();
+        let result = engine
+            .virtual_machine
+            .enter_safepoint(|_| result_rx.recv_timeout(Duration::from_secs(10)));
+        let joined = engine
+            .virtual_machine
+            .enter_safepoint(|_| thread_join(&worker));
+
+        collection.unwrap();
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(joined.unwrap(), crate::SteelVal::IntV(42));
+    }
+
+    #[cfg(feature = "sync")]
     #[test]
     fn finalizers_retain_heap_payloads_across_collections() {
         let mut engine = Engine::new();
