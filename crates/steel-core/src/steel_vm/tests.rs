@@ -613,6 +613,101 @@ mod find_closest_match_tests {
 mod embedding_regressions {
     use crate::steel_vm::engine::Engine;
 
+    #[cfg(feature = "sync")]
+    #[test]
+    fn exported_boxed_callback_keeps_globals_alive_after_engine_drop() {
+        let mut engine = Engine::new_raw_no_kernel();
+        crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+        engine.register_value(
+            "#%closure->boxed-function",
+            crate::SteelVal::BuiltIn(crate::steel_vm::primitives::closure_to_boxed_function),
+        );
+        let heap = std::sync::Arc::downgrade(&engine.virtual_machine.heap);
+        let callback = engine
+            .run(
+                "(require-builtin steel/meta)
+                 (define state (box 42))
+                 (#%closure->boxed-function (lambda () (unbox state)))",
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+        let crate::SteelVal::BoxedFunction(callback) = callback else {
+            panic!("expected a boxed callback");
+        };
+        drop(engine);
+        for _ in 0..2 {
+            assert_eq!(callback.func()(&[]).unwrap(), crate::SteelVal::IntV(42));
+        }
+        drop(callback);
+        assert!(heap.upgrade().is_none());
+    }
+
+    #[cfg(all(feature = "sync", feature = "dylibs"))]
+    #[test]
+    fn exported_ffi_callback_keeps_globals_alive_after_engine_drop() {
+        use crate::steel_vm::ffi::{FFIValue, HostRuntimeFunction};
+        use abi_stable::std_types::RSliceMut;
+
+        let mut engine = Engine::new_raw_no_kernel();
+        crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+        engine.register_value(
+            "function->ffi-function",
+            crate::SteelVal::BuiltIn(crate::steel_vm::ffi::function_to_ffi_function),
+        );
+        let heap = std::sync::Arc::downgrade(&engine.virtual_machine.heap);
+        let callback = engine
+            .run(
+                "(require-builtin steel/meta)
+                 (define state (box 42))
+                 (function->ffi-function (lambda () (unbox state)))",
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+        let crate::SteelVal::Custom(callback) = callback else {
+            panic!("expected an FFI callback");
+        };
+        drop(engine);
+        {
+            let guard = callback.read();
+            let function =
+                crate::rvals::as_underlying_type::<HostRuntimeFunction>(guard.as_ref()).unwrap();
+            for _ in 0..2 {
+                assert!(matches!(
+                    function.call(RSliceMut::from_mut_slice(&mut [])).unwrap(),
+                    FFIValue::IntV(42)
+                ));
+            }
+        }
+        drop(callback);
+        assert!(heap.upgrade().is_none());
+    }
+
+    #[test]
+    fn cloned_thread_keeps_globals_alive_after_engine_drop() {
+        let mut engine = Engine::new_raw_no_kernel();
+        crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+        let heap = std::sync::Arc::downgrade(&engine.virtual_machine.heap);
+        let function = engine
+            .run(
+                "(require-builtin steel/meta)
+                 (define state (box 42))
+                 (lambda () (unbox state))",
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut thread = engine.virtual_machine.clone();
+        drop(engine);
+        assert_eq!(
+            thread.call_fn_from_mut_slice(function, &mut []).unwrap(),
+            crate::SteelVal::IntV(42)
+        );
+        drop(thread);
+        assert!(heap.upgrade().is_none());
+    }
+
     struct StoredThread {
         _thread: crate::steel_vm::vm::SteelThread,
         dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -643,7 +738,7 @@ mod embedding_regressions {
 
         let dropped = Arc::new(AtomicUsize::new(0));
         let stored = StoredThread {
-            _thread: engine.virtual_machine.clone(),
+            _thread: engine.virtual_machine.clone_for_storage(),
             dropped: dropped.clone(),
             heap: Arc::downgrade(&engine.virtual_machine.heap),
         }
@@ -728,7 +823,7 @@ mod embedding_regressions {
         let dropped = store_thread_clone(&mut engine, false);
         let first_result = (
             engine.extract_value("stored-thread").unwrap().as_rooted(),
-            engine.virtual_machine.heap.clone(),
+            engine.virtual_machine.heap.clone_for_storage(),
         );
         let other = crate::SteelVal::HeapAllocated(
             engine
@@ -737,7 +832,10 @@ mod embedding_regressions {
                 .lock()
                 .allocate_without_collection(crate::SteelVal::IntV(42)),
         );
-        let second_result = (other.as_rooted(), engine.virtual_machine.heap.clone());
+        let second_result = (
+            other.as_rooted(),
+            engine.virtual_machine.heap.clone_for_storage(),
+        );
         drop(engine);
         assert_eq!(dropped.load(Ordering::SeqCst), 0);
         drop(first_result);

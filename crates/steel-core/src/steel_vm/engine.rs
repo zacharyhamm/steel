@@ -268,7 +268,7 @@ impl Drop for Engine {
 
 impl Clone for Engine {
     fn clone(&self) -> Self {
-        let mut virtual_machine = self.virtual_machine.clone_for_execution();
+        let mut virtual_machine = self.virtual_machine.clone();
 
         // Set up child
         virtual_machine.synchronizer = Synchronizer::new();
@@ -1970,7 +1970,7 @@ impl Engine {
         if guard.symbol_map.free_list.should_collect() {
             drop(guard);
 
-            let heap = self.virtual_machine.heap.clone();
+            let heap = self.virtual_machine.heap.clone_for_storage();
 
             let mut heap_lock = self.virtual_machine.enter_safepoint(|_| heap.lock());
 
@@ -2187,7 +2187,7 @@ impl Engine {
     pub fn update_value(&mut self, name: &str, value: SteelVal) -> Option<&mut Self> {
         let idx = self.virtual_machine.compiler.read().get_idx(name)?;
 
-        let heap = self.virtual_machine.heap.clone();
+        let heap = self.virtual_machine.heap.clone_for_storage();
 
         let _ = self.virtual_machine.enter_safepoint(|_| heap.lock());
 
