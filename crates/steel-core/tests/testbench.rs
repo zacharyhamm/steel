@@ -8,6 +8,23 @@ use steel::steel_vm::engine::Engine;
 use steel::PRELUDE;
 
 #[test]
+fn compile_long_dotted_list_literal() {
+    let mut engine = Engine::new();
+    let source = format!("'(0 {}. 2)", "1 ".repeat(29_999));
+    let values = engine.compile_and_run_raw_program(source).unwrap();
+    assert_eq!(values.len(), 1);
+
+    let mut tail = &values[0];
+    for index in 0..30_000 {
+        let pair = tail.pair().expect("expected another pair");
+        let expected = if index == 0 { 0 } else { 1 };
+        assert_eq!(pair.car_ref(), &steel::SteelVal::IntV(expected));
+        tail = pair.cdr_ref();
+    }
+    assert_eq!(tail, &steel::SteelVal::IntV(2));
+}
+
+#[test]
 fn basic_test() {
     test_from_files(
         "tests/test_files/input_tests.rkt",

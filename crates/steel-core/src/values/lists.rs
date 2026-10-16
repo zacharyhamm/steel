@@ -1,4 +1,5 @@
 use core::cell::Cell;
+use core::hash::{Hash, Hasher};
 
 use im_lists::{
     handler::{DefaultDropHandler, DropHandler},
@@ -13,7 +14,7 @@ use crate::{
 
 // TODO:
 // Builtin immutable pairs
-#[derive(Clone, Hash)]
+#[derive(Clone)]
 pub struct Pair {
     pub(crate) car: SteelVal,
     pub(crate) cdr: SteelVal,
@@ -38,6 +39,26 @@ impl Pair {
 
     pub fn cdr_ref(&self) -> &SteelVal {
         &self.cdr
+    }
+}
+
+impl Hash for Pair {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let mut pair = self;
+        loop {
+            pair.car.hash(state);
+            match &pair.cdr {
+                SteelVal::Pair(next) => {
+                    // Preserve SteelVal's tag when hashing the tail without recursion.
+                    core::mem::discriminant(&pair.cdr).hash(state);
+                    pair = next;
+                }
+                tail => {
+                    tail.hash(state);
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -271,5 +292,38 @@ impl<T: IntoSteelVal + Clone, D: im_lists::handler::DropHandler<Self>> IntoSteel
             .map(|x| x.into_steelval())
             .collect::<crate::rvals::Result<List<_>>>()
             .map(SteelVal::ListV)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::hash_map::DefaultHasher;
+
+    #[test]
+    fn pair_hash_preserves_recursive_field_order() {
+        fn hash_recursively(value: &SteelVal, state: &mut impl Hasher) {
+            if let SteelVal::Pair(pair) = value {
+                core::mem::discriminant(value).hash(state);
+                hash_recursively(pair.car_ref(), state);
+                hash_recursively(pair.cdr_ref(), state);
+            } else {
+                value.hash(state);
+            }
+        }
+
+        let inner: SteelVal = Pair::cons(SteelVal::IntV(1), SteelVal::BoolV(false)).into();
+        for tail in [
+            SteelVal::IntV(2),
+            inner.clone(),
+            SteelVal::ListV(Default::default()),
+        ] {
+            let value: SteelVal = Pair::cons(inner.clone(), tail).into();
+            let mut expected = DefaultHasher::new();
+            hash_recursively(&value, &mut expected);
+            let mut actual = DefaultHasher::new();
+            value.hash(&mut actual);
+            assert_eq!(actual.finish(), expected.finish());
+        }
     }
 }
