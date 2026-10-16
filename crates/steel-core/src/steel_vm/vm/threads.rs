@@ -1126,7 +1126,7 @@ pub(crate) fn spawn_native_thread(ctx: &mut VmCore, args: &[SteelVal]) -> Option
     let thread_time = crate::time::Instant::now();
 
     // Do this here?
-    let mut thread = ctx.thread.clone_for_execution();
+    let mut thread = ctx.thread.clone();
 
     thread.stack.clear();
     thread.stack_frames.clear();
@@ -1166,7 +1166,7 @@ pub(crate) fn spawn_native_thread(ctx: &mut VmCore, args: &[SteelVal]) -> Option
         // like we're not getting it installed correctly, and things are dying
         thread
             .call_function(constant_map, func, Vec::new())
-            .map(|value| (value.as_rooted(), thread.heap.clone()))
+            .map(|value| (value.as_rooted(), thread.heap.clone_for_storage()))
             .map_err(|e| e.to_string())
     });
 
@@ -1179,7 +1179,7 @@ pub(crate) fn spawn_native_thread(ctx: &mut VmCore, args: &[SteelVal]) -> Option
         // like we're not getting it installed correctly, and things are dying
         thread
             .call_function(constant_map, func, Vec::new())
-            .map(|value| (value.as_rooted(), thread.heap.clone()))
+            .map(|value| (value.as_rooted(), thread.heap.clone_for_storage()))
             .map_err(|e| e.to_string())
     });
 

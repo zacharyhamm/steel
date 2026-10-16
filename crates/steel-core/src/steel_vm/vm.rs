@@ -386,7 +386,6 @@ pub enum ThreadState {
 // }
 
 /// The thread execution context
-#[derive(Clone)]
 #[repr(C)]
 pub struct SteelThread {
     // TODO: Figure out how to best broadcast changes
@@ -425,6 +424,12 @@ pub struct SteelThread {
     pub(crate) heap: HeapHandle,
 }
 
+impl Clone for SteelThread {
+    fn clone(&self) -> Self {
+        self.clone_with_heap(self.heap.clone())
+    }
+}
+
 pub(crate) struct HeapState {
     heap: parking_lot::Mutex<Heap>,
     execution_owners: std::sync::atomic::AtomicUsize,
@@ -459,23 +464,31 @@ impl HeapHandle {
 
     fn acquire_execution_ownership(&mut self) {
         if !self.execution_owner {
-            let previous = self
-                .shared
+            use std::sync::atomic::Ordering::Relaxed;
+
+            #[allow(deprecated)] // try_update requires Rust 1.95.
+            self.shared
                 .execution_owners
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            assert!(previous > 0, "cannot execute on a closed heap");
+                .fetch_update(Relaxed, Relaxed, |owners| (owners > 0).then(|| owners + 1))
+                .expect("cannot execute on a closed heap");
             self.execution_owner = true;
+        }
+    }
+
+    /// Retain storage for snapshots, pending results, or temporary heap access.
+    pub(crate) fn clone_for_storage(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+            execution_owner: false,
         }
     }
 }
 
 impl Clone for HeapHandle {
     fn clone(&self) -> Self {
-        // Stored VM clones and pending results retain storage, not execution ownership.
-        Self {
-            shared: self.shared.clone(),
-            execution_owner: false,
-        }
+        let mut heap = self.clone_for_storage();
+        heap.acquire_execution_ownership();
+        heap
     }
 }
 
@@ -494,7 +507,7 @@ impl Drop for HeapHandle {
         if self.execution_owner {
             self.shared.execution_owners.fetch_sub(1, AcqRel);
         }
-        if self.shared.execution_owners.load(Acquire) != 0 {
+        if self.shared.execution_owners.load(Acquire) != 0 || Arc::strong_count(&self.shared) == 1 {
             return;
         }
         // A payload destructor can release another handle to this same heap.
@@ -519,6 +532,71 @@ impl Drop for HeapHandle {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod heap_handle_tests {
+    use super::{Heap, HeapHandle};
+    use crate::rvals::{Custom, IntoSteelVal};
+    use std::{
+        panic::{catch_unwind, AssertUnwindSafe},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Weak,
+        },
+    };
+
+    #[test]
+    fn closed_heap_acquisition_does_not_leave_an_execution_owner() {
+        let owner = HeapHandle::new(Heap::new());
+        let survivor = owner.clone();
+        let mut storage = owner.clone_for_storage();
+        drop(owner);
+        assert_eq!(storage.execution_owners.load(Ordering::Relaxed), 1);
+        drop(survivor);
+
+        for _ in 0..2 {
+            assert!(catch_unwind(AssertUnwindSafe(|| {
+                storage.acquire_execution_ownership();
+            }))
+            .is_err());
+            assert_eq!(storage.execution_owners.load(Ordering::Relaxed), 0);
+            assert!(!storage.execution_owner);
+            assert!(catch_unwind(AssertUnwindSafe(|| storage.clone())).is_err());
+            assert_eq!(storage.execution_owners.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn sole_heap_handle_releases_payloads_without_teardown() {
+        struct Probe {
+            heap: Weak<super::HeapState>,
+            drops: Arc<AtomicUsize>,
+        }
+
+        impl Custom for Probe {}
+
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                assert!(
+                    self.heap.upgrade().is_none(),
+                    "payload detached before heap drop"
+                );
+                self.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let heap = HeapHandle::new(Heap::new());
+        let drops = Arc::new(AtomicUsize::new(0));
+        let probe = Probe {
+            heap: Arc::downgrade(&heap),
+            drops: drops.clone(),
+        };
+        heap.lock()
+            .allocate_without_collection(probe.into_steelval().unwrap());
+        drop(heap);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
     }
 }
 
@@ -902,10 +980,34 @@ impl SteelThread {
         }
     }
 
-    pub(crate) fn clone_for_execution(&self) -> Self {
-        let mut thread = self.clone();
-        thread.heap.acquire_execution_ownership();
-        thread
+    /// Retain a stored snapshot without keeping its heap open for execution.
+    #[cfg(test)]
+    pub(crate) fn clone_for_storage(&self) -> Self {
+        self.clone_with_heap(self.heap.clone_for_storage())
+    }
+
+    fn clone_with_heap(&self, heap: HeapHandle) -> Self {
+        Self {
+            global_env: self.global_env.clone(),
+            stack: self.stack.clone(),
+            #[cfg(feature = "dynamic")]
+            profiler: self.profiler.clone(),
+            function_interner: self.function_interner.clone(),
+            runtime_options: self.runtime_options.clone(),
+            current_frame: self.current_frame.clone(),
+            stack_frames: self.stack_frames.clone(),
+            constant_map: self.constant_map.clone(),
+            interrupted: self.interrupted.clone(),
+            synchronizer: self.synchronizer.clone(),
+            thread_local_storage: self.thread_local_storage.clone(),
+            compiler: self.compiler.clone(),
+            id: self.id,
+            safepoints_enabled: self.safepoints_enabled,
+            #[cfg(feature = "jit2")]
+            jit: self.jit.clone(),
+            module_context: self.module_context.clone(),
+            heap,
+        }
     }
 
     pub(crate) fn replace_heap(&mut self, heap: Heap) {
@@ -1049,7 +1151,7 @@ impl SteelThread {
     }
 
     pub fn insert_binding(&mut self, idx: usize, value: SteelVal) {
-        let heap = self.heap.clone();
+        let heap = self.heap.clone_for_storage();
         let _ = self.enter_safepoint(|_| heap.lock());
 
         #[cfg(feature = "sync")]
@@ -1937,7 +2039,7 @@ impl<'a> VmCore<'a> {
     }
 
     pub fn make_box(&mut self, value: SteelVal) -> SteelVal {
-        let heap = self.thread.heap.clone();
+        let heap = self.thread.heap.clone_for_storage();
         let mut heap_lock = self.thread.enter_safepoint(|_| heap.lock());
         let allocated_var = heap_lock.allocate(
             value,
@@ -1955,7 +2057,7 @@ impl<'a> VmCore<'a> {
     // TODO: Accept a slice instead, or an iterator with a known size.
     // That way we can take advantage of a pre allocation.
     pub fn make_mutable_vector(&mut self, values: Vec<SteelVal>) -> SteelVal {
-        let heap = self.thread.heap.clone();
+        let heap = self.thread.heap.clone_for_storage();
         let mut heap_lock = self.thread.enter_safepoint(|_| heap.lock());
         let allocated_var = heap_lock.allocate_vector(
             values,
@@ -1974,7 +2076,7 @@ impl<'a> VmCore<'a> {
         &mut self,
         values: impl Iterator<Item = SteelVal> + Clone,
     ) -> SteelVal {
-        let heap = self.thread.heap.clone();
+        let heap = self.thread.heap.clone_for_storage();
         let mut heap_lock = self.thread.enter_safepoint(|_| heap.lock());
 
         let allocated_var = heap_lock.allocate_vector_iter(
@@ -1993,7 +2095,7 @@ impl<'a> VmCore<'a> {
     pub(crate) fn gc_collect(&mut self) {
         // Before we acquire a lock on the heap, make sure we're not going to block
         // anything since we could deadlock up to this point.
-        let heap = self.thread.heap.clone();
+        let heap = self.thread.heap.clone_for_storage();
         let mut heap_lock = self.thread.enter_safepoint(|_| heap.lock());
 
         heap_lock.collection(
@@ -4237,7 +4339,7 @@ impl<'a> VmCore<'a> {
     // get in place mutation.
     // Basically a `MoveReadGlobal`
     fn handle_set(&mut self, index: usize) -> Result<()> {
-        let heap = self.thread.heap.clone();
+        let heap = self.thread.heap.clone_for_storage();
         let _ = self.thread.enter_safepoint(|_| heap.lock());
         let value_to_assign = self.thread.stack.pop().unwrap();
 
@@ -4745,7 +4847,7 @@ impl<'a> VmCore<'a> {
     // #[inline(always)]
     fn handle_bind(&mut self, payload_size: usize) {
         // Guard against the heap
-        let heap = self.thread.heap.clone();
+        let heap = self.thread.heap.clone_for_storage();
         let _ = self.thread.enter_safepoint(|_| heap.lock());
 
         let value = self.thread.stack.pop().unwrap();
@@ -7520,7 +7622,7 @@ fn cons_handler(ctx: &mut VmCore<'_>) -> Result<()> {
 fn new_box_handler(ctx: &mut VmCore<'_>) -> Result<()> {
     let last = ctx.thread.stack.pop().unwrap();
 
-    let heap = ctx.thread.heap.clone();
+    let heap = ctx.thread.heap.clone_for_storage();
 
     let mut heap_lock = ctx.thread.enter_safepoint(|_| heap.lock());
     let allocated_var = heap_lock.allocate(

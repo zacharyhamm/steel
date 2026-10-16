@@ -2235,7 +2235,7 @@ fn make_mutable_box(ctx: &mut VmCore, args: &[SteelVal]) -> Option<Result<SteelV
         ));
     }
 
-    let heap = ctx.thread.heap.clone();
+    let heap = ctx.thread.heap.clone_for_storage();
 
     let mut heap_lock = ctx.thread.enter_safepoint(|_| heap.lock());
 
