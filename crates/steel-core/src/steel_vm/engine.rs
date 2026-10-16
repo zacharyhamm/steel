@@ -3085,3 +3085,28 @@ fn symbol_identity_is_independent_of_allocation() {
         SteelVal::BoolV(false)
     );
 }
+
+#[test]
+fn raw_engine_macro_defined_values_export_from_modules() {
+    let mut engine = Engine::new_raw_no_kernel();
+    crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+    engine
+        .run(
+            r#"
+        (require-builtin steel/lists)
+        (define-syntax define-values
+          (syntax-rules ()
+            [(define-values (a b) expression)
+             (begin (define temporary expression)
+                    (define a (car temporary)) (define b (car (cdr temporary))))]))
+    "#,
+        )
+        .unwrap();
+    engine.register_steel_module(
+        "values-module".into(),
+        "(provide a b) (define-values (a b) '(3 4))".into(),
+    );
+    engine.run("(require \"values-module\")").unwrap();
+    assert_eq!(engine.run("a").unwrap()[0], SteelVal::IntV(3));
+    assert_eq!(engine.run("b").unwrap()[0], SteelVal::IntV(4));
+}

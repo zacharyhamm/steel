@@ -39,6 +39,21 @@ pub fn collect_globals(exprs: &[ExprKind]) -> FxHashSet<InternedString> {
                     global_defs.insert(*name);
                 }
             }
+            // Global prelude macros expand after modules are named; preserve their exported bindings.
+            ExprKind::List(l)
+                if l.first_ident()
+                    .is_some_and(|name| name.resolve() == "define-values") =>
+            {
+                if let Some(ExprKind::List(bindings)) = l.get(1) {
+                    global_defs.extend(
+                        bindings
+                            .args
+                            .iter()
+                            .filter_map(ExprKind::atom_identifier)
+                            .copied(),
+                    );
+                }
+            }
             ExprKind::List(l)
                 if l.first_ident() == Some(&*DEFINE)
                     || l.first()
