@@ -55,7 +55,7 @@ use super::{
     functions::BoxedDynFunction,
     lazy_stream::LazyStream,
     port::SteelPort,
-    structs::UserDefinedStruct,
+    structs::{UserDefinedStruct, VTable},
     transducers::{Reducer, Transducer},
 };
 
@@ -122,6 +122,9 @@ impl GlobalSlotRecycler {
             if !self.slots.contains(&index) {
                 self.push_back(root.clone());
             }
+        }
+        for properties in VTable::property_maps_snapshot() {
+            self.push_back(SteelVal::HashMapV(properties.into()));
         }
 
         // Mark all unreachable for the purposes of the global
@@ -406,6 +409,9 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
     fn visit_future_function(&mut self, _function: BoxedAsyncFunctionSignature) -> Self::Output {}
 
     fn visit_hash_map(&mut self, hashmap: SteelHashMap) -> Self::Output {
+        if !self.visited.insert(hashmap.0.as_ptr() as usize) {
+            return;
+        }
         for (key, value) in hashmap.iter() {
             self.push_back(key.clone());
             self.push_back(value.clone());
@@ -425,7 +431,9 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
             visited: rustc_hash::FxHashSet::default(),
         };
 
-        queue.mark_heap_reference(&heap_ref.strong_ptr());
+        if let Some(heap_ref) = heap_ref.inner.upgrade() {
+            queue.mark_heap_reference(&heap_ref);
+        }
     }
 
     fn visit_immutable_vector(&mut self, vector: SteelVector) -> Self::Output {
@@ -452,7 +460,9 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
             visited: rustc_hash::FxHashSet::default(),
         };
 
-        queue.mark_heap_vector(&vector.strong_ptr())
+        if let Some(vector) = vector.inner.upgrade() {
+            queue.mark_heap_vector(&vector);
+        }
     }
 
     fn visit_port(&mut self, _port: SteelPort) -> Self::Output {}
@@ -475,10 +485,7 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
         for field in steel_struct.fields.iter() {
             self.push_back(field.clone());
         }
-        let properties = steel_struct.properties();
-        if self.visited.insert(properties.as_ptr() as usize) {
-            self.push_back(SteelVal::HashMapV(properties.into()));
-        }
+        self.push_back(SteelVal::HashMapV(steel_struct.properties().into()));
     }
 
     fn visit_stream(&mut self, stream: Gc<LazyStream>) -> Self::Output {
@@ -960,6 +967,10 @@ mod will_tests {
                      (holder)))",
             )
             .unwrap();
+        let descriptor = match engine.extract_value("owner").unwrap() {
+            SteelVal::CustomStruct(owner) => owner.type_descriptor,
+            _ => panic!("expected a struct"),
+        };
         for _ in 0..3 {
             engine.run("(probe-gc)").unwrap();
             assert_eq!(readiness(&engine, "executor"), [false]);
@@ -971,6 +982,14 @@ mod will_tests {
             );
         }
         engine.run("(set! owner #f)").unwrap();
+        engine.run("(probe-gc) (probe-gc)").unwrap();
+        assert_eq!(readiness(&engine, "executor"), [false]);
+
+        crate::values::structs::VTable::set_entry(
+            &descriptor,
+            None,
+            Gc::new(crate::values::HashMap::new()),
+        );
         engine.run("(probe-gc) (probe-gc)").unwrap();
         assert_eq!(readiness(&engine, "executor"), [true]);
         assert_eq!(
@@ -1360,6 +1379,52 @@ fn free_list_continues_allocating_in_the_middle() {
     }
 
     drop(right_half)
+}
+
+#[cfg(feature = "sync")]
+#[test]
+fn borrowed_heap_traversal_keeps_children_after_heap_teardown() {
+    use std::sync::Arc;
+
+    struct Probe(#[allow(dead_code)] Arc<()>);
+    impl Custom for Probe {}
+
+    for vector in [false, true] {
+        let count = Arc::new(());
+        let mut heap = Heap::new();
+        let child = Probe(count.clone()).into_steelval().unwrap();
+        let root = if vector {
+            SteelVal::MutableVector(heap.allocate_vec_without_collection(vec![child]))
+        } else {
+            SteelVal::HeapAllocated(heap.allocate_without_collection(child))
+        };
+        heap.memory_free_list.mark_all_unreachable();
+        heap.vector_free_list.mark_all_unreachable();
+        let queue = crossbeam_queue::SegQueue::new();
+        let mut local_queue = Vec::new();
+        let mut marker = MarkAndSweepContextRefQueue {
+            queue: &queue,
+            local_queue: &mut local_queue,
+            stats: MarkAndSweepStats::default(),
+            visited: rustc_hash::FxHashSet::default(),
+            will_executors: Vec::new(),
+            reachable: rustc_hash::FxHashSet::default(),
+        };
+        match &root {
+            SteelVal::HeapAllocated(value) => marker.visit_heap_allocated(value.clone()),
+            SteelVal::MutableVector(value) => marker.visit_mutable_vector(value.clone()),
+            _ => unreachable!(),
+        }
+        std::thread::spawn(move || drop(heap)).join().unwrap();
+        #[cfg(feature = "biased")]
+        steel_rc::QueueHandle::run_explicit_merge();
+        assert_eq!(Arc::strong_count(&count), 2);
+        // The queued child must outlive the heap, while expired heap references are skipped.
+        marker.push_back(&root);
+        marker.visit();
+        drop(marker);
+        assert_eq!(Arc::strong_count(&count), 1);
+    }
 }
 
 #[cfg(feature = "sync")]
@@ -2462,6 +2527,9 @@ impl Heap {
         }
 
         constants.trace(&mut context);
+        for properties in VTable::property_maps_snapshot() {
+            context.push_back(SteelVal::HashMapV(properties.into()));
+        }
 
         log::debug!(target: "gc", "Roots size: {}", roots.len());
         for root in roots {
@@ -2816,7 +2884,9 @@ impl<'a> MarkAndSweepContextRefQueue<'a> {
 
         self.stats.memory_reached_count += 1;
 
-        self.push_back(&heap_ref.read().value);
+        let guard = heap_ref.read();
+        self.save(guard.value.clone());
+        self.push_back(&guard.value);
     }
 
     // Visit the heap vector, mark it as visited!
@@ -2835,6 +2905,7 @@ impl<'a> MarkAndSweepContextRefQueue<'a> {
         self.stats.vector_reached_count += 1;
 
         for value in heap_vector.read().value.iter() {
+            self.save(value.clone());
             self.push_back(value);
         }
     }
@@ -2970,6 +3041,9 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
     fn visit_future_function(&mut self, _function: BoxedAsyncFunctionSignature) -> Self::Output {}
 
     fn visit_hash_map(&mut self, hashmap: SteelHashMap) -> Self::Output {
+        if !self.visited.insert(hashmap.0.as_ptr() as usize) {
+            return;
+        }
         for (key, value) in hashmap.iter() {
             self.push_back(key.clone());
             self.push_back(value.clone());
@@ -2983,7 +3057,9 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
     }
 
     fn visit_heap_allocated(&mut self, heap_ref: HeapRef<SteelVal>) -> Self::Output {
-        self.mark_heap_reference(&heap_ref.strong_ptr());
+        if let Some(heap_ref) = heap_ref.inner.upgrade() {
+            self.mark_heap_reference(&heap_ref);
+        }
     }
 
     fn visit_immutable_vector(&mut self, vector: SteelVector) -> Self::Output {
@@ -3004,7 +3080,9 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
     fn visit_mutable_function(&mut self, _function: MutFunctionSignature) -> Self::Output {}
 
     fn visit_mutable_vector(&mut self, vector: HeapRef<Vec<SteelVal>>) -> Self::Output {
-        self.mark_heap_vector(&vector.strong_ptr())
+        if let Some(vector) = vector.inner.upgrade() {
+            self.mark_heap_vector(&vector);
+        }
     }
 
     fn visit_port(&mut self, _port: SteelPort) -> Self::Output {}
@@ -3027,10 +3105,7 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
         for field in steel_struct.fields.iter() {
             self.push_back(field.clone());
         }
-        let properties = steel_struct.properties();
-        if self.visited.insert(properties.as_ptr() as usize) {
-            self.push_back(SteelVal::HashMapV(properties.into()));
-        }
+        self.push_back(SteelVal::HashMapV(steel_struct.properties().into()));
     }
 
     fn visit_stream(&mut self, stream: Gc<LazyStream>) -> Self::Output {
@@ -3215,6 +3290,9 @@ impl<'a> BreadthFirstSearchSteelValReferenceVisitor2<'a> for MarkAndSweepContext
     }
 
     fn visit_hash_map(&mut self, hashmap: &super::HashMap<SteelVal, SteelVal>) -> Self::Output {
+        if !self.visited.insert(hashmap as *const _ as usize) {
+            return;
+        }
         for (key, value) in hashmap.iter() {
             self.push_back(key);
             self.push_back(value);
@@ -3228,7 +3306,9 @@ impl<'a> BreadthFirstSearchSteelValReferenceVisitor2<'a> for MarkAndSweepContext
     }
 
     fn visit_heap_allocated(&mut self, heap_ref: HeapRef<SteelVal>) -> Self::Output {
-        self.mark_heap_reference(&heap_ref.strong_ptr());
+        if let Some(heap_ref) = heap_ref.inner.upgrade() {
+            self.mark_heap_reference(&heap_ref);
+        }
     }
 
     fn visit_immutable_vector(&mut self, vector: &Vector<SteelVal>) -> Self::Output {
@@ -3256,7 +3336,9 @@ impl<'a> BreadthFirstSearchSteelValReferenceVisitor2<'a> for MarkAndSweepContext
     }
 
     fn visit_mutable_vector(&mut self, vector: HeapRef<Vec<SteelVal>>) -> Self::Output {
-        self.mark_heap_vector(&vector.strong_ptr())
+        if let Some(vector) = vector.inner.upgrade() {
+            self.mark_heap_vector(&vector);
+        }
     }
 
     fn visit_reducer(&mut self, reducer: &Reducer) -> Self::Output {
@@ -3274,12 +3356,9 @@ impl<'a> BreadthFirstSearchSteelValReferenceVisitor2<'a> for MarkAndSweepContext
         for field in steel_struct.fields.iter() {
             self.push_back(field);
         }
-        let properties = steel_struct.properties();
-        if self.visited.insert(properties.as_ptr() as usize) {
-            let properties = SteelVal::HashMapV(properties.into());
-            self.push_back(&properties);
-            self.save(properties);
-        }
+        let properties = SteelVal::HashMapV(steel_struct.properties().into());
+        self.push_back(&properties);
+        self.save(properties);
     }
 
     fn visit_stream(&mut self, stream: &LazyStream) -> Self::Output {

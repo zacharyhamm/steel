@@ -624,6 +624,78 @@ mod embedding_regressions {
     }
 
     #[test]
+    fn struct_properties_keep_heap_values_alive_before_first_instance() {
+        let mut engine = Engine::new();
+        register_gc(&mut engine);
+        engine
+            .run(
+                "(define make-holder
+                   (let ()
+                     (struct holder () #:boxed (box 42) #:vector (vector (box 99)))
+                     holder))",
+            )
+            .unwrap();
+        engine.run("(probe-gc) (probe-gc)").unwrap();
+        assert_eq!(
+            engine
+                .run(
+                    "(define owner (make-holder))
+                     (unbox (#%struct-property-ref owner '#:boxed))
+                     (unbox (vector-ref (#%struct-property-ref owner '#:vector) 0))",
+                )
+                .unwrap()[1..],
+            [crate::SteelVal::IntV(42), crate::SteelVal::IntV(99)]
+        );
+    }
+
+    #[test]
+    fn struct_properties_preserve_closure_globals_during_recycling() {
+        let mut engine = Engine::new();
+        register_gc(&mut engine);
+        engine
+            .run(
+                "(define target (box 42))
+                 (define make-holder
+                   (let ()
+                     (struct holder () #:read (lambda () (unbox target)))
+                     holder))",
+            )
+            .unwrap();
+        engine.run("(define target (box 0))").unwrap();
+        for _ in 0..150 {
+            engine.run("(define shadowed 0)").unwrap();
+        }
+        engine.run("(probe-gc) (probe-gc)").unwrap();
+        assert_eq!(
+            engine
+                .run("((#%struct-property-ref (make-holder) '#:read))")
+                .unwrap(),
+            [crate::SteelVal::IntV(42)]
+        );
+    }
+
+    #[test]
+    fn struct_properties_allow_engine_teardown_and_later_collection() {
+        use std::sync::Arc;
+
+        let mut engine = Engine::new();
+        let heap = Arc::downgrade(&engine.virtual_machine.heap);
+        engine
+            .run("(struct holder () #:boxed (box 42) #:vector (vector (box 99)))")
+            .unwrap();
+        drop(engine);
+        assert!(heap.upgrade().is_none());
+
+        let mut collector = Engine::new();
+        register_gc(&mut collector);
+        collector.run("(probe-gc) (probe-gc)").unwrap();
+        for _ in 0..150 {
+            collector.run("(define shadowed 0)").unwrap();
+        }
+        assert!(heap.upgrade().is_none());
+    }
+
+    #[test]
     fn cyclic_struct_properties_keep_heap_values_alive() {
         use crate::{gc::Gc, values::structs::VTable, SteelVal};
 
