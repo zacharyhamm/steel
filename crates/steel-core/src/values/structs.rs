@@ -892,6 +892,29 @@ pub struct VTable {
 }
 
 impl VTable {
+    // Release the table lock before traversing properties, which can refer back to structs.
+    #[cfg(feature = "sync")]
+    pub(crate) fn property_maps_snapshot() -> Vec<Gc<HashMap<SteelVal, SteelVal>>> {
+        STATIC_VTABLE
+            .read()
+            .entries
+            .iter()
+            .map(|entry| entry.properties.clone())
+            .collect()
+    }
+
+    #[cfg(not(feature = "sync"))]
+    pub(crate) fn property_maps_snapshot() -> Vec<Gc<HashMap<SteelVal, SteelVal>>> {
+        VTABLE.with(|table| {
+            table
+                .borrow()
+                .entries
+                .iter()
+                .map(|entry| entry.properties.clone())
+                .collect()
+        })
+    }
+
     fn insert(name: InternedString, options: Gc<HashMap<SteelVal, SteelVal>>) {
         VTABLE.with(|x| x.borrow_mut().map.insert(name, options));
     }
@@ -1215,6 +1238,8 @@ thread_local! {
     // The only way that can happen is if a struct is constructed on another thread?
     // The value inside should explicitly be a thread safe value.
     pub static VTABLE: Rc<RefCell<VTable>> = {
+        // Initialize list storage first so it outlives property lists in this table.
+        let _ = List::<SteelVal>::new();
 
         let mut map = rustc_hash::FxHashMap::default();
 
