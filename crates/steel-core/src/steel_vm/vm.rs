@@ -714,8 +714,12 @@ impl Synchronizer {
     pub fn stop_threads(&mut self) {
         self.state.pause_for_safepoint();
 
+        let mut threads = self.threads.lock().unwrap();
+        // Release completed threads' handles before collection snapshots their result roots.
+        threads.retain(|thread| thread.ctx.strong_count() > 0);
+
         // Stop other threads, wait until we've gathered acknowledgements
-        self.threads.lock().unwrap().iter().for_each(|x| {
+        threads.iter().for_each(|x| {
             if let SteelVal::Custom(c) = &x.handle {
                 if let Some(inner) = as_underlying_type::<ThreadHandle>(c.read().as_ref()) {
                     inner.thread_state_manager.pause_for_safepoint();

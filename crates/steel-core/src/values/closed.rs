@@ -81,6 +81,7 @@ pub struct GlobalSlotRecycler {
     slots: HashSet<usize>,
 
     queue: Vec<SteelVal>,
+    visited_customs: rustc_hash::FxHashSet<usize>,
 
     #[cfg(feature = "sync")]
     will_executors: Vec<GcMut<Box<dyn CustomType>>>,
@@ -102,6 +103,7 @@ impl GlobalSlotRecycler {
     // push the values back, visit, mark visited, move on.
     pub fn recycle(&mut self, roots: &mut [SteelVal], symbol_map: &mut SymbolMap, heap: &mut Heap) {
         self.slots.clear();
+        self.visited_customs.clear();
         #[cfg(feature = "sync")]
         self.will_executors.clear();
 
@@ -148,6 +150,60 @@ impl GlobalSlotRecycler {
                 roots[index] = SteelVal::Void;
             }
         }
+    }
+}
+
+#[test]
+fn global_slot_recycling_traces_receiver_cycles_once_per_pass() {
+    use crate::steel_vm::{
+        engine::Engine,
+        vm::threads::{channel_send, Channels},
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct VisitCount(Arc<AtomicUsize>);
+    impl Custom for VisitCount {
+        fn gc_visit_children(&self, _context: &mut MarkAndSweepContext) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let channels = Channels::new();
+    let receiver = channels.receiver();
+    let payload = VisitCount(count.clone()).into_steelval().unwrap();
+    channel_send(&channels.sender(), receiver.clone()).unwrap();
+    channel_send(&channels.sender(), payload.clone()).unwrap();
+
+    let mut recycler = GlobalSlotRecycler::default();
+    let mut symbol_map = SymbolMap::new();
+    let mut heap = Heap::new();
+    let mut roots = [receiver.clone(), SteelVal::Void];
+    for pass in 1..=2 {
+        roots[1] = SteelVal::IntV(42);
+        symbol_map.free_list.shadowed_slots.push(1);
+        recycler.recycle(&mut roots, &mut symbol_map, &mut heap);
+        assert_eq!(roots[1], SteelVal::Void);
+        assert_eq!(symbol_map.free_list.free_list.pop(), Some(1));
+        assert_eq!(count.load(Ordering::SeqCst), pass);
+    }
+
+    let mut engine = Engine::new();
+    let receive = engine
+        .run("(lambda (receiver) (channel/try-recv receiver))")
+        .unwrap()
+        .pop()
+        .unwrap();
+    for expected in [receiver.clone(), payload] {
+        assert_eq!(
+            engine
+                .call_function_with_args(receive.clone(), vec![receiver.clone()])
+                .unwrap(),
+            expected
+        );
     }
 }
 
@@ -323,21 +379,19 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
     }
     // TODO: Come back to this
     fn visit_custom_type(&mut self, custom_type: GcMut<Box<dyn CustomType>>) -> Self::Output {
+        if !self.visited_customs.insert(custom_type.as_ptr() as usize) {
+            return;
+        }
+
         #[cfg(feature = "sync")]
         if custom_type.read().as_any_ref().is::<WillExecutor>() {
-            if self
-                .will_executors
-                .iter()
-                .any(|other| Gc::ptr_eq(other, &custom_type))
-            {
-                return;
-            }
             self.will_executors.push(custom_type.clone());
         }
 
         let mut queue = MarkAndSweepContext {
             queue: &mut self.queue,
             stats: MarkAndSweepStats::default(),
+            visited_customs: rustc_hash::FxHashSet::default(),
         };
 
         visit_custom_children(&custom_type, &mut queue);
@@ -368,6 +422,7 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
         let mut queue = MarkAndSweepContext {
             queue: &mut self.queue,
             stats: MarkAndSweepStats::default(),
+            visited_customs: rustc_hash::FxHashSet::default(),
         };
 
         queue.mark_heap_reference(&heap_ref.strong_ptr());
@@ -394,6 +449,7 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
         let mut queue = MarkAndSweepContext {
             queue: &mut self.queue,
             stats: MarkAndSweepStats::default(),
+            visited_customs: rustc_hash::FxHashSet::default(),
         };
 
         queue.mark_heap_vector(&vector.strong_ptr())
@@ -1297,6 +1353,7 @@ fn parallel_mark_counts_each_slot_exactly_once() {
                     local_queue: &mut local_queue,
                     queue: &queue,
                     stats: MarkAndSweepStats::default(),
+                    visited_customs: rustc_hash::FxHashSet::default(),
                     will_executors: Vec::new(),
                     reachable: rustc_hash::FxHashSet::default(),
                 };
@@ -2347,6 +2404,7 @@ impl Heap {
         let mut context = MarkAndSweepContext {
             queue: &mut self.mark_and_sweep_queue,
             stats: MarkAndSweepStats::default(),
+            visited_customs: rustc_hash::FxHashSet::default(),
         };
 
         // Pause all threads
@@ -2419,6 +2477,7 @@ impl Heap {
                 queue: &queue,
                 local_queue: &mut local_queue,
                 stats: MarkAndSweepStats::default(),
+                visited_customs: rustc_hash::FxHashSet::default(),
                 will_executors: Vec::new(),
                 reachable,
             };
@@ -2584,6 +2643,7 @@ impl<T: Clone + core::fmt::Debug + PartialEq + Eq> HeapAllocated<T> {
 pub struct MarkAndSweepContext<'a> {
     queue: &'a mut Vec<SteelVal>,
     stats: MarkAndSweepStats,
+    visited_customs: rustc_hash::FxHashSet<usize>,
 }
 
 impl<'a> MarkAndSweepContext<'a> {
@@ -2651,6 +2711,7 @@ pub struct MarkAndSweepContextRefQueue<'a> {
     local_queue: &'a mut Vec<SteelValPointer>,
     queue: &'a crossbeam_queue::SegQueue<SteelValPointer>,
     stats: MarkAndSweepStats,
+    visited_customs: rustc_hash::FxHashSet<usize>,
     will_executors: Vec<&'a MutContainer<Box<dyn CustomType>>>,
     reachable: rustc_hash::FxHashSet<usize>,
 }
@@ -2690,6 +2751,7 @@ impl<'a> MarkAndSweepContextRefQueue<'a> {
         let mut temporary_queue = MarkAndSweepContext {
             queue: &mut queue,
             stats: MarkAndSweepStats::default(),
+            visited_customs: rustc_hash::FxHashSet::default(),
         };
 
         visit_custom_children(custom_type, &mut temporary_queue);
@@ -2983,6 +3045,9 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
     }
     // TODO: Come back to this
     fn visit_custom_type(&mut self, custom_type: GcMut<Box<dyn CustomType>>) -> Self::Output {
+        if !self.visited_customs.insert(custom_type.as_ptr() as usize) {
+            return;
+        }
         visit_custom_children(&custom_type, self);
     }
 
@@ -3225,19 +3290,19 @@ impl<'a> BreadthFirstSearchSteelValReferenceVisitor2<'a> for MarkAndSweepContext
         &mut self,
         custom_type: &'a MutContainer<Box<dyn CustomType>>,
     ) -> Self::Output {
+        if !self
+            .visited_customs
+            .insert(custom_type as *const _ as usize)
+        {
+            return;
+        }
         let Some(is_executor) =
             read_custom_type(custom_type).map(|custom| custom.as_any_ref().is::<WillExecutor>())
         else {
             return;
         };
         if is_executor {
-            if !self
-                .will_executors
-                .iter()
-                .any(|other| std::ptr::eq(*other, custom_type))
-            {
-                self.will_executors.push(custom_type);
-            }
+            self.will_executors.push(custom_type);
         } else {
             self.visit_custom_children(custom_type);
         }

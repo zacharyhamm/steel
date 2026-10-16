@@ -1257,6 +1257,40 @@ mod embedding_regressions {
     }
 
     #[test]
+    fn queued_channel_cycles_terminate_collection_and_preserve_messages() {
+        for message in ["receiver", "channels"] {
+            let mut engine = Engine::new();
+            register_gc(&mut engine);
+            engine
+                .run(
+                    "(define channels (channels/new))
+                     (define receiver (channels-receiver channels))",
+                )
+                .unwrap();
+
+            for _ in 0..2 {
+                engine
+                    .run(format!(
+                        "(channel/send (channels-sender channels) {message})
+                         (channel/send (channels-sender channels) (box 42))
+                         (probe-gc) (probe-gc)"
+                    ))
+                    .unwrap();
+                assert_eq!(
+                    engine
+                        .run(format!("(eq? (channel/recv receiver) {message})"))
+                        .unwrap(),
+                    [crate::SteelVal::BoolV(true)],
+                );
+                assert_eq!(
+                    engine.run("(unbox (channel/recv receiver))").unwrap(),
+                    [crate::SteelVal::IntV(42)],
+                );
+            }
+        }
+    }
+
+    #[test]
     fn pending_channel_values_survive_collection() {
         for receiver in ["receiver", "(channels-receiver channels)"] {
             let mut engine = Engine::new();
@@ -1445,12 +1479,15 @@ mod embedding_regressions {
         engine.register_fn("probe-value", move || Probe(factory.clone()));
         register_gc(&mut engine);
         for (payload, reader) in [
-            ("(box (cons 42 (probe-value)))", "(car (unbox joined))"),
-            ("(vector 42 (probe-value))", "(vector-ref joined 0)"),
+            ("(box payload)", "(car (unbox joined))"),
+            ("(vector 42 payload)", "(vector-ref joined 0)"),
         ] {
+            // shortcut: keep probe owners alive until biased RC can reclaim exited workers' values.
             let worker = engine
                 .run(format!(
-                    "(define worker (spawn-native-thread (lambda () {payload}))) worker"
+                    "(define worker
+                       (let ((payload (cons 42 (probe-value))))
+                         (spawn-native-thread (lambda () {payload})))) worker"
                 ))
                 .unwrap()
                 .pop()
@@ -1471,6 +1508,63 @@ mod embedding_regressions {
             engine.run("(set! joined #f)").unwrap();
             engine.run("(probe-gc)").unwrap();
             assert_eq!(Arc::strong_count(&count), 2);
+        }
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn discarded_completed_thread_handles_release_result_payloads() {
+        use crate::steel_vm::{register_fn::RegisterFn, vm::threads::thread_finished};
+        use std::{
+            sync::Arc,
+            time::{Duration, Instant},
+        };
+
+        struct Probe(#[allow(dead_code)] Arc<()>);
+        impl crate::rvals::Custom for Probe {}
+
+        let count = Arc::new(());
+        let factory = count.clone();
+        let mut engine = Engine::new();
+        engine.register_fn("probe-value", move || Probe(factory.clone()));
+        register_gc(&mut engine);
+
+        for payload in ["(box payload)", "(vector payload)"] {
+            // shortcut: keep probe owners alive until biased RC can reclaim exited workers' values.
+            let workers: Vec<_> = (0..10)
+                .map(|_| {
+                    engine
+                        .run(format!(
+                            "(let ((payload (probe-value)))
+                               (spawn-native-thread (lambda () {payload})))"
+                        ))
+                        .unwrap()
+                        .pop()
+                        .unwrap()
+                })
+                .collect();
+            engine.enter_safepoint(|| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while workers
+                    .iter()
+                    .any(|worker| thread_finished(worker).unwrap() != crate::SteelVal::BoolV(true))
+                {
+                    assert!(Instant::now() < deadline, "workers did not finish");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+            assert_eq!(Arc::strong_count(&count), 12);
+            drop(workers);
+            engine.run("(probe-gc)").unwrap();
+            assert_eq!(Arc::strong_count(&count), 2, "{payload}");
+
+            engine
+                .run(
+                    "(map (lambda (i) (box (vector i))) (range 2000))
+                     (probe-gc)",
+                )
+                .unwrap();
+            assert_eq!(Arc::strong_count(&count), 2, "{payload}");
         }
     }
 
