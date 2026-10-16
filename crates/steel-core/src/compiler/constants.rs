@@ -242,10 +242,21 @@ impl ConstantMap {
                     })
                     .collect(),
             )),
-            SteelVal::Pair(pair) => {
-                let car = self.add_or_get(pair.car());
-                let cdr = self.add_or_get(pair.cdr());
-                Some(crate::values::lists::Pair::cons(self.get(car), self.get(cdr)).into())
+            SteelVal::Pair(_) => {
+                let mut cars = Vec::new();
+                let mut tail = val;
+                // Intern the elements without hashing and storing every pair suffix.
+                while let SteelVal::Pair(pair) = tail {
+                    let idx = self.add_or_get(pair.car());
+                    cars.push(self.get(idx));
+                    tail = pair.cdr_ref();
+                }
+                let tail_idx = self.add_or_get(tail.clone());
+                let mut result = self.get(tail_idx);
+                for car in cars.into_iter().rev() {
+                    result = crate::values::lists::Pair::cons(car, result).into();
+                }
+                Some(result)
             }
             _ => None,
         }
@@ -290,6 +301,49 @@ impl ConstantMap {
 #[cfg(test)]
 pub mod constant_table_tests {
     use super::*;
+    use crate::values::lists::Pair;
+
+    #[test]
+    fn long_dotted_list_does_not_intern_suffixes() {
+        let mut instance = ConstantMap::new();
+        let value = (0..30_000).fold(SteelVal::IntV(2), |tail, _| {
+            Pair::cons(SteelVal::IntV(1), tail).into()
+        });
+        let idx = instance.add_or_get(value);
+        assert_eq!(instance.len(), 3);
+
+        let value = instance.get(idx);
+        let mut tail = &value;
+        for _ in 0..30_000 {
+            let pair = tail.pair().expect("expected another pair");
+            assert_eq!(pair.car_ref(), &SteelVal::IntV(1));
+            tail = pair.cdr_ref();
+        }
+        assert_eq!(tail, &SteelVal::IntV(2));
+        assert_eq!(instance.add_or_get(value), idx);
+        assert_eq!(instance.len(), 3);
+    }
+
+    #[test]
+    fn pair_elements_and_tail_use_canonical_constants() {
+        let mut instance = ConstantMap::new();
+        let string = || SteelVal::StringV("shared".into());
+        let vector = || SteelVal::VectorV([string()].into_iter().collect());
+        let list = || SteelVal::ListV([string()].into_iter().collect());
+        let string_idx = instance.add_or_get(string());
+        let vector_idx = instance.add_or_get(vector());
+        let list_idx = instance.add_or_get(list());
+
+        let value = Pair::cons(vector(), Pair::cons(string(), list()).into()).into();
+        let idx = instance.add_or_get(value);
+        let value = instance.get(idx);
+        let first = value.pair().unwrap();
+        assert!(first.car_ref().ptr_eq(&instance.get(vector_idx)));
+        let second = first.cdr_ref().pair().unwrap();
+        assert!(second.car_ref().ptr_eq(&instance.get(string_idx)));
+        assert!(second.cdr_ref().ptr_eq(&instance.get(list_idx)));
+        assert_eq!(instance.len(), 4);
+    }
 
     #[test]
     fn run_tests_constant_map() {
