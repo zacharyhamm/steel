@@ -727,6 +727,27 @@ pub(crate) mod drop_impls {
         pub static FORMAT_BUFFER: RefCell<VecDeque<SteelVal>> = RefCell::new(VecDeque::with_capacity(128));
     }
 
+    impl Drop for Pair {
+        fn drop(&mut self) {
+            if matches!(self.car, SteelVal::Void) && matches!(self.cdr, SteelVal::Void) {
+                return;
+            }
+            let drained = DROP_BUFFER.try_with(|buffer| {
+                let Ok(mut buffer) = buffer.try_borrow_mut() else {
+                    return false;
+                };
+                buffer.push_back(self.car.make_void());
+                buffer.push_back(self.cdr.make_void());
+                IterativeDropHandler::bfs(&mut buffer);
+                true
+            });
+            if drained != Ok(true) {
+                let mut buffer = VecDeque::from([self.car.make_void(), self.cdr.make_void()]);
+                IterativeDropHandler::bfs(&mut buffer);
+            }
+        }
+    }
+
     impl Drop for SteelVector {
         fn drop(&mut self) {
             if self.0.is_empty() {
@@ -846,7 +867,7 @@ pub(crate) mod drop_impls {
 
 pub struct IterativeDropHandler<'a> {
     drop_buffer: &'a mut VecDeque<SteelVal>,
-    #[cfg(feature = "experimental-drop-handler")]
+    #[cfg(all(feature = "experimental-drop-handler", feature = "sync"))]
     moved_threads: bool,
 }
 
@@ -854,7 +875,7 @@ impl<'a> IterativeDropHandler<'a> {
     pub fn bfs(drop_buffer: &'a mut VecDeque<SteelVal>) {
         IterativeDropHandler {
             drop_buffer,
-            #[cfg(feature = "experimental-drop-handler")]
+            #[cfg(all(feature = "experimental-drop-handler", feature = "sync"))]
             moved_threads: false,
         }
         .visit();
@@ -1150,7 +1171,7 @@ impl<'a> BreadthFirstSearchSteelValVisitor for IterativeDropHandler<'a> {
 
             // Long recursive drops will block the main thread from continuing - we should
             // have another thread pick up the work?
-            #[cfg(feature = "experimental-drop-handler")]
+            #[cfg(all(feature = "experimental-drop-handler", feature = "sync"))]
             if !self.moved_threads && self.drop_buffer.len() > 20 {
                 self.moved_threads = true;
 
@@ -1199,9 +1220,9 @@ impl<'a> BreadthFirstSearchSteelValVisitor for IterativeDropHandler<'a> {
     }
 
     fn visit_pair(&mut self, pair: Gc<Pair>) -> Self::Output {
-        if let Ok(inner) = Gc::try_unwrap(pair) {
-            self.push_back(inner.car);
-            self.push_back(inner.cdr);
+        if let Ok(mut inner) = Gc::try_unwrap(pair) {
+            self.push_back(inner.car.make_void());
+            self.push_back(inner.cdr.make_void());
         }
     }
 }
@@ -1339,6 +1360,7 @@ impl BreadthFirstSearchSteelValVisitor for OwnedIterativeDropHandler {
                     crate::values::transducers::Transducers::Enumerating => {}
                     crate::values::transducers::Transducers::Zipping(z) => self.push_back(z),
                     crate::values::transducers::Transducers::Interleaving(i) => self.push_back(i),
+                    crate::values::transducers::Transducers::MapPair(i) => self.push_back(i),
                 }
             }
         }
@@ -1366,7 +1388,9 @@ impl BreadthFirstSearchSteelValVisitor for OwnedIterativeDropHandler {
 
     // Walk the whole thing! This includes the stack and all the stack frames
     fn visit_continuation(&mut self, continuation: Continuation) {
-        if let Ok(inner) = crate::gc::Shared::try_unwrap(continuation.inner).map(|x| x.consume()) {
+        if let Ok(inner) =
+            crate::gc::shared::StandardShared::try_unwrap(continuation.inner).map(|x| x.consume())
+        {
             match inner {
                 ContinuationMark::Closed(mut inner) => {
                     for value in core::mem::take(&mut inner.stack) {
@@ -1509,11 +1533,42 @@ impl BreadthFirstSearchSteelValVisitor for OwnedIterativeDropHandler {
     }
 
     fn visit_pair(&mut self, pair: Gc<Pair>) -> Self::Output {
-        if let Ok(inner) = Gc::try_unwrap(pair) {
-            self.push_back(inner.car);
-            self.push_back(inner.cdr);
+        if let Ok(mut inner) = Gc::try_unwrap(pair) {
+            self.push_back(inner.car.make_void());
+            self.push_back(inner.cdr.make_void());
         }
     }
+}
+
+#[cfg(all(test, feature = "experimental-drop-handler"))]
+#[test]
+fn owned_drop_handler_takes_pair_fields_iteratively() {
+    let owner = std::sync::Arc::new(());
+    let probe = owner.clone();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            #[cfg(all(feature = "sync", feature = "biased"))]
+            steel_rc::register_thread();
+            struct Probe(#[allow(dead_code)] std::sync::Arc<()>);
+            impl crate::rvals::Custom for Probe {}
+            let mut value = crate::rvals::IntoSteelVal::into_steelval(Probe(probe)).unwrap();
+            for depth in 0..30_000 {
+                value = if depth % 2 == 0 {
+                    Pair::cons(value, SteelVal::IntV(1)).into()
+                } else {
+                    Pair::cons(SteelVal::IntV(1), value).into()
+                };
+            }
+            OwnedIterativeDropHandler {
+                drop_buffer: VecDeque::from([value]),
+            }
+            .visit();
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(std::sync::Arc::strong_count(&owner), 1);
 }
 
 pub trait BreadthFirstSearchSteelValVisitor {

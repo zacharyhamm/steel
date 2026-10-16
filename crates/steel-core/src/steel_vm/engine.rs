@@ -268,7 +268,7 @@ impl Drop for Engine {
 
 impl Clone for Engine {
     fn clone(&self) -> Self {
-        let mut virtual_machine = self.virtual_machine.clone();
+        let mut virtual_machine = self.virtual_machine.clone_for_execution();
 
         // Set up child
         virtual_machine.synchronizer = Synchronizer::new();
@@ -548,11 +548,8 @@ impl Engine {
             .deep_clone();
         engine.virtual_machine.compiler.write().constant_map = constant_map;
 
-        let heap_copy = Arc::new(parking_lot::Mutex::new(
-            engine.virtual_machine.heap.lock().clone(),
-        ));
-
-        engine.virtual_machine.heap = heap_copy;
+        let heap_copy = engine.virtual_machine.heap.lock().clone();
+        engine.virtual_machine.replace_heap(heap_copy);
         engine
     }
 
@@ -576,9 +573,7 @@ impl Engine {
             .deep_clone();
         engine.virtual_machine.compiler.write().constant_map = constant_map;
 
-        let heap_copy = Arc::new(parking_lot::Mutex::new(
-            engine.virtual_machine.heap.lock().clone(),
-        ));
+        let heap_copy = engine.virtual_machine.heap.lock().clone();
 
         engine.virtual_machine.replace_heap(heap_copy);
         engine
@@ -1975,9 +1970,9 @@ impl Engine {
         if guard.symbol_map.free_list.should_collect() {
             drop(guard);
 
-            let mut heap_lock = self
-                .virtual_machine
-                .enter_safepoint(|thread| thread.heap.lock_arc());
+            let heap = self.virtual_machine.heap.clone();
+
+            let mut heap_lock = self.virtual_machine.enter_safepoint(|_| heap.lock());
 
             #[cfg(feature = "sync")]
             self.virtual_machine.with_locked_env(|ctx, env| {
@@ -2192,9 +2187,9 @@ impl Engine {
     pub fn update_value(&mut self, name: &str, value: SteelVal) -> Option<&mut Self> {
         let idx = self.virtual_machine.compiler.read().get_idx(name)?;
 
-        let _ = self
-            .virtual_machine
-            .enter_safepoint(|thread| thread.heap.lock_arc());
+        let heap = self.virtual_machine.heap.clone();
+
+        let _ = self.virtual_machine.enter_safepoint(|_| heap.lock());
 
         #[cfg(feature = "sync")]
         {
