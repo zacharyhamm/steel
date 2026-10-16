@@ -1118,7 +1118,7 @@ impl VTable {
         proc: Option<usize>,
         properties: Gc<HashMap<SteelVal, SteelVal>>,
     ) {
-        VTABLE.with(|x| {
+        let previous = VTABLE.with(|x| {
             let mut guard = x.borrow_mut();
 
             let index = descriptor.0;
@@ -1137,8 +1137,9 @@ impl VTable {
                 .and_then(|x| x.as_bool())
                 .unwrap_or_default();
 
-            value.properties = properties;
-        })
+            core::mem::replace(&mut value.properties, properties)
+        });
+        drop(previous);
     }
 
     #[cfg(feature = "sync")]
@@ -1165,7 +1166,10 @@ impl VTable {
             .and_then(|x| x.as_bool())
             .unwrap_or_default();
 
-        value.properties = properties;
+        let previous = core::mem::replace(&mut value.properties, properties);
+        drop(guard);
+        // Property destructors can reenter the table through engine teardown.
+        drop(previous);
     }
 
     // fn define_trait()

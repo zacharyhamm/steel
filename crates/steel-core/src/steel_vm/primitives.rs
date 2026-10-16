@@ -2235,21 +2235,19 @@ fn make_mutable_box(ctx: &mut VmCore, args: &[SteelVal]) -> Option<Result<SteelV
         ));
     }
 
-    let heap = ctx.thread.heap.clone_for_storage();
+    ctx.thread.with_heap(|thread, heap| {
+        let allocated_var = heap.allocate(
+            args[0].clone(), // TODO: Could actually move off of the stack entirely
+            &thread.stack,
+            thread.stack_frames.iter().map(|x| x.function.as_ref()),
+            thread.global_env.roots(),
+            &ctx.constants,
+            &thread.thread_local_storage,
+            &mut thread.synchronizer,
+        );
 
-    let mut heap_lock = ctx.thread.enter_safepoint(|_| heap.lock());
-
-    let allocated_var = heap_lock.allocate(
-        args[0].clone(), // TODO: Could actually move off of the stack entirely
-        &ctx.thread.stack,
-        ctx.thread.stack_frames.iter().map(|x| x.function.as_ref()),
-        ctx.thread.global_env.roots(),
-        &ctx.constants,
-        &ctx.thread.thread_local_storage,
-        &mut ctx.thread.synchronizer,
-    );
-
-    Some(Ok(SteelVal::HeapAllocated(allocated_var)))
+        Some(Ok(SteelVal::HeapAllocated(allocated_var)))
+    })
 }
 
 /// Returns the value stored inside a strong box created with `box-strong`.
