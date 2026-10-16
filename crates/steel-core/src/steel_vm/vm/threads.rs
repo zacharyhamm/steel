@@ -829,12 +829,16 @@ fn serialize_thread_impl(ctx: &mut VmCore, _args: &[SteelVal]) -> Result<SteelVa
 }
 */
 
+type PendingMessages = StandardShared<Mutex<FxHashMap<usize, WeakShared<SteelVal>>>>;
+
 pub struct SteelReceiver {
-    receiver: crossbeam_channel::Receiver<RootedSteelVal>,
+    receiver: crossbeam_channel::Receiver<StandardShared<SteelVal>>,
+    pending: PendingMessages,
 }
 
 pub struct SteelSender {
-    sender: crossbeam_channel::Sender<RootedSteelVal>,
+    sender: crossbeam_channel::Sender<StandardShared<SteelVal>>,
+    pending: PendingMessages,
 }
 
 pub struct Channels {
@@ -842,17 +846,49 @@ pub struct Channels {
     receiver: SteelVal,
 }
 
-impl Custom for SteelReceiver {}
+impl Custom for SteelReceiver {
+    fn gc_visit_children(&self, context: &mut MarkAndSweepContext) {
+        self.pending.lock().unwrap().retain(|_, message| {
+            if let Some(message) = message.upgrade() {
+                context.push_back(message.as_ref().clone());
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
 impl Custom for SteelSender {}
-impl Custom for Channels {}
+impl Custom for Channels {
+    fn gc_visit_children(&self, context: &mut MarkAndSweepContext) {
+        context.push_back(self.sender.clone());
+        context.push_back(self.receiver.clone());
+    }
+}
+
+impl SteelReceiver {
+    fn take_message(&self, message: StandardShared<SteelVal>) -> SteelVal {
+        self.pending
+            .lock()
+            .unwrap()
+            .remove(&(StandardShared::as_ptr(&message) as usize));
+        message.as_ref().clone()
+    }
+}
 
 impl Channels {
     pub fn new() -> Self {
         let (sender, receiver) = crossbeam_channel::unbounded();
+        let pending = StandardShared::new(Mutex::new(FxHashMap::default()));
 
         Self {
-            sender: SteelSender { sender }.into_steelval().unwrap(),
-            receiver: SteelReceiver { receiver }.into_steelval().unwrap(),
+            sender: SteelSender {
+                sender,
+                pending: pending.clone(),
+            }
+            .into_steelval()
+            .unwrap(),
+            receiver: SteelReceiver { receiver, pending }.into_steelval().unwrap(),
         }
     }
 
@@ -903,39 +939,55 @@ pub fn channels_receiver(value: &SteelVal) -> Result<SteelVal> {
 
 #[steel_derive::function(name = "channel/send")]
 pub fn channel_send(sender: &SteelVal, value: SteelVal) -> Result<SteelVal> {
-    SteelSender::as_ref(sender)?
+    let sender = SteelSender::as_ref(sender)?;
+    let message = StandardShared::new(value);
+    let identity = StandardShared::as_ptr(&message) as usize;
+    // Publish the weak entry before the message can be received or traced.
+    sender
+        .pending
+        .lock()
+        .unwrap()
+        .insert(identity, StandardShared::downgrade(&message));
+    sender
         .sender
-        .send(value.as_rooted())
+        .send(message)
         .map_err(|e| {
+            sender.pending.lock().unwrap().remove(&identity);
             throw!(Generic => "channel disconnected -
-            unable to send value across channel: {:?}", e.0.value())()
+            unable to send value across channel: {:?}", e.0)()
         })
         .map(|_| SteelVal::Void)
 }
 
-#[steel_derive::function(name = "channel/recv")]
-pub fn channel_recv(receiver: &SteelVal) -> Result<SteelVal> {
-    SteelReceiver::as_ref(receiver)?
-        .receiver
-        .recv()
-        .map(|value| value.value().clone())
-        .map_err(|_| {
-            throw!(Generic => "Unable to receive on the channel.
-                The channel is empty and disconnected")()
-        })
+#[steel_derive::context(name = "channel/recv", arity = "Exact(1)")]
+pub fn channel_recv(ctx: &mut VmCore, args: &[SteelVal]) -> Option<Result<SteelVal>> {
+    Some((|| {
+        let receiver = SteelReceiver::as_ref(&args[0])?;
+        // Builtin arguments leave the stack; keep the receiver and message traced until resuming.
+        let _root = args[0].as_rooted();
+        let message = ctx
+            .thread
+            .enter_safepoint(|_| receiver.receiver.recv())
+            .map_err(|_| {
+                throw!(Generic => "Unable to receive on the channel.
+                    The channel is empty and disconnected")()
+            })?;
+        Ok(receiver.take_message(message))
+    })())
 }
 
 // Need singletons to use for "empty"
 
-#[steel_derive::function(name = "channel/try-recv")]
-pub fn channel_try_recv(receiver: &SteelVal) -> Result<SteelVal> {
-    let value = SteelReceiver::as_ref(receiver)?.receiver.try_recv();
-
-    match value {
-        Ok(v) => Ok(v.value().clone()),
-        Err(crossbeam_channel::TryRecvError::Empty) => Ok(empty_channel()),
-        Err(crossbeam_channel::TryRecvError::Disconnected) => Ok(disconnected_channel()),
-    }
+#[steel_derive::context(name = "channel/try-recv", arity = "Exact(1)")]
+pub fn channel_try_recv(_ctx: &mut VmCore, args: &[SteelVal]) -> Option<Result<SteelVal>> {
+    Some((|| {
+        let receiver = SteelReceiver::as_ref(&args[0])?;
+        match receiver.receiver.try_recv() {
+            Ok(message) => Ok(receiver.take_message(message)),
+            Err(crossbeam_channel::TryRecvError::Empty) => Ok(empty_channel()),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => Ok(disconnected_channel()),
+        }
+    })())
 }
 
 #[cfg(not(feature = "sync"))]

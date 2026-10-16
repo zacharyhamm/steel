@@ -649,6 +649,7 @@ impl Synchronizer {
 
                         unsafe {
                             let live_ctx = &(*ctx);
+                            live_ctx.constant_map.trace(context);
                             for value in &live_ctx.stack {
                                 context.push_back(value.clone());
                             }
@@ -675,6 +676,7 @@ impl Synchronizer {
                                 if let Some(forked_thread_handle) = &inner.forked_thread_handle {
                                     if let Some(upgraded) = forked_thread_handle.upgrade() {
                                         if let Ok(live_ctx) = upgraded.try_lock() {
+                                            live_ctx.constant_map.trace(context);
                                             for value in &live_ctx.stack {
                                                 context.push_back(value.clone());
                                             }
@@ -1825,6 +1827,7 @@ impl<'a> VmCore<'a> {
             &self.thread.stack,
             self.thread.stack_frames.iter().map(|x| x.function.as_ref()),
             self.thread.global_env.roots(),
+            &self.constants,
             &self.thread.thread_local_storage,
             &mut self.thread.synchronizer,
         );
@@ -1841,6 +1844,7 @@ impl<'a> VmCore<'a> {
             &self.thread.stack,
             self.thread.stack_frames.iter().map(|x| x.function.as_ref()),
             self.thread.global_env.roots(),
+            &self.constants,
             &self.thread.thread_local_storage,
             &mut self.thread.synchronizer,
         );
@@ -1859,6 +1863,7 @@ impl<'a> VmCore<'a> {
             &self.thread.stack,
             self.thread.stack_frames.iter().map(|x| x.function.as_ref()),
             self.thread.global_env.roots(),
+            &self.constants,
             &self.thread.thread_local_storage,
             &mut self.thread.synchronizer,
         );
@@ -1875,6 +1880,7 @@ impl<'a> VmCore<'a> {
             &self.thread.stack,
             self.thread.stack_frames.iter().map(|x| x.function.as_ref()),
             self.thread.global_env.roots(),
+            &self.constants,
             &self.thread.thread_local_storage,
             &mut self.thread.synchronizer,
             true,
@@ -7398,6 +7404,7 @@ fn new_box_handler(ctx: &mut VmCore<'_>) -> Result<()> {
         &ctx.thread.stack,
         ctx.thread.stack_frames.iter().map(|x| x.function.as_ref()),
         ctx.thread.global_env.roots(),
+        &ctx.constants,
         &ctx.thread.thread_local_storage,
         &mut ctx.thread.synchronizer,
     );

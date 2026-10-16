@@ -8,9 +8,11 @@ use crate::gc::shared::ShareableMut;
 
 use crate::gc::{Shared, SharedMut};
 use crate::parser::tryfrom_visitor::TryFromExprKindForSteelVal;
+use crate::rvals::cycles::BreadthFirstSearchSteelValVisitor;
 use crate::rvals::{
     into_serializable_value, Result, SerializableSteelVal, SerializationContext, SteelVal,
 };
+use crate::values::closed::MarkAndSweepContext;
 
 use crate::parser::{
     ast::ExprKind,
@@ -68,6 +70,12 @@ impl ConstantMap {
         let values = self.values.read();
         if values.len() != self.reified_values.load().len() {
             self.reified_values.store(Arc::new(values.clone()));
+        }
+    }
+
+    pub(crate) fn trace(&self, context: &mut MarkAndSweepContext) {
+        for value in self.values.read().iter() {
+            context.push_back(value.clone());
         }
     }
 
