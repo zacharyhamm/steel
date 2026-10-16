@@ -1220,6 +1220,14 @@ impl Compiler {
 
         log::debug!(target: "expansion-phase", "Beginning constant folding");
 
+        // Native no-kernel forms contain hygienic references to private primitives.
+        // Resolve lexical names before constant propagation can capture those references.
+        if self.kernel.is_none() {
+            expanded_statements = flatten_begins_and_expand_defines(expanded_statements)?;
+            self.shadowed_variable_renamer
+                .rename_shadowed_variables(&mut expanded_statements, true);
+        }
+
         let expanded_statements =
             self.apply_const_evaluation(constant_primitives(), expanded_statements, false)?;
 

@@ -242,6 +242,11 @@ impl ConstantMap {
                     })
                     .collect(),
             )),
+            SteelVal::Pair(pair) => {
+                let car = self.add_or_get(pair.car());
+                let cdr = self.add_or_get(pair.cdr());
+                Some(crate::values::lists::Pair::cons(self.get(car), self.get(cdr)).into())
+            }
             _ => None,
         }
     }
@@ -249,7 +254,7 @@ impl ConstantMap {
     // This is certainly not what we want. This time complexity is
     // questionable
     pub fn add_or_get(&mut self, mut val: SteelVal) -> usize {
-        if let SteelVal::ListV(_) | SteelVal::VectorV(_) = &val {
+        if let SteelVal::ListV(_) | SteelVal::VectorV(_) | SteelVal::Pair(_) = &val {
             if let Some(new_list) = self.walk_constants(&val) {
                 val = new_list;
             };

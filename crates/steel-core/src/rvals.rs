@@ -2327,7 +2327,7 @@ impl SteelVal {
             (Void, Void) => true,
             (StringV(l), StringV(r)) => crate::gc::Shared::ptr_eq(l, r),
             (FuncV(l), FuncV(r)) => *l as usize == *r as usize,
-            (SymbolV(l), SymbolV(r)) => l == r,
+            (SymbolV(l), SymbolV(r)) => crate::gc::Shared::ptr_eq(l, r),
             (SteelVal::Custom(l), SteelVal::Custom(r)) => Gc::ptr_eq(l, r),
             (HashMapV(l), HashMapV(r)) => Gc::ptr_eq(&l.0, &r.0),
             (HashSetV(l), HashSetV(r)) => Gc::ptr_eq(&l.0, &r.0),
