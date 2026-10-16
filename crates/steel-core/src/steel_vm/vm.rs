@@ -1059,6 +1059,12 @@ impl SteelThread {
         thunk(self)
     }
 
+    pub(crate) fn with_heap<T>(&mut self, thunk: impl FnOnce(&mut Self, &mut Heap) -> T) -> T {
+        let heap = self.heap.clone_for_storage();
+        let mut guard = self.enter_safepoint(|_| heap.lock());
+        thunk(self, &mut guard)
+    }
+
     // Allow this thread to be available for garbage collection
     // during the duration of the provided thunk
     #[inline(always)]
@@ -1151,8 +1157,7 @@ impl SteelThread {
     }
 
     pub fn insert_binding(&mut self, idx: usize, value: SteelVal) {
-        let heap = self.heap.clone_for_storage();
-        let _ = self.enter_safepoint(|_| heap.lock());
+        self.with_heap(|_, _| {});
 
         #[cfg(feature = "sync")]
         self.with_locked_env(move |_, env| {
@@ -2039,74 +2044,72 @@ impl<'a> VmCore<'a> {
     }
 
     pub fn make_box(&mut self, value: SteelVal) -> SteelVal {
-        let heap = self.thread.heap.clone_for_storage();
-        let mut heap_lock = self.thread.enter_safepoint(|_| heap.lock());
-        let allocated_var = heap_lock.allocate(
-            value,
-            &self.thread.stack,
-            self.thread.stack_frames.iter().map(|x| x.function.as_ref()),
-            self.thread.global_env.roots(),
-            &self.constants,
-            &self.thread.thread_local_storage,
-            &mut self.thread.synchronizer,
-        );
+        self.thread.with_heap(|thread, heap| {
+            let allocated_var = heap.allocate(
+                value,
+                &thread.stack,
+                thread.stack_frames.iter().map(|x| x.function.as_ref()),
+                thread.global_env.roots(),
+                &self.constants,
+                &thread.thread_local_storage,
+                &mut thread.synchronizer,
+            );
 
-        SteelVal::HeapAllocated(allocated_var)
+            SteelVal::HeapAllocated(allocated_var)
+        })
     }
 
     // TODO: Accept a slice instead, or an iterator with a known size.
     // That way we can take advantage of a pre allocation.
     pub fn make_mutable_vector(&mut self, values: Vec<SteelVal>) -> SteelVal {
-        let heap = self.thread.heap.clone_for_storage();
-        let mut heap_lock = self.thread.enter_safepoint(|_| heap.lock());
-        let allocated_var = heap_lock.allocate_vector(
-            values,
-            &self.thread.stack,
-            self.thread.stack_frames.iter().map(|x| x.function.as_ref()),
-            self.thread.global_env.roots(),
-            &self.constants,
-            &self.thread.thread_local_storage,
-            &mut self.thread.synchronizer,
-        );
+        self.thread.with_heap(|thread, heap| {
+            let allocated_var = heap.allocate_vector(
+                values,
+                &thread.stack,
+                thread.stack_frames.iter().map(|x| x.function.as_ref()),
+                thread.global_env.roots(),
+                &self.constants,
+                &thread.thread_local_storage,
+                &mut thread.synchronizer,
+            );
 
-        SteelVal::MutableVector(allocated_var)
+            SteelVal::MutableVector(allocated_var)
+        })
     }
 
     pub fn make_mutable_vector_iter(
         &mut self,
         values: impl Iterator<Item = SteelVal> + Clone,
     ) -> SteelVal {
-        let heap = self.thread.heap.clone_for_storage();
-        let mut heap_lock = self.thread.enter_safepoint(|_| heap.lock());
+        self.thread.with_heap(|thread, heap| {
+            let allocated_var = heap.allocate_vector_iter(
+                values,
+                &thread.stack,
+                thread.stack_frames.iter().map(|x| x.function.as_ref()),
+                thread.global_env.roots(),
+                &self.constants,
+                &thread.thread_local_storage,
+                &mut thread.synchronizer,
+            );
 
-        let allocated_var = heap_lock.allocate_vector_iter(
-            values,
-            &self.thread.stack,
-            self.thread.stack_frames.iter().map(|x| x.function.as_ref()),
-            self.thread.global_env.roots(),
-            &self.constants,
-            &self.thread.thread_local_storage,
-            &mut self.thread.synchronizer,
-        );
-
-        SteelVal::MutableVector(allocated_var)
+            SteelVal::MutableVector(allocated_var)
+        })
     }
 
     pub(crate) fn gc_collect(&mut self) {
         // Before we acquire a lock on the heap, make sure we're not going to block
         // anything since we could deadlock up to this point.
-        let heap = self.thread.heap.clone_for_storage();
-        let mut heap_lock = self.thread.enter_safepoint(|_| heap.lock());
-
-        heap_lock.collection(
-            &self.thread.stack,
-            self.thread.stack_frames.iter().map(|x| x.function.as_ref()),
-            self.thread.global_env.roots(),
-            &self.constants,
-            &self.thread.thread_local_storage,
-            &mut self.thread.synchronizer,
-            true,
-        );
+        self.thread.with_heap(|thread, heap| {
+            heap.collection(
+                &thread.stack,
+                thread.stack_frames.iter().map(|x| x.function.as_ref()),
+                thread.global_env.roots(),
+                &self.constants,
+                &thread.thread_local_storage,
+                &mut thread.synchronizer,
+                true,
+            );
+        })
     }
 
     // TODO: Expose a function for this! Or alternatively, set up an incremental
@@ -4339,8 +4342,7 @@ impl<'a> VmCore<'a> {
     // get in place mutation.
     // Basically a `MoveReadGlobal`
     fn handle_set(&mut self, index: usize) -> Result<()> {
-        let heap = self.thread.heap.clone_for_storage();
-        let _ = self.thread.enter_safepoint(|_| heap.lock());
+        self.thread.with_heap(|_, _| {});
         let value_to_assign = self.thread.stack.pop().unwrap();
 
         let value = if self.thread.safepoints_enabled {
@@ -4847,8 +4849,7 @@ impl<'a> VmCore<'a> {
     // #[inline(always)]
     fn handle_bind(&mut self, payload_size: usize) {
         // Guard against the heap
-        let heap = self.thread.heap.clone_for_storage();
-        let _ = self.thread.enter_safepoint(|_| heap.lock());
+        self.thread.with_heap(|_, _| {});
 
         let value = self.thread.stack.pop().unwrap();
 
@@ -7622,25 +7623,24 @@ fn cons_handler(ctx: &mut VmCore<'_>) -> Result<()> {
 fn new_box_handler(ctx: &mut VmCore<'_>) -> Result<()> {
     let last = ctx.thread.stack.pop().unwrap();
 
-    let heap = ctx.thread.heap.clone_for_storage();
+    ctx.thread.with_heap(|thread, heap| {
+        let allocated_var = heap.allocate(
+            last,
+            &thread.stack,
+            thread.stack_frames.iter().map(|x| x.function.as_ref()),
+            thread.global_env.roots(),
+            &ctx.constants,
+            &thread.thread_local_storage,
+            &mut thread.synchronizer,
+        );
 
-    let mut heap_lock = ctx.thread.enter_safepoint(|_| heap.lock());
-    let allocated_var = heap_lock.allocate(
-        last,
-        &ctx.thread.stack,
-        ctx.thread.stack_frames.iter().map(|x| x.function.as_ref()),
-        ctx.thread.global_env.roots(),
-        &ctx.constants,
-        &ctx.thread.thread_local_storage,
-        &mut ctx.thread.synchronizer,
-    );
+        let result = SteelVal::HeapAllocated(allocated_var);
 
-    let result = SteelVal::HeapAllocated(allocated_var);
+        thread.stack.push(result);
 
-    ctx.thread.stack.push(result);
-
-    ctx.ip += 2;
-    Ok(())
+        ctx.ip += 2;
+        Ok(())
+    })
 }
 
 #[allow(unused)]

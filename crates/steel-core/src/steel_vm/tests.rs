@@ -1139,6 +1139,81 @@ mod source_gc_tests {
 mod embedding_regressions {
     use crate::steel_vm::engine::Engine;
 
+    #[test]
+    fn replacing_struct_properties_releases_embedded_engine() {
+        use crate::{rvals::IntoSteelVal, steel_vm::register_fn::RegisterFn};
+        use std::{
+            process::Command,
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            },
+            time::{Duration, Instant},
+        };
+
+        const CHILD: &str = "STEEL_PROPERTY_REPLACEMENT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "steel_vm::tests::embedding_regressions::replacing_struct_properties_releases_embedded_engine", "--nocapture"])
+                .env(CHILD, "1")
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(
+                        status.success(),
+                        "property replacement child failed: {status}"
+                    );
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("property replacement deadlocked");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        struct EmbeddedEngine {
+            _engine: Engine,
+            dropped: Arc<AtomicUsize>,
+        }
+        impl crate::rvals::Custom for EmbeddedEngine {}
+        impl Drop for EmbeddedEngine {
+            fn drop(&mut self) {
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let mut embedded = Engine::new_raw_no_kernel();
+        let stored_drops = store_thread_clone(&mut embedded, false);
+        let heap = Arc::downgrade(&embedded.virtual_machine.heap);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let value = EmbeddedEngine {
+            _engine: embedded,
+            dropped: dropped.clone(),
+        }
+        .into_steelval()
+        .unwrap();
+        let mut engine = Engine::new();
+        engine.register_fn(
+            "#%vtable-update-entry!",
+            crate::values::structs::VTable::set_entry,
+        );
+        engine.run("(struct holder ())").unwrap();
+        engine.register_value("embedded", value);
+        engine.run("(#%vtable-update-entry! struct:holder #f (hash '#:owner embedded)) (set! embedded #f)").unwrap();
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        engine
+            .run("(#%vtable-update-entry! struct:holder #f (hash))")
+            .unwrap();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(stored_drops.load(Ordering::SeqCst), 1);
+        assert!(heap.upgrade().is_none());
+    }
+
     #[cfg(feature = "sync")]
     #[test]
     fn exported_boxed_callback_keeps_globals_alive_after_engine_drop() {
@@ -2181,7 +2256,9 @@ mod embedding_regressions {
             3,
             "only the live value and factory may retain the payload"
         );
-        engine.run("(set! live #f) (probe-gc)").unwrap();
+        // Release the old value returned by set! before collecting it.
+        engine.run("(set! live #f)").unwrap();
+        engine.run("(probe-gc)").unwrap();
         assert_eq!(
             Arc::strong_count(&count),
             2,
@@ -2452,7 +2529,7 @@ mod embedding_regressions {
     }
 
     #[cfg(feature = "sync")]
-    fn check_other_thread_allocations(constructor: &str, reader: &str) {
+    fn check_other_thread_allocations(constructor: &str, reader: &str, recycle: bool) {
         use crate::steel_vm::{register_fn::RegisterFn, vm::threads::thread_join};
         use std::{
             panic::{catch_unwind, AssertUnwindSafe},
@@ -2487,10 +2564,16 @@ mod embedding_regressions {
                 .virtual_machine
                 .enter_safepoint(|_| ready_rx.recv_timeout(Duration::from_secs(10)))
                 .unwrap();
+            if recycle {
+                for _ in 0..150 {
+                    engine.run("(define shadowed 0)").unwrap();
+                }
+            } else {
+                engine.run("(probe-gc)").unwrap();
+            }
             engine
                 .run(format!(
                     r#"
-                    (probe-gc)
                     (define added (map {constructor} (range 1000)))
                     (equal? (map {reader} added) (range 1000))
                     "#,
@@ -2512,14 +2595,21 @@ mod embedding_regressions {
 
     #[cfg(feature = "sync")]
     #[test]
+    fn recycling_preserves_values_on_worker_stacks() {
+        check_other_thread_allocations("box", "unbox", true);
+        check_other_thread_allocations("vector", "(lambda (v) (vector-ref v 0))", true);
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
     fn other_thread_roots_count_toward_box_allocations() {
-        check_other_thread_allocations("box", "unbox");
+        check_other_thread_allocations("box", "unbox", false);
     }
 
     #[cfg(feature = "sync")]
     #[test]
     fn other_thread_roots_count_toward_vector_allocations() {
-        check_other_thread_allocations("vector", "(lambda (value) (vector-ref value 0))");
+        check_other_thread_allocations("vector", "(lambda (value) (vector-ref value 0))", false);
     }
 
     #[cfg(feature = "sync")]
@@ -2698,7 +2788,9 @@ mod embedding_regressions {
             )
             .unwrap();
         assert_eq!(Arc::strong_count(&count), 4);
-        engine.run("(set! live #f) (probe-gc) (probe-gc)").unwrap();
+        // Release the old value returned by set! before testing will eligibility.
+        engine.run("(set! live #f)").unwrap();
+        engine.run("(probe-gc) (probe-gc)").unwrap();
         assert_eq!(Arc::strong_count(&count), 4);
         assert_eq!(
             engine.run("(will-execute executor)").unwrap(),
