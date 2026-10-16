@@ -3051,6 +3051,21 @@ mod resolver_tests {
 }
 
 #[test]
+fn engine_bootstrap_preserves_struct_macro() {
+    for mut engine in [Engine::new(), Engine::new_sandboxed()] {
+        let result = engine
+            .run(
+                "(struct point (x) #:mutable)
+                 (define p (point 3))
+                 (set-point-x! p 4)
+                 (point-x p)",
+            )
+            .unwrap();
+        assert_eq!(result.last(), Some(&SteelVal::IntV(4)));
+    }
+}
+
+#[test]
 fn raw_engine_immutable_structs() {
     let mut engine = Engine::new_raw_no_kernel();
     engine

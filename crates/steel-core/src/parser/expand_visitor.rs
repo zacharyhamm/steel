@@ -2207,6 +2207,32 @@ mod expansion_tests {
     }
 
     #[test]
+    fn native_forms_skip_definition_signatures() {
+        for source in [
+            "(#%define-syntax (struct expr) (struct local (field)))",
+            "(define (struct expr) (struct local (field)))",
+            "(#%define-syntax (define-values expr) (struct local (field)))",
+            "(define (define-values expr) (struct local (field)))",
+        ] {
+            let input = steel_parser::parser::Parser::parse_without_lowering(source)
+                .unwrap()
+                .remove(0);
+            let expanded = expand_kernel(
+                input.clone(),
+                None,
+                ModuleContainer::default(),
+                GlobalMap::Set(&FxHashSet::default()),
+            )
+            .unwrap();
+            let (ExprKind::List(input), ExprKind::List(expanded)) = (input, expanded) else {
+                panic!("expected an unlowered definition: {source}");
+            };
+            assert_eq!(input.args[..2], expanded.args[..2], "{source}");
+            assert!(matches!(expanded.args[2], ExprKind::Begin(_)), "{source}");
+        }
+    }
+
+    #[test]
     fn test_basic_expansion() {
         // (define-syntax when
         //     (syntax-rules ()
