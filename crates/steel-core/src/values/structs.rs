@@ -250,22 +250,26 @@ impl UserDefinedStruct {
         }
     }
 
-    #[cfg(not(feature = "sync"))]
-    pub(crate) fn get(&self, val: &SteelVal) -> Option<SteelVal> {
-        VTABLE.with(|x| {
-            x.borrow().entries[self.type_descriptor.0]
+    pub(crate) fn properties(&self) -> Gc<HashMap<SteelVal, SteelVal>> {
+        #[cfg(not(feature = "sync"))]
+        {
+            VTABLE.with(|x| {
+                x.borrow().entries[self.type_descriptor.0]
+                    .properties
+                    .clone()
+            })
+        }
+
+        #[cfg(feature = "sync")]
+        {
+            STATIC_VTABLE.read().entries[self.type_descriptor.0]
                 .properties
-                .get(val)
-                .cloned()
-        })
+                .clone()
+        }
     }
 
-    #[cfg(feature = "sync")]
     pub(crate) fn get(&self, val: &SteelVal) -> Option<SteelVal> {
-        STATIC_VTABLE.read().entries[self.type_descriptor.0]
-            .properties
-            .get(val)
-            .cloned()
+        self.properties().get(val).cloned()
     }
 
     #[inline(always)]

@@ -81,7 +81,7 @@ pub struct GlobalSlotRecycler {
     slots: HashSet<usize>,
 
     queue: Vec<SteelVal>,
-    visited_customs: rustc_hash::FxHashSet<usize>,
+    visited: rustc_hash::FxHashSet<usize>,
 
     #[cfg(feature = "sync")]
     will_executors: Vec<GcMut<Box<dyn CustomType>>>,
@@ -103,7 +103,7 @@ impl GlobalSlotRecycler {
     // push the values back, visit, mark visited, move on.
     pub fn recycle(&mut self, roots: &mut [SteelVal], symbol_map: &mut SymbolMap, heap: &mut Heap) {
         self.slots.clear();
-        self.visited_customs.clear();
+        self.visited.clear();
         #[cfg(feature = "sync")]
         self.will_executors.clear();
 
@@ -379,7 +379,7 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
     }
     // TODO: Come back to this
     fn visit_custom_type(&mut self, custom_type: GcMut<Box<dyn CustomType>>) -> Self::Output {
-        if !self.visited_customs.insert(custom_type.as_ptr() as usize) {
+        if !self.visited.insert(custom_type.as_ptr() as usize) {
             return;
         }
 
@@ -391,7 +391,7 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
         let mut queue = MarkAndSweepContext {
             queue: &mut self.queue,
             stats: MarkAndSweepStats::default(),
-            visited_customs: rustc_hash::FxHashSet::default(),
+            visited: rustc_hash::FxHashSet::default(),
         };
 
         custom_type.read().visit_children(&mut queue);
@@ -422,7 +422,7 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
         let mut queue = MarkAndSweepContext {
             queue: &mut self.queue,
             stats: MarkAndSweepStats::default(),
-            visited_customs: rustc_hash::FxHashSet::default(),
+            visited: rustc_hash::FxHashSet::default(),
         };
 
         queue.mark_heap_reference(&heap_ref.strong_ptr());
@@ -449,7 +449,7 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
         let mut queue = MarkAndSweepContext {
             queue: &mut self.queue,
             stats: MarkAndSweepStats::default(),
-            visited_customs: rustc_hash::FxHashSet::default(),
+            visited: rustc_hash::FxHashSet::default(),
         };
 
         queue.mark_heap_vector(&vector.strong_ptr())
@@ -474,6 +474,10 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
     fn visit_steel_struct(&mut self, steel_struct: Gc<UserDefinedStruct>) -> Self::Output {
         for field in steel_struct.fields.iter() {
             self.push_back(field.clone());
+        }
+        let properties = steel_struct.properties();
+        if self.visited.insert(properties.as_ptr() as usize) {
+            self.push_back(SteelVal::HashMapV(properties.into()));
         }
     }
 
@@ -944,6 +948,38 @@ mod will_tests {
     }
 
     #[test]
+    fn struct_properties_remain_ordinary_will_roots() {
+        let mut engine = engine_with_gc();
+        engine
+            .run(
+                "(define executor (make-will-executor))
+                 (define owner
+                   (let ((key (list (box 1) 2 3 4)))
+                     (will-register executor key (lambda (value) 42))
+                     (struct holder () #:key key)
+                     (holder)))",
+            )
+            .unwrap();
+        for _ in 0..3 {
+            engine.run("(probe-gc)").unwrap();
+            assert_eq!(readiness(&engine, "executor"), [false]);
+            assert_eq!(
+                engine
+                    .run("(unbox (car (#%struct-property-ref owner '#:key)))")
+                    .unwrap(),
+                [SteelVal::IntV(1)]
+            );
+        }
+        engine.run("(set! owner #f)").unwrap();
+        engine.run("(probe-gc) (probe-gc)").unwrap();
+        assert_eq!(readiness(&engine, "executor"), [true]);
+        assert_eq!(
+            engine.run("(will-execute executor)").unwrap(),
+            [SteelVal::IntV(42)]
+        );
+    }
+
+    #[test]
     fn forked_thread_constants_remain_ordinary_will_roots() {
         use crate::steel_vm::vm::{StackFrame, SteelThread};
         use std::sync::Arc;
@@ -1353,7 +1389,7 @@ fn parallel_mark_counts_each_slot_exactly_once() {
                     local_queue: &mut local_queue,
                     queue: &queue,
                     stats: MarkAndSweepStats::default(),
-                    visited_customs: rustc_hash::FxHashSet::default(),
+                    visited: rustc_hash::FxHashSet::default(),
                     will_executors: Vec::new(),
                     reachable: rustc_hash::FxHashSet::default(),
                 };
@@ -2404,7 +2440,7 @@ impl Heap {
         let mut context = MarkAndSweepContext {
             queue: &mut self.mark_and_sweep_queue,
             stats: MarkAndSweepStats::default(),
-            visited_customs: rustc_hash::FxHashSet::default(),
+            visited: rustc_hash::FxHashSet::default(),
         };
 
         // Pause all threads
@@ -2477,7 +2513,7 @@ impl Heap {
                 queue: &queue,
                 local_queue: &mut local_queue,
                 stats: MarkAndSweepStats::default(),
-                visited_customs: rustc_hash::FxHashSet::default(),
+                visited: rustc_hash::FxHashSet::default(),
                 will_executors: Vec::new(),
                 reachable,
             };
@@ -2643,7 +2679,7 @@ impl<T: Clone + core::fmt::Debug + PartialEq + Eq> HeapAllocated<T> {
 pub struct MarkAndSweepContext<'a> {
     queue: &'a mut Vec<SteelVal>,
     stats: MarkAndSweepStats,
-    visited_customs: rustc_hash::FxHashSet<usize>,
+    visited: rustc_hash::FxHashSet<usize>,
 }
 
 impl<'a> MarkAndSweepContext<'a> {
@@ -2711,7 +2747,7 @@ pub struct MarkAndSweepContextRefQueue<'a> {
     local_queue: &'a mut Vec<SteelValPointer>,
     queue: &'a crossbeam_queue::SegQueue<SteelValPointer>,
     stats: MarkAndSweepStats,
-    visited_customs: rustc_hash::FxHashSet<usize>,
+    visited: rustc_hash::FxHashSet<usize>,
     will_executors: Vec<&'a MutContainer<Box<dyn CustomType>>>,
     reachable: rustc_hash::FxHashSet<usize>,
 }
@@ -2751,7 +2787,7 @@ impl<'a> MarkAndSweepContextRefQueue<'a> {
         let mut temporary_queue = MarkAndSweepContext {
             queue: &mut queue,
             stats: MarkAndSweepStats::default(),
-            visited_customs: rustc_hash::FxHashSet::default(),
+            visited: rustc_hash::FxHashSet::default(),
         };
 
         custom_type.read().visit_children(&mut temporary_queue);
@@ -2919,7 +2955,7 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
     }
     // TODO: Come back to this
     fn visit_custom_type(&mut self, custom_type: GcMut<Box<dyn CustomType>>) -> Self::Output {
-        if !self.visited_customs.insert(custom_type.as_ptr() as usize) {
+        if !self.visited.insert(custom_type.as_ptr() as usize) {
             return;
         }
         custom_type.read().visit_children(self);
@@ -2990,6 +3026,10 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
     fn visit_steel_struct(&mut self, steel_struct: Gc<UserDefinedStruct>) -> Self::Output {
         for field in steel_struct.fields.iter() {
             self.push_back(field.clone());
+        }
+        let properties = steel_struct.properties();
+        if self.visited.insert(properties.as_ptr() as usize) {
+            self.push_back(SteelVal::HashMapV(properties.into()));
         }
     }
 
@@ -3164,10 +3204,7 @@ impl<'a> BreadthFirstSearchSteelValReferenceVisitor2<'a> for MarkAndSweepContext
         &mut self,
         custom_type: &'a MutContainer<Box<dyn CustomType>>,
     ) -> Self::Output {
-        if !self
-            .visited_customs
-            .insert(custom_type as *const _ as usize)
-        {
+        if !self.visited.insert(custom_type as *const _ as usize) {
             return;
         }
         if custom_type.read().as_any_ref().is::<WillExecutor>() {
@@ -3236,6 +3273,12 @@ impl<'a> BreadthFirstSearchSteelValReferenceVisitor2<'a> for MarkAndSweepContext
     fn visit_steel_struct(&mut self, steel_struct: &UserDefinedStruct) -> Self::Output {
         for field in steel_struct.fields.iter() {
             self.push_back(field);
+        }
+        let properties = steel_struct.properties();
+        if self.visited.insert(properties.as_ptr() as usize) {
+            let properties = SteelVal::HashMapV(properties.into());
+            self.push_back(&properties);
+            self.save(properties);
         }
     }
 

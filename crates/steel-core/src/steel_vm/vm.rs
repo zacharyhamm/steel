@@ -421,6 +421,31 @@ pub struct SteelThread {
     pub(crate) jit: Arc<Mutex<crate::jit2::cgen::JIT>>,
 
     pub(crate) module_context: Vec<SteelString>,
+
+    // Drop after all VM roots, and share only with threads using this heap.
+    #[cfg(feature = "sync")]
+    heap_teardown: Arc<HeapTeardown>,
+}
+
+#[cfg(feature = "sync")]
+struct HeapTeardown(Arc<parking_lot::Mutex<Heap>>);
+
+#[cfg(feature = "sync")]
+impl Drop for HeapTeardown {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.0) > 1 {
+            // Pending results retain their roots while unreachable heap-owned handles are freed.
+            self.0.lock().collection(
+                &[],
+                core::iter::empty(),
+                &[],
+                &ConstantMap::new(),
+                &[],
+                &mut Synchronizer::new(),
+                true,
+            );
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -765,6 +790,10 @@ impl SteelThread {
             handle,
         });
 
+        let heap = Arc::new(parking_lot::Mutex::new(Heap::new()));
+        #[cfg(feature = "sync")]
+        let heap_teardown = Arc::new(HeapTeardown(heap.clone()));
+
         SteelThread {
             global_env: Env::root(),
             stack: Vec::with_capacity(128),
@@ -774,7 +803,7 @@ impl SteelThread {
 
             function_interner: FunctionInterner::default(),
             // _super_instructions: Vec::new(),
-            heap: Arc::new(parking_lot::Mutex::new(Heap::new())),
+            heap,
             runtime_options: RunTimeOptions::new(),
             stack_frames: Vec::with_capacity(128),
             current_frame: StackFrame::main(),
@@ -797,8 +826,16 @@ impl SteelThread {
             #[cfg(feature = "jit2")]
             jit: Arc::new(Mutex::new(crate::jit2::cgen::JIT::default())),
             module_context: Vec::new(),
+            #[cfg(feature = "sync")]
+            heap_teardown,
             // delayed_dropper: DelayedDropper::new(),
         }
+    }
+
+    #[cfg(feature = "sync")]
+    pub(crate) fn replace_heap(&mut self, heap: Arc<parking_lot::Mutex<Heap>>) {
+        self.heap_teardown = Arc::new(HeapTeardown(heap.clone()));
+        self.heap = heap;
     }
 
     #[inline(always)]

@@ -580,7 +580,7 @@ impl Engine {
             engine.virtual_machine.heap.lock().clone(),
         ));
 
-        engine.virtual_machine.heap = heap_copy;
+        engine.virtual_machine.replace_heap(heap_copy);
         engine
     }
 
@@ -3063,6 +3063,29 @@ fn raw_engine_immutable_struct_functions_round_trip() {
             .into()
         )]
     );
+}
+
+#[test]
+fn raw_engine_definition_helpers_round_trip_in_closures() {
+    let mut engine = Engine::new_raw_no_kernel();
+    crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+    engine
+        .run(
+            "(require-builtin steel/meta)
+             (define (round-trip function)
+               (deserialize-value (bytes->serialized (serialized->bytes (serialize-value function)))))",
+        )
+        .unwrap();
+    for body in [
+        "(struct point (x)) (point-x (point 42))",
+        "(define-values (x y) '(1 42)) y",
+    ] {
+        engine.run(format!("(define (f) {body})")).unwrap();
+        assert_eq!(
+            engine.run("((round-trip f))").unwrap(),
+            [SteelVal::IntV(42)]
+        );
+    }
 }
 
 #[test]

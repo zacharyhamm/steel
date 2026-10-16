@@ -624,6 +624,34 @@ mod embedding_regressions {
     }
 
     #[test]
+    fn cyclic_struct_properties_keep_heap_values_alive() {
+        use crate::{gc::Gc, values::structs::VTable, SteelVal};
+
+        let mut engine = Engine::new();
+        register_gc(&mut engine);
+        engine
+            .run("(struct holder ()) (define owner (holder))")
+            .unwrap();
+        let SteelVal::CustomStruct(owner) = engine.extract_value("owner").unwrap() else {
+            panic!("expected a struct");
+        };
+        let original_properties = owner.properties();
+        let mut properties = (*original_properties).clone();
+        let payload = engine.run("(box 42)").unwrap().pop().unwrap();
+        properties.insert(payload, SteelVal::CustomStruct(owner.clone()));
+        VTable::set_entry(&owner.type_descriptor, None, Gc::new(properties));
+        engine.run("(probe-gc) (probe-gc)").unwrap();
+        assert_eq!(
+            owner
+                .properties()
+                .keys()
+                .find_map(SteelVal::as_box_to_inner),
+            Some(SteelVal::IntV(42))
+        );
+        VTable::set_entry(&owner.type_descriptor, None, original_properties);
+    }
+
+    #[test]
     fn execution_results_survive_later_collections() {
         let mut engine = Engine::new();
         register_gc(&mut engine);
@@ -1036,6 +1064,132 @@ mod embedding_regressions {
             drop(worker);
             assert!(heap.upgrade().is_none());
             collector.run("(probe-gc) (probe-gc)").unwrap();
+        }
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn engine_teardown_releases_heap_stored_thread_handles() {
+        use crate::steel_vm::{register_fn::RegisterFn, vm::threads::thread_finished};
+        use std::{
+            sync::Arc,
+            time::{Duration, Instant},
+        };
+
+        struct Probe(#[allow(dead_code)] Arc<()>);
+        impl crate::rvals::Custom for Probe {}
+
+        for (container, clone_heap) in [
+            ("box", false),
+            ("vector", false),
+            ("box", true),
+            ("vector", true),
+        ] {
+            let count = Arc::new(());
+            let factory = count.clone();
+            let mut engine = Engine::new_raw_no_kernel();
+            crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+            if clone_heap {
+                let isolated = engine.deep_clone();
+                let original_heap = Arc::downgrade(&engine.virtual_machine.heap);
+                drop(engine);
+                assert!(original_heap.upgrade().is_none());
+                engine = isolated;
+            }
+            engine.register_fn("probe-value", move || Probe(factory.clone()));
+            let heap = Arc::downgrade(&engine.virtual_machine.heap);
+            let worker = engine
+                .run(
+                    "(require-builtin steel/meta)
+                     (require-builtin steel/threads)
+                     (require-builtin steel/vectors)
+                     (define worker
+                       (let ((payload (probe-value)))
+                         (spawn-native-thread (lambda () (box payload)))))
+                     worker",
+                )
+                .unwrap()
+                .pop()
+                .unwrap();
+            engine.enter_safepoint(|| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while thread_finished(&worker).unwrap() != crate::SteelVal::BoolV(true) {
+                    assert!(Instant::now() < deadline, "worker did not finish");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+            engine
+                .run(format!(
+                    "(define owner ({container} worker)) (define live (box 42))"
+                ))
+                .unwrap();
+            drop(worker);
+            let mut survivor = engine.clone();
+            drop(engine);
+            assert_eq!(
+                survivor.run("(unbox live)").unwrap(),
+                [crate::SteelVal::IntV(42)]
+            );
+            drop(survivor);
+            assert!(
+                heap.upgrade().is_none(),
+                "{container} must not retain the heap"
+            );
+            assert_eq!(
+                Arc::strong_count(&count),
+                1,
+                "{container} must release the payload"
+            );
+        }
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn engine_teardown_waits_for_running_workers() {
+        use crate::steel_vm::register_fn::RegisterFn;
+        use std::{
+            sync::Arc,
+            time::{Duration, Instant},
+        };
+
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let mut engine = Engine::new_raw_no_kernel();
+        crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+        engine.register_fn("wait-for-release", move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        let heap = Arc::downgrade(&engine.virtual_machine.heap);
+        engine
+            .run(
+                "(require-builtin steel/meta)
+                 (require-builtin steel/threads)
+                 (define owner
+                   (box (spawn-native-thread
+                          (lambda ()
+                            (define payload (box 42))
+                            (wait-for-release)
+                            payload))))",
+            )
+            .unwrap();
+        engine.enter_safepoint(|| started_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        drop(engine);
+        assert!(
+            heap.strong_count() > 0,
+            "the running worker still needs its heap"
+        );
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while heap.strong_count() > 0 {
+            // Biased RC defers cross-thread drops to the allocating thread.
+            #[cfg(feature = "biased")]
+            steel_rc::QueueHandle::run_explicit_merge();
+            assert!(
+                Instant::now() < deadline,
+                "the completed worker retained its heap"
+            );
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
