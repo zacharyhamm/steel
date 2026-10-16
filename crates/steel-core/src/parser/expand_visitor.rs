@@ -1635,6 +1635,14 @@ fn expand_define_values(list: &List) -> Result<ExprKind> {
             location.clone(),
         ))));
     }
+    definitions.push(ExprKind::Set(Box::new(ast::Set::new(
+        temporary,
+        ExprKind::Atom(Atom::new(SyntaxObject::new(
+            TokenType::BooleanLiteral(false),
+            span,
+        ))),
+        SyntaxObject::new(TokenType::Set, span),
+    ))));
     Ok(ExprKind::Begin(Box::new(Begin::new(
         definitions,
         SyntaxObject::new(TokenType::Begin, span),

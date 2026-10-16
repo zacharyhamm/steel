@@ -1382,6 +1382,7 @@ pub fn into_serializable_value(
             {
                 Ok(SerializableSteelVal::NativeRef(spec))
             } else if let Some(spec) = create_struct_spec(val.clone()) {
+                ctx.reachable_structs.insert(spec.descriptor);
                 Ok(SerializableSteelVal::StructConstructorSpec(spec))
 
                 // Attempt to discover it from the struct registry
