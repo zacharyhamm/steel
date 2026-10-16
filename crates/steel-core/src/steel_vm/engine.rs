@@ -1247,10 +1247,6 @@ impl Engine {
             "#%immutable-struct-type",
             SteelVal::FuncV(crate::values::structs::make_immutable_struct_type),
         );
-        engine.register_value(
-            "#%immutable-struct-binding",
-            SteelVal::FuncV(crate::values::structs::immutable_struct_binding),
-        );
 
         // Set the prelude string to be completely empty,
         // so we'll have to get that working yet.
@@ -2997,4 +2993,21 @@ fn raw_engine_immutable_structs() {
         SteelVal::IntV(9)
     );
     assert_eq!(engine.run("((lambda (#%immutable-struct-type #%immutable-struct-binding) (struct local (field)) (local-field (local 11))) #f #f)").unwrap()[0], SteelVal::IntV(11));
+}
+
+#[test]
+fn symbol_identity_is_independent_of_allocation() {
+    let mut engine = Engine::new_raw_no_kernel();
+    crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+    engine
+        .run("(require-builtin steel/equality) (require-builtin steel/lists)")
+        .unwrap();
+    assert_eq!(
+        engine.run("(eq? 'a (car '(a)))").unwrap()[0],
+        SteelVal::BoolV(true)
+    );
+    assert_eq!(
+        engine.run("(eq? 'a (car '(b)))").unwrap()[0],
+        SteelVal::BoolV(false)
+    );
 }

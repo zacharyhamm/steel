@@ -1650,11 +1650,7 @@ fn expand_immutable_struct(list: &List) -> Result<ExprKind> {
     for (index, binding) in names.enumerate() {
         definitions.push(ExprKind::Define(Box::new(Define::new(
             binding,
-            expr_list![
-                primitive("#%immutable-struct-binding"),
-                temporary.clone(),
-                expr_usize(index)
-            ],
+            expr_list![temporary.clone(), expr_usize(index)],
             location.clone(),
         ))));
     }
