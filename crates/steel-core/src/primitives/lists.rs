@@ -69,6 +69,7 @@ pub fn list_module() -> BuiltInModule {
     let mut module = BuiltInModule::new("steel/lists");
 
     module
+        .register_native_fn_definition(DESTRUCTURE_VALUES_DEFINITION)
         .register_native_fn_definition(NEW_DEFINITION)
         .register_native_fn_definition(NEW_CONST_DEFINITION)
         .register_native_fn_definition(CONS_DEFINITION)

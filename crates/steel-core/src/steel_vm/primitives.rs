@@ -2517,6 +2517,10 @@ fn meta_module() -> BuiltInModule {
         .register_fn("multi-arity?", is_multi_arity)
         .register_value("make-struct-type", SteelVal::FuncV(make_struct_type))
         .register_value(
+            "#%immutable-struct-type",
+            SteelVal::FuncV(crate::values::structs::make_immutable_struct_type),
+        )
+        .register_value(
             "#%struct-update",
             SteelVal::MutFunc(struct_update_primitive),
         )
