@@ -375,6 +375,7 @@ enum ExpressionType {
     DefineFlat(InternedString),
     DefineFlatStar(InternedString),
     DefineFunction(InternedString),
+    DefineValues(InternedString),
     Expression,
 }
 
@@ -418,6 +419,20 @@ impl ExpressionType {
                         ExprKind::LambdaFunction(_) => {
                             expression_types.push(ExpressionType::DefineFunction(*name));
                         }
+                        ExprKind::List(list)
+                            if list.args.first().is_some_and(|expr| {
+                                expr.atom_syntax_object().is_some_and(|syntax| {
+                                    syntax.unresolved
+                                        && syntax.ty.identifier().is_some_and(|name| {
+                                            name.resolve() == "#%values-destructure"
+                                        })
+                                })
+                            }) =>
+                        {
+                            // A producer can return closures that refer to any of the
+                            // surrounding definitions, just like a direct lambda RHS.
+                            expression_types.push(ExpressionType::DefineValues(*name));
+                        }
                         _ => {
                             defined_idents.visit(&d.body);
                             if defined_idents.check_output() {
@@ -433,8 +448,6 @@ impl ExpressionType {
                 _ => expression_types.push(ExpressionType::Expression),
             }
         }
-
-        // println!("Expression types: {:?}", expression_types);
 
         expression_types
     }
@@ -458,10 +471,12 @@ fn convert_exprs_to_let(begin: Box<Begin>) -> ExprKind {
         return ExprKind::Begin(begin);
     }
 
-    if !expression_types
-        .iter()
-        .any(|x| matches!(x, ExpressionType::DefineFunction(_)))
-    {
+    if !expression_types.iter().any(|x| {
+        matches!(
+            x,
+            ExpressionType::DefineFunction(_) | ExpressionType::DefineValues(_)
+        )
+    }) {
         return begin
             .exprs
             .into_iter()
@@ -590,7 +605,9 @@ fn convert_exprs_to_let(begin: Box<Begin>) -> ExprKind {
                 };
             }
             // Evaluate nonconstant initializers in body order, after earlier effects.
-            ExpressionType::DefineFlat(_) | ExpressionType::DefineFlatStar(_) => {
+            ExpressionType::DefineFlat(_)
+            | ExpressionType::DefineFlatStar(_)
+            | ExpressionType::DefineValues(_) => {
                 if let ExprKind::Define(d) = &exprs[i] {
                     top_level_arguments.push(d.name.clone());
                     top_level_dummy_args.push(ExprKind::Atom(Atom::new(SyntaxObject::default(

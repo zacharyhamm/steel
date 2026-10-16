@@ -1581,6 +1581,66 @@ fn expand_keyword_and_default_arguments(
     Ok(())
 }
 
+fn expand_define_values(list: &List) -> Result<ExprKind> {
+    let span = get_span(&ExprKind::List(list.clone()));
+    if list.improper || list.len() != 3 {
+        stop!(BadSyntax => "define-values expects (define-values (name ...) producer)"; span)
+    }
+    let ExprKind::List(bindings) = &list.args[1] else {
+        stop!(BadSyntax => "define-values expects a list of identifiers"; list.args[1].span())
+    };
+    if bindings.improper {
+        stop!(BadSyntax => "define-values expects a proper list of identifiers"; list.args[1].span())
+    }
+    let mut seen = HashSet::new();
+    for binding in &bindings.args {
+        let Some(name) = binding.atom_identifier() else {
+            stop!(BadSyntax => "define-values binding must be an identifier"; binding.span())
+        };
+        if !seen.insert(*name) {
+            stop!(BadSyntax => "duplicate define-values binding"; binding.span())
+        }
+    }
+    // Allocate an expansion identity: two invocations may have identical source spans.
+    let location = SyntaxObject::new(TokenType::Define, span);
+    let temporary = ExprKind::ident_with_span(
+        &format!("##define-values-{}", u32::from(location.syntax_object_id)),
+        span,
+    );
+    let primitive = |name: &str| {
+        let mut identifier = ExprKind::ident_with_span(name, span);
+        if let Some(syntax) = identifier.atom_syntax_object_mut() {
+            syntax.unresolved = true;
+            syntax.introduced_via_macro = true;
+        }
+        identifier
+    };
+    let mut definitions = vec![ExprKind::Define(Box::new(Define::new(
+        temporary.clone(),
+        expr_list![
+            primitive("#%values-destructure"),
+            list.args[2].clone(),
+            expr_usize(bindings.len())
+        ],
+        location.clone(),
+    )))];
+    for (index, binding) in bindings.args.iter().enumerate() {
+        definitions.push(ExprKind::Define(Box::new(Define::new(
+            binding.clone(),
+            expr_list![
+                primitive("#%values-ref"),
+                temporary.clone(),
+                expr_usize(index)
+            ],
+            location.clone(),
+        ))));
+    }
+    Ok(ExprKind::Begin(Box::new(Begin::new(
+        definitions,
+        SyntaxObject::new(TokenType::Begin, span),
+    ))))
+}
+
 fn expand_immutable_struct(list: &List) -> Result<ExprKind> {
     let span = get_span(&ExprKind::List(list.clone()));
     if list.len() != 3 {
@@ -1800,6 +1860,29 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
             ExprKind::Macro(m) => self.visit_macro(m),
             ExprKind::Atom(a) => self.visit_atom(a),
             ExprKind::List(l) => {
+                // Definition signatures are binding data, not executable applications
+                // of the function or macro being defined (for example `struct`).
+                if l.first().is_some_and(|head| {
+                    head.atom_syntax_object()
+                        .is_some_and(|syntax| matches!(syntax.ty, TokenType::Define))
+                }) || l
+                    .first_ident()
+                    .is_some_and(|name| name.resolve() == "#%define-syntax")
+                {
+                    for body in l.args.iter_mut().skip(2) {
+                        self.visit(body)?;
+                    }
+                    return Ok(());
+                }
+                if self.map.is_none()
+                    && l.first_ident()
+                        .is_some_and(|name| name.resolve() == "define-values")
+                {
+                    *expr = expand_define_values(l)?;
+                    self.changed = true;
+                    return self.visit(expr);
+                }
+
                 if self.map.is_none()
                     && l.first_ident()
                         .is_some_and(|name| name.resolve() == "struct")

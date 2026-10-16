@@ -1247,6 +1247,14 @@ impl Engine {
             "#%immutable-struct-type",
             SteelVal::FuncV(crate::values::structs::make_immutable_struct_type),
         );
+        engine.register_value(
+            "#%values-destructure",
+            SteelVal::FuncV(crate::primitives::lists::steel_destructure_values),
+        );
+        engine.register_value(
+            "#%values-ref",
+            SteelVal::FuncV(crate::primitives::lists::steel_list_ref),
+        );
 
         // Set the prelude string to be completely empty,
         // so we'll have to get that working yet.
@@ -2993,6 +3001,11 @@ fn raw_engine_immutable_structs() {
         SteelVal::IntV(9)
     );
     assert_eq!(engine.run("((lambda (#%immutable-struct-type #%immutable-struct-binding) (struct local (field)) (local-field (local 11))) #f #f)").unwrap()[0], SteelVal::IntV(11));
+    engine.run("(define (make-local value #%immutable-struct-type #%immutable-struct-binding) (struct local (field)) (local-field (local value)))").unwrap();
+    assert_eq!(
+        engine.run("(make-local 12 #f #f)").unwrap()[0],
+        SteelVal::IntV(12)
+    );
 }
 
 #[test]
@@ -3009,6 +3022,18 @@ fn symbol_identity_is_independent_of_allocation() {
     assert_eq!(
         engine.run("(eq? 'a (car '(b)))").unwrap()[0],
         SteelVal::BoolV(false)
+    );
+    assert_eq!(
+        engine.run("(eq? 'a (car '(a . b)))").unwrap()[0],
+        SteelVal::BoolV(true)
+    );
+    assert_eq!(
+        engine.run("(eq? 'b (cdr '(a . b)))").unwrap()[0],
+        SteelVal::BoolV(true)
+    );
+    assert_eq!(
+        engine.run("(eq? 'a (car (car '((a . 1)))))").unwrap()[0],
+        SteelVal::BoolV(true)
     );
 }
 
@@ -3035,4 +3060,51 @@ fn raw_engine_macro_defined_values_export_from_modules() {
     engine.run("(require \"values-module\")").unwrap();
     assert_eq!(engine.run("a").unwrap()[0], SteelVal::IntV(3));
     assert_eq!(engine.run("b").unwrap()[0], SteelVal::IntV(4));
+}
+
+#[test]
+fn raw_engine_define_values_has_fresh_bindings_and_private_helpers() {
+    let mut engine = Engine::new_raw_no_kernel();
+    engine.run("(define-values (a b) '(1 2)) (define-values (c) 3) (define-values () '()) (define-values () '())").unwrap();
+    for (name, expected) in [("a", 1), ("b", 2), ("c", 3)] {
+        assert_eq!(engine.run(name).unwrap()[0], SteelVal::IntV(expected));
+    }
+    assert_eq!(engine.run("((lambda (producer #%values-destructure #%values-ref) (define-values (x y) producer) y) '(4 5) #f #f)").unwrap()[0], SteelVal::IntV(5));
+    engine.run("(define (destructure producer #%values-destructure #%values-ref) (define-values (x y) producer) y)").unwrap();
+    assert_eq!(
+        engine.run("(destructure '(12 13) #f #f)").unwrap()[0],
+        SteelVal::IntV(13)
+    );
+    engine.run("(define-syntax pair-definitions (syntax-rules () [(pair-definitions x y) (begin (define-values (x) 6) (define-values (y) 7))])) (pair-definitions d e)").unwrap();
+    assert_eq!(engine.run("e").unwrap()[0], SteelVal::IntV(7));
+    for source in [
+        "(define-values (too few) '(1))",
+        "(define-values (too-many) '(1 2))",
+        "(define-values () '(1))",
+        "(define-values (duplicate duplicate) '(1 2))",
+        "(define-values (1) '(1))",
+        "(define-values (a . b) '(1 2))",
+        "(define-values name '(1))",
+    ] {
+        assert!(engine.run(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn raw_engine_define_values_preserves_definitions_and_module_exports() {
+    let mut engine = Engine::new_raw_no_kernel();
+    crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+    engine
+        .run("(require-builtin steel/numbers) (require-builtin steel/lists) (require-builtin steel/ord) (require-builtin steel/equality)")
+        .unwrap();
+    engine.run("(define count 0) (define-values (x y) (begin (set! count (+ count 1)) '(8 9))) (define-values (even?) (lambda (_) 77))").unwrap();
+    assert_eq!(engine.run("count").unwrap()[0], SteelVal::IntV(1));
+    assert_eq!(engine.run("(even? 2)").unwrap()[0], SteelVal::IntV(77));
+    assert_eq!(engine.run("(let () (define-values (recur-even) (lambda (n) (if (= n 0) #t (recur-odd (- n 1))))) (define-values (recur-odd) (lambda (n) (if (= n 0) #f (recur-even (- n 1))))) (recur-odd 9))").unwrap()[0], SteelVal::BoolV(true));
+    assert_eq!(engine.run("(let () (define trace 0) (define-values (a) (begin (set! trace (+ (* trace 10) 1)) 3)) (set! trace (+ (* trace 10) 2)) (define-values (b) (begin (set! trace (+ (* trace 10) 3)) a)) (define-values () (begin (set! trace (+ (* trace 10) 4)) '())) trace)").unwrap()[0], SteelVal::IntV(1234));
+    assert_eq!(engine.run("((lambda (outer) (let () (define-values (recur-even) (lambda (n) (if (= n 0) outer (recur-odd (- n 1))))) (define-values (recur-odd) (lambda (n) (if (= n 0) #f (recur-even (- n 1))))) (recur-even 8))) #t)").unwrap()[0], SteelVal::BoolV(true));
+    engine.register_steel_module("fresh-values".into(), "(provide left right) (define-values (left) 10) (define-values () '()) (define-values (right) 11)".into());
+    engine.run("(require \"fresh-values\")").unwrap();
+    assert_eq!(engine.run("left").unwrap()[0], SteelVal::IntV(10));
+    assert_eq!(engine.run("right").unwrap()[0], SteelVal::IntV(11));
 }

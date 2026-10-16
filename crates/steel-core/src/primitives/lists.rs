@@ -18,6 +18,19 @@ declare_const_mut_ref_functions! {
     PUSH_BACK => push_back,
 }
 
+// Preserve Steel's list convention for multiple values without a macro-kernel dependency.
+#[steel_derive::function(name = "#%values-destructure")]
+pub(crate) fn destructure_values(value: SteelVal, expected: usize) -> Result<SteelVal> {
+    let values = match value {
+        SteelVal::ListV(values) => values,
+        value => vec![value].into(),
+    };
+    if values.len() != expected {
+        stop!(ArityMismatch => "define-values arity mismatch: expected {}, found {}", expected, values.len())
+    }
+    Ok(SteelVal::ListV(values))
+}
+
 pub struct UnRecoverableResult(Result<SteelVal>);
 
 impl IntoSteelVal for UnRecoverableResult {
