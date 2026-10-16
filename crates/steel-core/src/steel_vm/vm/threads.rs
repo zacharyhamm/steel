@@ -26,11 +26,7 @@ use super::*;
 pub struct ThreadHandle {
     // Drop the result root before releasing its heap.
     pub(crate) handle: Mutex<
-        Option<
-            std::thread::JoinHandle<
-                core::result::Result<(RootedSteelVal, Arc<parking_lot::Mutex<Heap>>), String>,
-            >,
-        >,
+        Option<std::thread::JoinHandle<core::result::Result<(RootedSteelVal, HeapHandle), String>>>,
     >,
 
     pub(crate) thread: std::thread::Thread,
@@ -123,7 +119,11 @@ pub(crate) fn thread_join_impl(handle: &ThreadHandle) -> Result<SteelVal> {
         handle
             .join()
             .map_err(|_| SteelErr::new(ErrorKind::Generic, "thread panicked!".to_string()))?
-            .map(|result| result.0.value().clone())
+            .map(|(result, heap)| {
+                // Keep the joined value rooted while releasing its pending heap handle.
+                drop(heap);
+                result.value().clone()
+            })
             .map_err(|x| SteelErr::new(ErrorKind::Generic, x.to_string()))
     } else {
         stop!(ContractViolation => "thread handle has already been joined!");
@@ -1127,7 +1127,7 @@ pub(crate) fn spawn_native_thread(ctx: &mut VmCore, args: &[SteelVal]) -> Option
     let thread_time = crate::time::Instant::now();
 
     // Do this here?
-    let mut thread = ctx.thread.clone();
+    let mut thread = ctx.thread.clone_for_execution();
 
     thread.stack.clear();
     thread.stack_frames.clear();

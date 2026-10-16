@@ -31,10 +31,197 @@ use steel_parser::parser::{lower_entire_ast, SourceId};
 // underlying representation.
 #[derive(Debug)]
 pub struct ConstantMap {
-    map: SharedMut<FxHashMap<SteelVal, usize>>,
+    index: SharedMut<ConstantIndex>,
     values: SharedMut<Vec<SteelVal>>,
     // TODO: Flush to these values after a compilation. - maybe have two of them to
     reified_values: Arc<ArcSwap<Vec<SteelVal>>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConstantIndex {
+    nodes: Vec<CanonicalConstant>,
+    keys: FxHashMap<ConstantKey, usize>,
+    pairs: FxHashMap<usize, usize>,
+    #[cfg(test)]
+    pair_lookups: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CanonicalConstant {
+    value: SteelVal,
+    constant_index: Option<usize>,
+}
+
+// Child IDs avoid hashing an entire pair suffix each time its parent is interned.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ConstantKey {
+    Atom(SteelVal),
+    Pair(usize, usize),
+    List(Vec<usize>),
+    Vector(Vec<usize>),
+}
+
+enum ConstantWork {
+    Visit(SteelVal),
+    Pair(crate::gc::Gc<crate::values::lists::Pair>),
+    List(crate::values::lists::List<SteelVal>),
+    Vector(crate::rvals::SteelVector),
+}
+
+fn same_constant(left: &SteelVal, right: &SteelVal) -> bool {
+    use crate::gc::Gc;
+    match (left, right) {
+        (SteelVal::HeapAllocated(left), SteelVal::HeapAllocated(right)) => left.ptr_eq(right),
+        (SteelVal::CustomStruct(left), SteelVal::CustomStruct(right)) => Gc::ptr_eq(left, right),
+        (SteelVal::SyntaxObject(left), SteelVal::SyntaxObject(right)) => Gc::ptr_eq(left, right),
+        (SteelVal::BoxedIterator(left), SteelVal::BoxedIterator(right)) => Gc::ptr_eq(left, right),
+        (SteelVal::Boxed(left), SteelVal::Boxed(right)) => Gc::ptr_eq(left, right),
+        (SteelVal::Reference(left), SteelVal::Reference(right)) => Gc::ptr_eq(left, right),
+        (SteelVal::BigRational(left), SteelVal::BigRational(right)) => Gc::ptr_eq(left, right),
+        (SteelVal::Complex(left), SteelVal::Complex(right)) => Gc::ptr_eq(left, right),
+        (SteelVal::Rational(left), SteelVal::Rational(right)) => left == right,
+        _ => left.ptr_eq(right),
+    }
+}
+
+impl ConstantIndex {
+    fn intern(&mut self, value: SteelVal, mut values: Option<&mut Vec<SteelVal>>) -> usize {
+        let mut work = vec![ConstantWork::Visit(value)];
+        let mut children = Vec::new();
+        while let Some(item) = work.pop() {
+            let (key, original) = match item {
+                ConstantWork::Visit(SteelVal::Pair(pair)) => {
+                    if let Some(&id) = self.pairs.get(&(pair.as_ptr() as usize)) {
+                        self.publish(id, values.as_deref_mut());
+                        children.push(id);
+                        continue;
+                    }
+                    let car = pair.car();
+                    let cdr = pair.cdr();
+                    work.push(ConstantWork::Pair(pair));
+                    work.push(ConstantWork::Visit(cdr));
+                    work.push(ConstantWork::Visit(car));
+                    continue;
+                }
+                ConstantWork::Visit(SteelVal::ListV(list)) => {
+                    work.push(ConstantWork::List(list.clone()));
+                    let start = work.len();
+                    work.extend(list.iter().cloned().map(ConstantWork::Visit));
+                    work[start..].reverse();
+                    continue;
+                }
+                ConstantWork::Visit(SteelVal::VectorV(vector)) => {
+                    work.push(ConstantWork::Vector(vector.clone()));
+                    work.extend(vector.iter().rev().cloned().map(ConstantWork::Visit));
+                    continue;
+                }
+                ConstantWork::Visit(value) => (ConstantKey::Atom(value), None),
+                ConstantWork::Pair(pair) => {
+                    let cdr = children.pop().unwrap();
+                    let car = children.pop().unwrap();
+                    #[cfg(test)]
+                    {
+                        self.pair_lookups += 1;
+                    }
+                    (ConstantKey::Pair(car, cdr), Some(SteelVal::Pair(pair)))
+                }
+                ConstantWork::List(list) => (
+                    ConstantKey::List(children.split_off(children.len() - list.len())),
+                    Some(SteelVal::ListV(list)),
+                ),
+                ConstantWork::Vector(vector) => (
+                    ConstantKey::Vector(children.split_off(children.len() - vector.len())),
+                    Some(SteelVal::VectorV(vector)),
+                ),
+            };
+            let id = if let Some(&id) = self.keys.get(&key) {
+                id
+            } else {
+                let value = match &key {
+                    ConstantKey::Atom(value) => value.clone(),
+                    ConstantKey::Pair(car, cdr) => {
+                        let car = &self.nodes[*car].value;
+                        let cdr = &self.nodes[*cdr].value;
+                        let SteelVal::Pair(pair) = original.unwrap() else {
+                            unreachable!()
+                        };
+                        if same_constant(pair.car_ref(), car) && same_constant(pair.cdr_ref(), cdr)
+                        {
+                            SteelVal::Pair(pair)
+                        } else {
+                            crate::values::lists::Pair::cons(car.clone(), cdr.clone()).into()
+                        }
+                    }
+                    ConstantKey::List(ids) => {
+                        let SteelVal::ListV(list) = original.unwrap() else {
+                            unreachable!()
+                        };
+                        if list
+                            .iter()
+                            .zip(ids)
+                            .all(|(value, id)| same_constant(value, &self.nodes[*id].value))
+                        {
+                            SteelVal::ListV(list)
+                        } else {
+                            SteelVal::ListV(
+                                ids.iter().map(|id| self.nodes[*id].value.clone()).collect(),
+                            )
+                        }
+                    }
+                    ConstantKey::Vector(ids) => {
+                        let SteelVal::VectorV(vector) = original.unwrap() else {
+                            unreachable!()
+                        };
+                        if vector
+                            .iter()
+                            .zip(ids)
+                            .all(|(value, id)| same_constant(value, &self.nodes[*id].value))
+                        {
+                            SteelVal::VectorV(vector)
+                        } else {
+                            SteelVal::VectorV(
+                                ids.iter().map(|id| self.nodes[*id].value.clone()).collect(),
+                            )
+                        }
+                    }
+                };
+                let id = self.nodes.len();
+                if let SteelVal::Pair(pair) = &value {
+                    self.pairs.insert(pair.as_ptr() as usize, id);
+                }
+                self.nodes.push(CanonicalConstant {
+                    value,
+                    constant_index: None,
+                });
+                self.keys.insert(key, id);
+                id
+            };
+            self.publish(id, values.as_deref_mut());
+            children.push(id);
+        }
+        children.pop().unwrap()
+    }
+
+    fn publish(&mut self, id: usize, values: Option<&mut Vec<SteelVal>>) {
+        if let Some(values) = values {
+            let node = &mut self.nodes[id];
+            if node.constant_index.is_none() {
+                node.constant_index = Some(values.len());
+                values.push(node.value.clone());
+            }
+        }
+    }
+
+    fn rebuild(values: &mut [SteelVal]) -> Self {
+        let mut index = Self::default();
+        for (position, value) in values.iter_mut().enumerate() {
+            let id = index.intern(value.clone(), None);
+            let node = &mut index.nodes[id];
+            *value = node.value.clone();
+            node.constant_index = Some(position);
+        }
+        index
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -50,7 +237,7 @@ impl Clone for ConstantMap {
     fn clone(&self) -> Self {
         Self {
             values: Shared::clone(&self.values),
-            map: Shared::clone(&self.map),
+            index: Shared::clone(&self.index),
             reified_values: Arc::clone(&self.reified_values),
         }
     }
@@ -60,7 +247,7 @@ impl ConstantMap {
     pub fn new() -> ConstantMap {
         ConstantMap {
             values: Shared::new(MutContainer::new(Vec::new())),
-            map: Shared::new(MutContainer::new(FxHashMap::default())),
+            index: Shared::new(MutContainer::new(ConstantIndex::default())),
             // Does this help at all?
             reified_values: Arc::new(ArcSwap::from_pointee(Vec::new())),
         }
@@ -80,20 +267,12 @@ impl ConstantMap {
     }
 
     pub fn deep_clone(&self) -> ConstantMap {
+        let index = self.index.read();
+        let values = self.values.read();
         Self {
-            map: Shared::new(MutContainer::new(
-                self.map
-                    .read()
-                    .iter()
-                    .map(|x| (x.0.clone(), x.1.clone()))
-                    .collect(),
-            )),
-            values: Shared::new(MutContainer::new(
-                self.values.read().iter().cloned().collect(),
-            )),
-            reified_values: Arc::new(ArcSwap::from_pointee(
-                self.values.read().iter().cloned().collect(),
-            )),
+            index: Shared::new(MutContainer::new(index.clone())),
+            values: Shared::new(MutContainer::new(values.clone())),
+            reified_values: Arc::new(ArcSwap::from_pointee(values.clone())),
         }
     }
 
@@ -111,15 +290,10 @@ impl ConstantMap {
             .unwrap()
     }
 
-    pub fn from_vec(vec: Vec<SteelVal>) -> ConstantMap {
+    pub fn from_vec(mut vec: Vec<SteelVal>) -> ConstantMap {
+        let index = ConstantIndex::rebuild(&mut vec);
         ConstantMap {
-            map: Shared::new(MutContainer::new(
-                vec.clone()
-                    .into_iter()
-                    .enumerate()
-                    .map(|x| (x.1, x.0))
-                    .collect(),
-            )),
+            index: Shared::new(MutContainer::new(index)),
             values: Shared::new(MutContainer::new(vec.clone())),
             reified_values: Arc::new(ArcSwap::from_pointee(vec)),
         }
@@ -183,12 +357,12 @@ impl ConstantMap {
 
 impl ConstantMap {
     pub fn add(&mut self, val: SteelVal) -> usize {
-        let idx = self.len();
-        self.values.write().push(val.clone());
-
-        // TODO: Consider just storing the hash code, not the actual value.
-        self.map.write().insert(val, idx);
-
+        let mut index = self.index.write();
+        let mut values = self.values.write();
+        let id = index.intern(val, None);
+        let idx = values.len();
+        index.nodes[id].constant_index = Some(idx);
+        values.push(index.nodes[id].value.clone());
         idx
     }
 
@@ -222,62 +396,10 @@ impl ConstantMap {
         self.values.read().get(idx).cloned()
     }
 
-    // Replace with existing constants if they already exist
-    fn walk_constants(&mut self, val: &SteelVal) -> Option<SteelVal> {
-        match val {
-            SteelVal::ListV(l) => Some(SteelVal::ListV(
-                l.iter()
-                    .map(|value| {
-                        let idx = self.add_or_get(value.clone());
-
-                        self.get(idx)
-                    })
-                    .collect(),
-            )),
-            SteelVal::VectorV(v) => Some(SteelVal::VectorV(
-                v.iter()
-                    .map(|value| {
-                        let idx = self.add_or_get(value.clone());
-                        self.get(idx)
-                    })
-                    .collect(),
-            )),
-            SteelVal::Pair(_) => {
-                let mut cars = Vec::new();
-                let mut tail = val;
-                // Intern the elements without hashing and storing every pair suffix.
-                while let SteelVal::Pair(pair) = tail {
-                    let idx = self.add_or_get(pair.car());
-                    cars.push(self.get(idx));
-                    tail = pair.cdr_ref();
-                }
-                let tail_idx = self.add_or_get(tail.clone());
-                let mut result = self.get(tail_idx);
-                for car in cars.into_iter().rev() {
-                    result = crate::values::lists::Pair::cons(car, result).into();
-                }
-                Some(result)
-            }
-            _ => None,
-        }
-    }
-
-    // This is certainly not what we want. This time complexity is
-    // questionable
-    pub fn add_or_get(&mut self, mut val: SteelVal) -> usize {
-        if let SteelVal::ListV(_) | SteelVal::VectorV(_) | SteelVal::Pair(_) = &val {
-            if let Some(new_list) = self.walk_constants(&val) {
-                val = new_list;
-            };
-        }
-
-        let idx = self.map.write().get(&val).copied();
-
-        if let Some(idx) = idx {
-            idx
-        } else {
-            self.add(val)
-        }
+    pub fn add_or_get(&mut self, val: SteelVal) -> usize {
+        let mut index = self.index.write();
+        let id = index.intern(val, Some(&mut self.values.write()));
+        index.nodes[id].constant_index.unwrap()
     }
 
     pub fn len(&self) -> usize {
@@ -289,12 +411,16 @@ impl ConstantMap {
     }
 
     pub fn roll_back(&mut self, idx: usize) {
-        self.values.write().truncate(idx);
+        let mut index = self.index.write();
+        let mut values = self.values.write();
+        values.truncate(idx);
+        *index = ConstantIndex::rebuild(&mut values);
+        self.reified_values.store(Arc::new(values.clone()));
     }
 
     #[cfg(test)]
     pub fn clear(&mut self) {
-        self.values.write().clear()
+        self.roll_back(0);
     }
 }
 
@@ -304,13 +430,18 @@ pub mod constant_table_tests {
     use crate::values::lists::Pair;
 
     #[test]
-    fn long_dotted_list_does_not_intern_suffixes() {
+    fn long_dotted_list_interns_suffixes_in_linear_work() {
         let mut instance = ConstantMap::new();
-        let value = (0..30_000).fold(SteelVal::IntV(2), |tail, _| {
-            Pair::cons(SteelVal::IntV(1), tail).into()
-        });
-        let idx = instance.add_or_get(value);
-        assert_eq!(instance.len(), 3);
+        let value = || {
+            (0..30_000).fold(SteelVal::IntV(2), |tail, _| {
+                Pair::cons(SteelVal::IntV(1), tail).into()
+            })
+        };
+        let idx = instance.add_or_get(value());
+        assert_eq!(instance.len(), 30_002);
+        assert_eq!(instance.index.read().pair_lookups, 30_000);
+        assert_eq!(instance.add_or_get(value()), idx);
+        assert_eq!(instance.index.read().pair_lookups, 60_000);
 
         let value = instance.get(idx);
         let mut tail = &value;
@@ -321,7 +452,8 @@ pub mod constant_table_tests {
         }
         assert_eq!(tail, &SteelVal::IntV(2));
         assert_eq!(instance.add_or_get(value), idx);
-        assert_eq!(instance.len(), 3);
+        assert_eq!(instance.len(), 30_002);
+        assert_eq!(instance.index.read().pair_lookups, 60_000);
     }
 
     #[test]
@@ -342,7 +474,107 @@ pub mod constant_table_tests {
         let second = first.cdr_ref().pair().unwrap();
         assert!(second.car_ref().ptr_eq(&instance.get(string_idx)));
         assert!(second.cdr_ref().ptr_eq(&instance.get(list_idx)));
-        assert_eq!(instance.len(), 4);
+        assert_eq!(instance.len(), 5);
+    }
+
+    #[test]
+    fn suffix_identity_survives_insertion_cloning_and_reconstruction() {
+        let suffix = || SteelVal::from(Pair::cons(SteelVal::IntV(2), SteelVal::IntV(3)));
+        let whole = || SteelVal::from(Pair::cons(SteelVal::IntV(1), suffix()));
+        for suffix_first in [false, true] {
+            for direct in [false, true] {
+                let mut map = ConstantMap::new();
+                let mut insert = |value| {
+                    if direct {
+                        map.add(value)
+                    } else {
+                        map.add_or_get(value)
+                    }
+                };
+                let (whole_idx, suffix_idx) = if suffix_first {
+                    let suffix_idx = insert(suffix());
+                    (insert(whole()), suffix_idx)
+                } else {
+                    let whole_idx = insert(whole());
+                    (whole_idx, insert(suffix()))
+                };
+                let bytes = map.to_bytes().unwrap();
+                let rebuilt = ConstantMap::from_vec(map.values.read().clone());
+                for mut copy in [
+                    map.clone(),
+                    map.deep_clone(),
+                    rebuilt,
+                    ConstantMap::from_bytes(&bytes).unwrap(),
+                ] {
+                    assert_eq!(copy.to_bytes().unwrap(), bytes);
+                    assert!(copy
+                        .get(whole_idx)
+                        .pair()
+                        .unwrap()
+                        .cdr_ref()
+                        .ptr_eq(&copy.get(suffix_idx)));
+                    assert_eq!(copy.add_or_get(whole()), whole_idx);
+                    assert_eq!(copy.add_or_get(suffix()), suffix_idx);
+                    assert!(copy
+                        .get(whole_idx)
+                        .pair()
+                        .unwrap()
+                        .cdr_ref()
+                        .ptr_eq(&copy.get(suffix_idx)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rollback_and_clear_rebuild_all_indexes_and_flushed_values() {
+        let mut map = ConstantMap::new();
+        let value = || SteelVal::from(Pair::cons(SteelVal::IntV(1), SteelVal::IntV(2)));
+        map.add(SteelVal::IntV(42));
+        let mut shared = map.clone();
+        map.add_or_get(value());
+        map.flush();
+        map.roll_back(1);
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared.reified_values.load().len(), 1);
+        assert_eq!(shared.add_or_get(value()), 3);
+        assert_eq!(map.len(), 4);
+        let mut independent = map.deep_clone();
+        map.clear();
+        assert!(shared.is_empty());
+        assert!(shared.reified_values.load().is_empty());
+        assert_eq!(map.add_or_get(value()), 2);
+        assert_eq!(independent.add_or_get(value()), 3);
+    }
+
+    #[cfg(not(feature = "without-drop-protection"))]
+    #[test]
+    fn nested_constants_intern_and_drop_on_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                #[cfg(all(feature = "sync", feature = "biased"))]
+                steel_rc::register_thread();
+                for shape in 0..4 {
+                    let mut map = ConstantMap::new();
+                    let make_value = || {
+                        (0..10_000).fold(SteelVal::IntV(0), |child, depth| match shape {
+                            0 => Pair::cons(child, SteelVal::IntV(1)).into(),
+                            1 => Pair::cons(SteelVal::IntV(1), child).into(),
+                            2 if depth % 2 == 0 => Pair::cons(child, SteelVal::IntV(1)).into(),
+                            2 => Pair::cons(SteelVal::IntV(1), child).into(),
+                            _ if depth % 2 == 0 => SteelVal::ListV([child].into_iter().collect()),
+                            _ => SteelVal::VectorV([child].into_iter().collect()),
+                        })
+                    };
+                    let idx = map.add_or_get(make_value());
+                    assert_eq!(map.add_or_get(make_value()), idx);
+                    assert_eq!(map.deep_clone().add_or_get(map.get(idx)), idx);
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

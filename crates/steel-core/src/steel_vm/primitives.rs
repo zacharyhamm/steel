@@ -2235,7 +2235,9 @@ fn make_mutable_box(ctx: &mut VmCore, args: &[SteelVal]) -> Option<Result<SteelV
         ));
     }
 
-    let mut heap_lock = ctx.thread.enter_safepoint(|thread| thread.heap.lock_arc());
+    let heap = ctx.thread.heap.clone();
+
+    let mut heap_lock = ctx.thread.enter_safepoint(|_| heap.lock());
 
     let allocated_var = heap_lock.allocate(
         args[0].clone(), // TODO: Could actually move off of the stack entirely

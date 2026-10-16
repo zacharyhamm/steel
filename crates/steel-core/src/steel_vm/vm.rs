@@ -400,7 +400,6 @@ pub struct SteelThread {
     profiler: OpCodeOccurenceProfiler,
 
     pub(crate) function_interner: FunctionInterner,
-    pub(crate) heap: Arc<parking_lot::Mutex<Heap>>,
     pub(crate) runtime_options: RunTimeOptions,
     pub(crate) current_frame: StackFrame,
     pub(crate) stack_frames: Vec<StackFrame>,
@@ -422,28 +421,103 @@ pub struct SteelThread {
 
     pub(crate) module_context: Vec<SteelString>,
 
-    // Drop after all VM roots, and share only with threads using this heap.
-    #[cfg(feature = "sync")]
-    heap_teardown: Arc<HeapTeardown>,
+    // Release execution ownership after all VM roots.
+    pub(crate) heap: HeapHandle,
 }
 
-#[cfg(feature = "sync")]
-struct HeapTeardown(Arc<parking_lot::Mutex<Heap>>);
+pub(crate) struct HeapState {
+    heap: parking_lot::Mutex<Heap>,
+    execution_owners: std::sync::atomic::AtomicUsize,
+    // 0: idle, 1: tracing, 2: tracing with another release to process.
+    teardown: std::sync::atomic::AtomicU8,
+}
 
-#[cfg(feature = "sync")]
-impl Drop for HeapTeardown {
+impl core::ops::Deref for HeapState {
+    type Target = parking_lot::Mutex<Heap>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.heap
+    }
+}
+
+pub(crate) struct HeapHandle {
+    shared: Arc<HeapState>,
+    execution_owner: bool,
+}
+
+impl HeapHandle {
+    fn new(heap: Heap) -> Self {
+        Self {
+            shared: Arc::new(HeapState {
+                heap: parking_lot::Mutex::new(heap),
+                execution_owners: std::sync::atomic::AtomicUsize::new(1),
+                teardown: std::sync::atomic::AtomicU8::new(0),
+            }),
+            execution_owner: true,
+        }
+    }
+
+    fn acquire_execution_ownership(&mut self) {
+        if !self.execution_owner {
+            let previous = self
+                .shared
+                .execution_owners
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            assert!(previous > 0, "cannot execute on a closed heap");
+            self.execution_owner = true;
+        }
+    }
+}
+
+impl Clone for HeapHandle {
+    fn clone(&self) -> Self {
+        // Stored VM clones and pending results retain storage, not execution ownership.
+        Self {
+            shared: self.shared.clone(),
+            execution_owner: false,
+        }
+    }
+}
+
+impl core::ops::Deref for HeapHandle {
+    type Target = Arc<HeapState>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.shared
+    }
+}
+
+impl Drop for HeapHandle {
     fn drop(&mut self) {
-        if Arc::strong_count(&self.0) > 1 {
-            // Pending results retain their roots while unreachable heap-owned handles are freed.
-            self.0.lock().collection(
-                &[],
-                core::iter::empty(),
-                &[],
-                &ConstantMap::new(),
-                &[],
-                &mut Synchronizer::new(),
-                true,
-            );
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+
+        if self.execution_owner {
+            self.shared.execution_owners.fetch_sub(1, AcqRel);
+        }
+        if self.shared.execution_owners.load(Acquire) != 0 {
+            return;
+        }
+        // A payload destructor can release another handle to this same heap.
+        if self.shared.teardown.swap(2, AcqRel) != 0 {
+            return;
+        }
+        loop {
+            self.shared.teardown.store(1, Release);
+            let (reachable, keep_alive) = Heap::trace_teardown_roots();
+            let detached = self.shared.lock().detach_unreachable(&reachable);
+            let changed = !detached.is_empty();
+            // Payload destructors can release roots and heap handles, so run them unlocked.
+            drop(detached);
+            drop(keep_alive);
+            if !changed
+                && self
+                    .shared
+                    .teardown
+                    .compare_exchange(1, 0, AcqRel, Acquire)
+                    .is_ok()
+            {
+                break;
+            }
         }
     }
 }
@@ -790,9 +864,7 @@ impl SteelThread {
             handle,
         });
 
-        let heap = Arc::new(parking_lot::Mutex::new(Heap::new()));
-        #[cfg(feature = "sync")]
-        let heap_teardown = Arc::new(HeapTeardown(heap.clone()));
+        let heap = HeapHandle::new(Heap::new());
 
         SteelThread {
             global_env: Env::root(),
@@ -826,16 +898,18 @@ impl SteelThread {
             #[cfg(feature = "jit2")]
             jit: Arc::new(Mutex::new(crate::jit2::cgen::JIT::default())),
             module_context: Vec::new(),
-            #[cfg(feature = "sync")]
-            heap_teardown,
             // delayed_dropper: DelayedDropper::new(),
         }
     }
 
-    #[cfg(feature = "sync")]
-    pub(crate) fn replace_heap(&mut self, heap: Arc<parking_lot::Mutex<Heap>>) {
-        self.heap_teardown = Arc::new(HeapTeardown(heap.clone()));
-        self.heap = heap;
+    pub(crate) fn clone_for_execution(&self) -> Self {
+        let mut thread = self.clone();
+        thread.heap.acquire_execution_ownership();
+        thread
+    }
+
+    pub(crate) fn replace_heap(&mut self, heap: Heap) {
+        self.heap = HeapHandle::new(heap);
     }
 
     #[inline(always)]
@@ -975,7 +1049,8 @@ impl SteelThread {
     }
 
     pub fn insert_binding(&mut self, idx: usize, value: SteelVal) {
-        let _ = self.enter_safepoint(|thread| thread.heap.lock_arc());
+        let heap = self.heap.clone();
+        let _ = self.enter_safepoint(|_| heap.lock());
 
         #[cfg(feature = "sync")]
         self.with_locked_env(move |_, env| {
@@ -1862,7 +1937,8 @@ impl<'a> VmCore<'a> {
     }
 
     pub fn make_box(&mut self, value: SteelVal) -> SteelVal {
-        let mut heap_lock = self.thread.enter_safepoint(|thread| thread.heap.lock_arc());
+        let heap = self.thread.heap.clone();
+        let mut heap_lock = self.thread.enter_safepoint(|_| heap.lock());
         let allocated_var = heap_lock.allocate(
             value,
             &self.thread.stack,
@@ -1879,7 +1955,8 @@ impl<'a> VmCore<'a> {
     // TODO: Accept a slice instead, or an iterator with a known size.
     // That way we can take advantage of a pre allocation.
     pub fn make_mutable_vector(&mut self, values: Vec<SteelVal>) -> SteelVal {
-        let mut heap_lock = self.thread.enter_safepoint(|thread| thread.heap.lock_arc());
+        let heap = self.thread.heap.clone();
+        let mut heap_lock = self.thread.enter_safepoint(|_| heap.lock());
         let allocated_var = heap_lock.allocate_vector(
             values,
             &self.thread.stack,
@@ -1897,7 +1974,8 @@ impl<'a> VmCore<'a> {
         &mut self,
         values: impl Iterator<Item = SteelVal> + Clone,
     ) -> SteelVal {
-        let mut heap_lock = self.thread.enter_safepoint(|thread| thread.heap.lock_arc());
+        let heap = self.thread.heap.clone();
+        let mut heap_lock = self.thread.enter_safepoint(|_| heap.lock());
 
         let allocated_var = heap_lock.allocate_vector_iter(
             values,
@@ -1915,7 +1993,8 @@ impl<'a> VmCore<'a> {
     pub(crate) fn gc_collect(&mut self) {
         // Before we acquire a lock on the heap, make sure we're not going to block
         // anything since we could deadlock up to this point.
-        let mut heap_lock = self.thread.enter_safepoint(|thread| thread.heap.lock_arc());
+        let heap = self.thread.heap.clone();
+        let mut heap_lock = self.thread.enter_safepoint(|_| heap.lock());
 
         heap_lock.collection(
             &self.thread.stack,
@@ -4158,7 +4237,8 @@ impl<'a> VmCore<'a> {
     // get in place mutation.
     // Basically a `MoveReadGlobal`
     fn handle_set(&mut self, index: usize) -> Result<()> {
-        let _ = self.thread.enter_safepoint(|thread| thread.heap.lock_arc());
+        let heap = self.thread.heap.clone();
+        let _ = self.thread.enter_safepoint(|_| heap.lock());
         let value_to_assign = self.thread.stack.pop().unwrap();
 
         let value = if self.thread.safepoints_enabled {
@@ -4665,7 +4745,8 @@ impl<'a> VmCore<'a> {
     // #[inline(always)]
     fn handle_bind(&mut self, payload_size: usize) {
         // Guard against the heap
-        let _ = self.thread.enter_safepoint(|thread| thread.heap.lock_arc());
+        let heap = self.thread.heap.clone();
+        let _ = self.thread.enter_safepoint(|_| heap.lock());
 
         let value = self.thread.stack.pop().unwrap();
 
@@ -7439,7 +7520,9 @@ fn cons_handler(ctx: &mut VmCore<'_>) -> Result<()> {
 fn new_box_handler(ctx: &mut VmCore<'_>) -> Result<()> {
     let last = ctx.thread.stack.pop().unwrap();
 
-    let mut heap_lock = ctx.thread.enter_safepoint(|thread| thread.heap.lock_arc());
+    let heap = ctx.thread.heap.clone();
+
+    let mut heap_lock = ctx.thread.enter_safepoint(|_| heap.lock());
     let allocated_var = heap_lock.allocate(
         last,
         &ctx.thread.stack,

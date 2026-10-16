@@ -613,6 +613,184 @@ mod find_closest_match_tests {
 mod embedding_regressions {
     use crate::steel_vm::engine::Engine;
 
+    struct StoredThread {
+        _thread: crate::steel_vm::vm::SteelThread,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        heap: std::sync::Weak<crate::steel_vm::vm::HeapState>,
+    }
+
+    impl crate::rvals::Custom for StoredThread {}
+
+    impl Drop for StoredThread {
+        fn drop(&mut self) {
+            if let Some(heap) = self.heap.upgrade() {
+                assert!(
+                    heap.try_lock().is_some(),
+                    "payload dropped under the heap lock"
+                );
+            }
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn store_thread_clone(
+        engine: &mut Engine,
+        vector: bool,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        use crate::rvals::IntoSteelVal;
+        use std::sync::{atomic::AtomicUsize, Arc};
+
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let stored = StoredThread {
+            _thread: engine.virtual_machine.clone(),
+            dropped: dropped.clone(),
+            heap: Arc::downgrade(&engine.virtual_machine.heap),
+        }
+        .into_steelval()
+        .unwrap();
+        let value = if vector {
+            crate::SteelVal::MutableVector(
+                engine
+                    .virtual_machine
+                    .heap
+                    .lock()
+                    .allocate_vec_without_collection(vec![stored]),
+            )
+        } else {
+            crate::SteelVal::HeapAllocated(
+                engine
+                    .virtual_machine
+                    .heap
+                    .lock()
+                    .allocate_without_collection(stored),
+            )
+        };
+        engine.register_value("stored-thread", value);
+        dropped
+    }
+
+    #[test]
+    fn teardown_reclaims_heap_stored_vm_clones_after_the_last_engine() {
+        use std::sync::{atomic::Ordering, Arc};
+
+        for vector in [false, true] {
+            let mut engine = Engine::new_raw_no_kernel();
+            let heap = Arc::downgrade(&engine.virtual_machine.heap);
+            let dropped = store_thread_clone(&mut engine, vector);
+            let live = crate::SteelVal::HeapAllocated(
+                engine
+                    .virtual_machine
+                    .heap
+                    .lock()
+                    .allocate_without_collection(crate::SteelVal::IntV(42)),
+            );
+            engine.register_value("live", live);
+            let survivor = engine.clone();
+            drop(engine);
+            assert_eq!(dropped.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                survivor.extract_value("live").unwrap().as_box_to_inner(),
+                Some(crate::SteelVal::IntV(42))
+            );
+            drop(survivor);
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            assert!(heap.upgrade().is_none());
+        }
+    }
+
+    #[test]
+    fn deep_cloned_heaps_have_independent_execution_owners() {
+        use std::sync::{atomic::Ordering, Arc};
+
+        let mut original = Engine::new_raw_no_kernel();
+        let mut isolated = original.deep_clone();
+        let original_heap = Arc::downgrade(&original.virtual_machine.heap);
+        let isolated_heap = Arc::downgrade(&isolated.virtual_machine.heap);
+        let original_drops = store_thread_clone(&mut original, false);
+        let isolated_drops = store_thread_clone(&mut isolated, true);
+        drop(original);
+        assert_eq!(original_drops.load(Ordering::SeqCst), 1);
+        assert!(original_heap.upgrade().is_none());
+        assert_eq!(isolated_drops.load(Ordering::SeqCst), 0);
+        assert!(isolated_heap.upgrade().is_some());
+        drop(isolated);
+        assert_eq!(isolated_drops.load(Ordering::SeqCst), 1);
+        assert!(isolated_heap.upgrade().is_none());
+    }
+
+    #[test]
+    fn closed_heaps_reclaim_cycles_as_pending_roots_are_released() {
+        use std::sync::{atomic::Ordering, Arc};
+
+        let mut engine = Engine::new_raw_no_kernel();
+        let heap = Arc::downgrade(&engine.virtual_machine.heap);
+        let dropped = store_thread_clone(&mut engine, false);
+        let first_result = (
+            engine.extract_value("stored-thread").unwrap().as_rooted(),
+            engine.virtual_machine.heap.clone(),
+        );
+        let other = crate::SteelVal::HeapAllocated(
+            engine
+                .virtual_machine
+                .heap
+                .lock()
+                .allocate_without_collection(crate::SteelVal::IntV(42)),
+        );
+        let second_result = (other.as_rooted(), engine.virtual_machine.heap.clone());
+        drop(engine);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        drop(first_result);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            second_result.0.value().as_box_to_inner(),
+            Some(crate::SteelVal::IntV(42))
+        );
+        drop(second_result);
+        assert!(heap.upgrade().is_none());
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn teardown_can_run_during_another_engines_gc() {
+        use std::sync::{atomic::Ordering, Arc, Barrier};
+
+        let mut collector = Engine::new();
+        register_gc(&mut collector);
+        let value = collector
+            .run("(define live (box (vector (box 42)))) live")
+            .unwrap()
+            .pop()
+            .unwrap();
+        let rooted = value.as_rooted();
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_barrier = barrier.clone();
+        let worker = std::thread::spawn(move || {
+            let mut engine = Engine::new_raw_no_kernel();
+            worker_barrier.wait();
+            for pass in 0..100 {
+                let heap = Arc::downgrade(&engine.virtual_machine.heap);
+                let dropped = store_thread_clone(&mut engine, pass % 2 == 0);
+                drop(engine);
+                assert_eq!(dropped.load(Ordering::SeqCst), 1);
+                assert!(heap.upgrade().is_none());
+                engine = Engine::new_raw_no_kernel();
+            }
+        });
+        barrier.wait();
+        for _ in 0..100 {
+            assert_eq!(
+                collector
+                    .run("(probe-gc) (unbox (vector-ref (unbox live) 0))")
+                    .unwrap()
+                    .pop(),
+                Some(crate::SteelVal::IntV(42))
+            );
+        }
+        worker.join().unwrap();
+        drop(rooted);
+    }
+
     fn register_gc(engine: &mut Engine) {
         let mut primitives = Engine::new_raw_no_kernel();
         crate::steel_vm::primitives::register_builtin_modules(&mut primitives, true);
@@ -707,20 +885,20 @@ mod embedding_regressions {
         let SteelVal::CustomStruct(owner) = engine.extract_value("owner").unwrap() else {
             panic!("expected a struct");
         };
-        let original_properties = owner.properties();
-        let mut properties = (*original_properties).clone();
+        let mut properties = crate::values::HashMap::default();
         let payload = engine.run("(box 42)").unwrap().pop().unwrap();
-        properties.insert(payload, SteelVal::CustomStruct(owner.clone()));
+        properties.insert(payload.clone(), SteelVal::CustomStruct(owner.clone()));
         VTable::set_entry(&owner.type_descriptor, None, Gc::new(properties));
         engine.run("(probe-gc) (probe-gc)").unwrap();
-        assert_eq!(
-            owner
-                .properties()
-                .keys()
-                .find_map(SteelVal::as_box_to_inner),
-            Some(SteelVal::IntV(42))
-        );
-        VTable::set_entry(&owner.type_descriptor, None, original_properties);
+        for _ in 0..150 {
+            engine.run("(define shadowed 0)").unwrap();
+        }
+        assert_eq!(payload.as_box_to_inner(), Some(SteelVal::IntV(42)));
+        let SteelVal::CustomStruct(property_owner) = owner.get(&payload).unwrap() else {
+            panic!("expected the property to refer back to the struct");
+        };
+        assert!(Gc::ptr_eq(&property_owner, &owner));
+        VTable::set_entry(&owner.type_descriptor, None, Gc::new(Default::default()));
     }
 
     #[test]
@@ -1310,6 +1488,16 @@ mod embedding_regressions {
             assert_eq!(Arc::strong_count(&count), 12);
             drop(workers);
             engine.run("(probe-gc)").unwrap();
+            // Other collectors can briefly retain a snapshot of these results.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Arc::strong_count(&count) != 2 {
+                assert!(
+                    Instant::now() < deadline,
+                    "results retained their payloads: {payload}"
+                );
+                std::thread::yield_now();
+                engine.run("(probe-gc)").unwrap();
+            }
             assert_eq!(Arc::strong_count(&count), 2, "{payload}");
 
             engine

@@ -395,6 +395,7 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
             queue: &mut self.queue,
             stats: MarkAndSweepStats::default(),
             visited: rustc_hash::FxHashSet::default(),
+            teardown: false,
         };
 
         custom_type.read().visit_children(&mut queue);
@@ -429,6 +430,7 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
             queue: &mut self.queue,
             stats: MarkAndSweepStats::default(),
             visited: rustc_hash::FxHashSet::default(),
+            teardown: false,
         };
 
         if let Some(heap_ref) = heap_ref.inner.upgrade() {
@@ -458,6 +460,7 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
             queue: &mut self.queue,
             stats: MarkAndSweepStats::default(),
             visited: rustc_hash::FxHashSet::default(),
+            teardown: false,
         };
 
         if let Some(vector) = vector.inner.upgrade() {
@@ -485,7 +488,6 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
         for field in steel_struct.fields.iter() {
             self.push_back(field.clone());
         }
-        self.push_back(SteelVal::HashMapV(steel_struct.properties().into()));
     }
 
     fn visit_stream(&mut self, stream: Gc<LazyStream>) -> Self::Output {
@@ -659,7 +661,6 @@ struct PendingWill {
     ready: bool,
 }
 
-#[cfg(feature = "sync")]
 fn traced_identity(value: &SteelVal) -> Option<usize> {
     match value {
         SteelVal::Closure(gc) => Some(gc.as_ptr() as usize),
@@ -876,7 +877,9 @@ pub fn will_execute(ctx: &mut VmCore, args: &[SteelVal]) -> Option<Result<SteelV
         })
         .unwrap()
     {
-        let Pair { car, cdr } = pair.try_unwrap().unwrap();
+        let mut pair = pair.try_unwrap().unwrap();
+        let car = core::mem::replace(&mut pair.car, SteelVal::Void);
+        let cdr = core::mem::replace(&mut pair.cdr, SteelVal::Void);
         apply(ctx, &[cdr, SteelVal::ListV(vec![car].into())])
     } else {
         unreachable!()
@@ -1315,6 +1318,53 @@ fn basic_free_list_usage() {
     for var in &free_list.elements {
         assert!(!var.read().is_reachable());
     }
+}
+
+#[test]
+fn teardown_traces_descendants_without_changing_foreign_marks() {
+    let mut foreign = Heap::new();
+    let child = foreign.allocate_without_collection(SteelVal::IntV(42));
+    let parent =
+        foreign.allocate_vec_without_collection(vec![SteelVal::HeapAllocated(child.clone())]);
+    for marked in [true, false] {
+        child.strong_ptr().write().reachable = marked;
+        parent.strong_ptr().write().reachable = marked;
+        // Keep this root private so parallel tests' normal collectors cannot mark it.
+        let mut queue = Vec::new();
+        let mut context = MarkAndSweepContext {
+            queue: &mut queue,
+            stats: MarkAndSweepStats::default(),
+            visited: rustc_hash::FxHashSet::default(),
+            teardown: true,
+        };
+        context.push_back(SteelVal::MutableVector(parent.clone()));
+        context.visit();
+        assert!(context.visited.contains(&child.as_ptr_usize()));
+        assert!(context.visited.contains(&parent.as_ptr_usize()));
+        assert_eq!(child.strong_ptr().read().reachable, marked);
+        assert_eq!(parent.strong_ptr().read().reachable, marked);
+    }
+}
+
+#[test]
+fn teardown_retains_registered_descendants_and_detaches_only_local_payloads() {
+    let mut heap = Heap::new();
+    let child = heap.allocate_without_collection(SteelVal::IntV(42));
+    let root = SteelVal::MutableVector(
+        heap.allocate_vec_without_collection(vec![SteelVal::HeapAllocated(child.clone())]),
+    )
+    .as_rooted();
+    let unreachable = heap.allocate_without_collection(SteelVal::IntV(99));
+    let (reachable, keep_alive) = Heap::trace_teardown_roots();
+    drop(heap.detach_unreachable(&reachable));
+    assert_eq!(child.get(), SteelVal::IntV(42));
+    assert_eq!(unreachable.get(), SteelVal::Void);
+    drop(keep_alive);
+    drop(root);
+    let (reachable, keep_alive) = Heap::trace_teardown_roots();
+    drop(heap.detach_unreachable(&reachable));
+    assert_eq!(child.get(), SteelVal::Void);
+    drop(keep_alive);
 }
 
 #[test]
@@ -2102,6 +2152,62 @@ struct MemorySpace {
 type MemoryBlock = (Vec<HeapValue>, Vec<HeapVector>);
 
 impl Heap {
+    pub(crate) fn trace_teardown_roots() -> (rustc_hash::FxHashSet<usize>, Vec<SteelVal>) {
+        #[cfg(feature = "sync")]
+        let mut roots: Vec<_> = GLOBAL_ROOTS
+            .lock()
+            .unwrap()
+            .roots
+            .values()
+            .cloned()
+            .collect();
+        #[cfg(not(feature = "sync"))]
+        let mut roots: Vec<_> = ROOTS
+            .try_with(|roots| roots.borrow().roots.values().cloned().collect())
+            .unwrap_or_default();
+        roots.extend(
+            VTable::property_maps_snapshot()
+                .into_iter()
+                .map(|map| SteelVal::HashMapV(map.into())),
+        );
+        let mut queue = Vec::new();
+        let mut context = MarkAndSweepContext {
+            queue: &mut queue,
+            stats: MarkAndSweepStats::default(),
+            visited: rustc_hash::FxHashSet::default(),
+            teardown: true,
+        };
+        for root in roots {
+            context.push_back(root);
+        }
+        context.visit();
+        (context.visited, context.stats.keep_alive)
+    }
+
+    pub(crate) fn detach_unreachable(
+        &mut self,
+        reachable: &rustc_hash::FxHashSet<usize>,
+    ) -> Vec<SteelVal> {
+        let mut detached = Vec::new();
+        for element in &self.memory_free_list.elements {
+            if !reachable.contains(&(StandardShared::as_ptr(element) as usize)) {
+                let mut guard = element.write();
+                guard.reset();
+                if !matches!(guard.value, SteelVal::Void) {
+                    detached.push(core::mem::replace(&mut guard.value, SteelVal::Void));
+                }
+            }
+        }
+        for element in &self.vector_free_list.elements {
+            if !reachable.contains(&(StandardShared::as_ptr(element) as usize)) {
+                let mut guard = element.write();
+                guard.reset();
+                detached.extend(core::mem::take(&mut guard.value));
+            }
+        }
+        detached
+    }
+
     pub fn new() -> Self {
         Heap {
             count: 0,
@@ -2506,6 +2612,7 @@ impl Heap {
             queue: &mut self.mark_and_sweep_queue,
             stats: MarkAndSweepStats::default(),
             visited: rustc_hash::FxHashSet::default(),
+            teardown: false,
         };
 
         // Pause all threads
@@ -2748,6 +2855,7 @@ pub struct MarkAndSweepContext<'a> {
     queue: &'a mut Vec<SteelVal>,
     stats: MarkAndSweepStats,
     visited: rustc_hash::FxHashSet<usize>,
+    teardown: bool,
 }
 
 impl<'a> MarkAndSweepContext<'a> {
@@ -2755,7 +2863,7 @@ impl<'a> MarkAndSweepContext<'a> {
         &mut self,
         heap_ref: &StandardSharedMut<HeapAllocated<SteelVal>>,
     ) {
-        {
+        if !self.teardown {
             let mut guard = heap_ref.write();
             if guard.is_reachable() {
                 return;
@@ -2773,7 +2881,7 @@ impl<'a> MarkAndSweepContext<'a> {
         &mut self,
         heap_vector: &StandardSharedMut<HeapAllocated<Vec<SteelVal>>>,
     ) {
-        {
+        if !self.teardown {
             let mut guard = heap_vector.write();
             if guard.is_reachable() {
                 return;
@@ -2856,6 +2964,7 @@ impl<'a> MarkAndSweepContextRefQueue<'a> {
             queue: &mut queue,
             stats: MarkAndSweepStats::default(),
             visited: rustc_hash::FxHashSet::default(),
+            teardown: false,
         };
 
         custom_type.read().visit_children(&mut temporary_queue);
@@ -2926,6 +3035,17 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
     }
 
     fn push_back(&mut self, value: SteelVal) {
+        if self.teardown {
+            // List slices can share an address while exposing different elements.
+            if !matches!(value, SteelVal::ListV(_)) {
+                if let Some(identity) = traced_identity(&value) {
+                    if !self.visited.insert(identity) {
+                        return;
+                    }
+                    self.stats.keep_alive.push(value.clone());
+                }
+            }
+        }
         self.stats.object_count += 1;
 
         // TODO: Determine if all numbers should push back.
@@ -3026,7 +3146,7 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
     }
     // TODO: Come back to this
     fn visit_custom_type(&mut self, custom_type: GcMut<Box<dyn CustomType>>) -> Self::Output {
-        if !self.visited.insert(custom_type.as_ptr() as usize) {
+        if !self.teardown && !self.visited.insert(custom_type.as_ptr() as usize) {
             return;
         }
         custom_type.read().visit_children(self);
@@ -3041,7 +3161,7 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
     fn visit_future_function(&mut self, _function: BoxedAsyncFunctionSignature) -> Self::Output {}
 
     fn visit_hash_map(&mut self, hashmap: SteelHashMap) -> Self::Output {
-        if !self.visited.insert(hashmap.0.as_ptr() as usize) {
+        if !self.teardown && !self.visited.insert(hashmap.0.as_ptr() as usize) {
             return;
         }
         for (key, value) in hashmap.iter() {
@@ -3105,7 +3225,6 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
         for field in steel_struct.fields.iter() {
             self.push_back(field.clone());
         }
-        self.push_back(SteelVal::HashMapV(steel_struct.properties().into()));
     }
 
     fn visit_stream(&mut self, stream: Gc<LazyStream>) -> Self::Output {
@@ -3356,9 +3475,6 @@ impl<'a> BreadthFirstSearchSteelValReferenceVisitor2<'a> for MarkAndSweepContext
         for field in steel_struct.fields.iter() {
             self.push_back(field);
         }
-        let properties = SteelVal::HashMapV(steel_struct.properties().into());
-        self.push_back(&properties);
-        self.save(properties);
     }
 
     fn visit_stream(&mut self, stream: &LazyStream) -> Self::Output {

@@ -44,19 +44,15 @@ impl Pair {
 
 impl Hash for Pair {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let mut pair = self;
-        loop {
-            pair.car.hash(state);
-            match &pair.cdr {
-                SteelVal::Pair(next) => {
-                    // Preserve SteelVal's tag when hashing the tail without recursion.
-                    core::mem::discriminant(&pair.cdr).hash(state);
-                    pair = next;
+        let mut pending = vec![&self.cdr, &self.car];
+        while let Some(value) = pending.pop() {
+            match value {
+                SteelVal::Pair(pair) => {
+                    core::mem::discriminant(value).hash(state);
+                    pending.push(&pair.cdr);
+                    pending.push(&pair.car);
                 }
-                tail => {
-                    tail.hash(state);
-                    break;
-                }
+                value => value.hash(state),
             }
         }
     }
@@ -299,6 +295,48 @@ impl<T: IntoSteelVal + Clone, D: im_lists::handler::DropHandler<Self>> IntoSteel
 mod tests {
     use super::*;
     use std::collections::hash_map::DefaultHasher;
+
+    #[cfg(not(feature = "without-drop-protection"))]
+    #[test]
+    fn deep_pair_trees_hash_and_drop_on_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                #[cfg(all(feature = "sync", feature = "biased"))]
+                steel_rc::register_thread();
+                thread_local! {
+                    static LAST_PAIR: std::cell::RefCell<Option<SteelVal>> = const {
+                        std::cell::RefCell::new(None)
+                    };
+                }
+                // Initialize before DROP_BUFFER so this pair is destroyed after that TLS is gone.
+                LAST_PAIR.with(|pair| assert!(pair.borrow().is_none()));
+                for shape in 0..3 {
+                    let mut value = SteelVal::IntV(0);
+                    for depth in 0..30_000 {
+                        value = if shape == 0 || (shape == 2 && depth % 2 == 0) {
+                            Pair::cons(value, SteelVal::IntV(1)).into()
+                        } else {
+                            Pair::cons(SteelVal::IntV(1), value).into()
+                        };
+                    }
+                    value.hash(&mut DefaultHasher::new());
+                    if shape == 0 {
+                        drop(value);
+                    } else if shape == 1 {
+                        crate::rvals::cycles::drop_impls::DROP_BUFFER.with(|buffer| {
+                            let _borrow = buffer.borrow_mut();
+                            drop(value);
+                        });
+                    } else {
+                        LAST_PAIR.with(|pair| *pair.borrow_mut() = Some(value));
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
 
     #[test]
     fn pair_hash_preserves_recursive_field_order() {

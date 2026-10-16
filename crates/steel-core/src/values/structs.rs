@@ -250,13 +250,14 @@ impl UserDefinedStruct {
         }
     }
 
-    pub(crate) fn properties(&self) -> Gc<HashMap<SteelVal, SteelVal>> {
+    pub(crate) fn get(&self, val: &SteelVal) -> Option<SteelVal> {
         #[cfg(not(feature = "sync"))]
         {
             VTABLE.with(|x| {
                 x.borrow().entries[self.type_descriptor.0]
                     .properties
-                    .clone()
+                    .get(val)
+                    .cloned()
             })
         }
 
@@ -264,12 +265,9 @@ impl UserDefinedStruct {
         {
             STATIC_VTABLE.read().entries[self.type_descriptor.0]
                 .properties
-                .clone()
+                .get(val)
+                .cloned()
         }
-    }
-
-    pub(crate) fn get(&self, val: &SteelVal) -> Option<SteelVal> {
-        self.properties().get(val).cloned()
     }
 
     #[inline(always)]
@@ -904,14 +902,16 @@ impl VTable {
 
     #[cfg(not(feature = "sync"))]
     pub(crate) fn property_maps_snapshot() -> Vec<Gc<HashMap<SteelVal, SteelVal>>> {
-        VTABLE.with(|table| {
-            table
-                .borrow()
-                .entries
-                .iter()
-                .map(|entry| entry.properties.clone())
-                .collect()
-        })
+        VTABLE
+            .try_with(|table| {
+                table
+                    .borrow()
+                    .entries
+                    .iter()
+                    .map(|entry| entry.properties.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn insert(name: InternedString, options: Gc<HashMap<SteelVal, SteelVal>>) {
