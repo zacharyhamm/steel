@@ -601,21 +601,21 @@ pub(crate) fn make_immutable_struct_type(args: &[SteelVal]) -> Result<SteelVal> 
         stop!(ContractViolation => "immutable struct field count must be between 0 and 65535")
     }
     let count = *count as usize;
-    let name = InternedString::from(name.as_str());
-    let (descriptor, _, _, _, _) = make_struct_type_inner(name.resolve(), count, None);
+    let (descriptor, _, _, _, _) = make_struct_type_inner(name.as_str(), count, None);
     Ok(SteelVal::BoxedFunction(Gc::new(BoxedDynFunction::new(
         Arc::new(move |args| {
             let [SteelVal::IntV(index)] = args else {
                 stop!(TypeMismatch => "immutable struct binding expects one index")
             };
-            match *index {
-                0 => Ok(UserDefinedStruct::constructor(name, count, descriptor)),
-                1 => Ok(UserDefinedStruct::predicate(descriptor)),
-                index if index >= 2 && (index as usize) < count + 2 => Ok(
-                    UserDefinedStruct::getter_prototype_index(descriptor, index as usize - 2),
-                ),
+            let typ = match *index {
+                0 => StructFunctionType::Constructor,
+                1 => StructFunctionType::Predicate,
+                index if index >= 2 && (index as usize) < count + 2 => {
+                    StructFunctionType::GetterProtoVec(index as usize - 2)
+                }
                 _ => stop!(ContractViolation => "invalid immutable struct binding index"),
-            }
+            };
+            Ok(fetch_from_type_map(StructConstructorRefSpec { descriptor, typ }).unwrap())
         }),
         Some("immutable-struct-binding"),
         Some(1),

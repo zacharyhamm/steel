@@ -23,8 +23,14 @@ use crate::{steel_deserialize, steel_serialize};
 use super::*;
 
 pub struct ThreadHandle {
-    pub(crate) handle:
-        Mutex<Option<std::thread::JoinHandle<core::result::Result<RootedSteelVal, String>>>>,
+    // Drop the result root before releasing its heap.
+    pub(crate) handle: Mutex<
+        Option<
+            std::thread::JoinHandle<
+                core::result::Result<(RootedSteelVal, Arc<parking_lot::Mutex<Heap>>), String>,
+            >,
+        >,
+    >,
 
     pub(crate) thread: std::thread::Thread,
 
@@ -116,7 +122,7 @@ pub(crate) fn thread_join_impl(handle: &ThreadHandle) -> Result<SteelVal> {
         handle
             .join()
             .map_err(|_| SteelErr::new(ErrorKind::Generic, "thread panicked!".to_string()))?
-            .map(|value| value.value().clone())
+            .map(|result| result.0.value().clone())
             .map_err(|x| SteelErr::new(ErrorKind::Generic, x.to_string()))
     } else {
         stop!(ContractViolation => "thread handle has already been joined!");
@@ -1160,7 +1166,7 @@ pub(crate) fn spawn_native_thread(ctx: &mut VmCore, args: &[SteelVal]) -> Option
         // like we're not getting it installed correctly, and things are dying
         thread
             .call_function(constant_map, func, Vec::new())
-            .map(|value| value.as_rooted())
+            .map(|value| (value.as_rooted(), thread.heap.clone()))
             .map_err(|e| e.to_string())
     });
 
@@ -1173,7 +1179,7 @@ pub(crate) fn spawn_native_thread(ctx: &mut VmCore, args: &[SteelVal]) -> Option
         // like we're not getting it installed correctly, and things are dying
         thread
             .call_function(constant_map, func, Vec::new())
-            .map(|value| value.as_rooted())
+            .map(|value| (value.as_rooted(), thread.heap.clone()))
             .map_err(|e| e.to_string())
     });
 

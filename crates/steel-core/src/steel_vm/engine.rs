@@ -3098,6 +3098,48 @@ fn raw_engine_immutable_structs() {
 }
 
 #[test]
+fn raw_engine_immutable_struct_functions_round_trip() {
+    let mut engine = Engine::new_raw_no_kernel();
+    crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+    engine
+        .run(
+            "(require-builtin steel/meta)
+             (require-builtin steel/lists)
+             (define (round-trip function)
+               (deserialize-value (bytes->serialized (serialized->bytes (serialize-value function)))))",
+        )
+        .unwrap();
+    assert_eq!(
+        engine
+            .run(
+                "((lambda ()
+                    (struct serialized-point (x y))
+                    (define restored-point (round-trip serialized-point))
+                    (define restored-point? (round-trip serialized-point?))
+                    (define restored-x (round-trip serialized-point-x))
+                    (define restored-y (round-trip serialized-point-y))
+                    (define p (restored-point 3 4))
+                    (list (restored-point? p)
+                          (restored-point? #f)
+                          (serialized-point-x p)
+                          (restored-x (serialized-point 5 6))
+                          (restored-y p))))",
+            )
+            .unwrap(),
+        [SteelVal::ListV(
+            vec![
+                SteelVal::BoolV(true),
+                SteelVal::BoolV(false),
+                SteelVal::IntV(3),
+                SteelVal::IntV(5),
+                SteelVal::IntV(4),
+            ]
+            .into()
+        )]
+    );
+}
+
+#[test]
 fn symbol_identity_is_independent_of_allocation() {
     let mut engine = Engine::new_raw_no_kernel();
     crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
@@ -3176,6 +3218,32 @@ fn raw_engine_define_values_has_fresh_bindings_and_private_helpers() {
         "(define-values name '(1))",
     ] {
         assert!(engine.run(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn raw_engine_define_values_releases_temporary_payloads() {
+    use std::sync::Arc;
+
+    struct Probe(#[allow(dead_code)] Arc<()>);
+    impl crate::rvals::Custom for Probe {}
+
+    let count = Arc::new(());
+    let factory = count.clone();
+    let mut engine = Engine::new_raw_no_kernel();
+    crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+    engine.run("(require-builtin steel/meta)").unwrap();
+    engine.register_fn("probe-value", move || Probe(factory.clone()));
+    for producer in ["(probe-value)", "(box (probe-value))"] {
+        for _ in 0..3 {
+            engine
+                .run(format!("(define-values (payload) {producer})"))
+                .unwrap();
+            assert_eq!(Arc::strong_count(&count), 3);
+            engine.run("(set! payload #f)").unwrap();
+            engine.run("(#%gc-collect) (#%gc-collect)").unwrap();
+            assert_eq!(Arc::strong_count(&count), 2, "{producer}");
+        }
     }
 }
 

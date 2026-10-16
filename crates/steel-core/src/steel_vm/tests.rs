@@ -1513,6 +1513,60 @@ mod embedding_regressions {
 
     #[cfg(feature = "sync")]
     #[test]
+    fn completed_thread_results_keep_originating_heap_alive() {
+        use crate::steel_vm::vm::threads::{thread_finished, thread_join};
+        use std::{
+            sync::Arc,
+            time::{Duration, Instant},
+        };
+
+        let mut collector = Engine::new_raw_no_kernel();
+        register_gc(&mut collector);
+        for join in [false, true] {
+            let mut engine = Engine::new_raw_no_kernel();
+            crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+            let heap = Arc::downgrade(&engine.virtual_machine.heap);
+            let worker = engine
+                .run(
+                    "(require-builtin steel/meta)
+                     (require-builtin steel/threads)
+                     (spawn-native-thread (lambda () (box 42)))",
+                )
+                .unwrap()
+                .pop()
+                .unwrap();
+            engine.enter_safepoint(|| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while thread_finished(&worker).unwrap() != crate::SteelVal::BoolV(true) {
+                    assert!(Instant::now() < deadline, "worker did not finish");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+            drop(engine);
+            assert_eq!(
+                heap.strong_count(),
+                1,
+                "the pending result must own its heap"
+            );
+            collector.run("(probe-gc) (probe-gc)").unwrap();
+
+            if join {
+                // Keep the heap alive while inspecting the unrooted join result.
+                let heap = heap.upgrade().unwrap();
+                let joined = thread_join(&worker).unwrap();
+                assert_eq!(joined.as_box_to_inner(), Some(crate::SteelVal::IntV(42)));
+                drop(joined);
+                assert_eq!(Arc::strong_count(&heap), 1);
+                assert!(thread_join(&worker).is_err());
+            }
+            drop(worker);
+            assert!(heap.upgrade().is_none());
+            collector.run("(probe-gc) (probe-gc)").unwrap();
+        }
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
     fn discarded_completed_thread_handles_release_result_payloads() {
         use crate::steel_vm::{register_fn::RegisterFn, vm::threads::thread_finished};
         use std::{
