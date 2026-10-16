@@ -136,6 +136,11 @@ impl<'a> Lexer<'a> {
                 '\x07'
             }
 
+            Some('f') => {
+                self.eat();
+                '\x0c'
+            }
+
             Some('b') => {
                 self.eat();
                 '\x08'
@@ -1068,6 +1073,16 @@ mod lexer_tests {
         for token in s {
             println!("{:?}", token);
         }
+    }
+
+    #[test]
+    fn form_feed_string_escape() {
+        let mut tokens = token_stream(r#""left\fright""#);
+        assert_eq!(
+            tokens.next().unwrap().ty,
+            StringLiteral("left\x0cright".into())
+        );
+        assert!(tokens.next().is_none());
     }
 
     #[test]

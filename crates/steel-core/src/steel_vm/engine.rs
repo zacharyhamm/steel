@@ -1243,6 +1243,14 @@ impl Engine {
         };
 
         bootstrap_globals(&mut engine);
+        engine.register_value(
+            "#%immutable-struct-type",
+            SteelVal::FuncV(crate::values::structs::make_immutable_struct_type),
+        );
+        engine.register_value(
+            "#%immutable-struct-binding",
+            SteelVal::FuncV(crate::values::structs::immutable_struct_binding),
+        );
 
         // Set the prelude string to be completely empty,
         // so we'll have to get that working yet.
@@ -2962,4 +2970,31 @@ mod resolver_tests {
             err
         );
     }
+}
+
+#[test]
+fn raw_engine_immutable_structs() {
+    let mut engine = Engine::new_raw_no_kernel();
+    engine
+        .run("(struct point (x y)) (struct other (x y)) (define p (point 3 4))")
+        .unwrap();
+    assert_eq!(engine.run("(point-x p)").unwrap()[0], SteelVal::IntV(3));
+    assert_eq!(engine.run("(point? p)").unwrap()[0], SteelVal::BoolV(true));
+    assert_eq!(engine.run("(other? p)").unwrap()[0], SteelVal::BoolV(false));
+    assert!(engine.run("(other-x p)").is_err());
+    assert!(engine.run("(point 1)").is_err());
+    assert!(engine.run("(struct mutable (x) #:mutable)").is_err());
+    assert!(engine.run("(struct duplicate (x x))").is_err());
+    assert!(engine.run("(struct invalid (1))").is_err());
+    assert!(engine.run("make-struct-type").is_err());
+    engine.register_steel_module(
+        "shapes".into(),
+        "(provide box box? box-value) (struct box (value))".into(),
+    );
+    engine.run("(require \"shapes\")").unwrap();
+    assert_eq!(
+        engine.run("(box-value (box 9))").unwrap()[0],
+        SteelVal::IntV(9)
+    );
+    assert_eq!(engine.run("((lambda (#%immutable-struct-type #%immutable-struct-binding) (struct local (field)) (local-field (local 11))) #f #f)").unwrap()[0], SteelVal::IntV(11));
 }

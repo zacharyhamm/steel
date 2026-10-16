@@ -591,6 +591,39 @@ fn populate_fields_offsets<'a>(
     Ok(())
 }
 
+// Compiler support for immutable structs in engines without the macro kernel.
+pub(crate) fn make_immutable_struct_type(args: &[SteelVal]) -> Result<SteelVal> {
+    let [SteelVal::SymbolV(name), SteelVal::IntV(count)] = args else {
+        stop!(TypeMismatch => "immutable struct type expects a symbol and field count")
+    };
+    if !(0..=65535).contains(count) {
+        stop!(ContractViolation => "immutable struct field count must be between 0 and 65535")
+    }
+    let (_, constructor, predicate, _, getters) =
+        make_struct_type_inner(name.as_str(), *count as usize, None);
+    let SteelVal::ListV(getters) = getters else {
+        unreachable!("native struct accessors are a list")
+    };
+    Ok(SteelVal::ListV(
+        std::iter::once(constructor)
+            .chain(std::iter::once(predicate))
+            .chain(getters.iter().cloned())
+            .collect(),
+    ))
+}
+
+pub(crate) fn immutable_struct_binding(args: &[SteelVal]) -> Result<SteelVal> {
+    let [SteelVal::ListV(bindings), SteelVal::IntV(index)] = args else {
+        stop!(TypeMismatch => "immutable struct binding expects a binding list and index")
+    };
+    bindings.get(*index as usize).cloned().ok_or_else(|| {
+        SteelErr::new(
+            crate::rerrs::ErrorKind::ContractViolation,
+            "invalid immutable struct binding index".into(),
+        )
+    })
+}
+
 pub fn make_struct_type(args: &[SteelVal]) -> Result<SteelVal> {
     if !(args.len() == 2 || args.len() == 3) {
         stop!(ArityMismatch => "make-struct-type expects 2 or 3 args, found: {}", args.len())

@@ -1581,6 +1581,89 @@ fn expand_keyword_and_default_arguments(
     Ok(())
 }
 
+fn expand_immutable_struct(list: &List) -> Result<ExprKind> {
+    let span = get_span(&ExprKind::List(list.clone()));
+    if list.len() != 3 {
+        stop!(BadSyntax => "no-kernel struct expects (struct name (field ...)); options are unsupported"; span)
+    }
+    let Some(name) = list.args[1].atom_identifier() else {
+        stop!(BadSyntax => "struct expects an identifier for its name"; list.args[1].span())
+    };
+    let ExprKind::List(fields) = &list.args[2] else {
+        stop!(BadSyntax => "struct expects a list of field identifiers"; list.args[2].span())
+    };
+    let mut seen = HashSet::new();
+    for field in &fields.args {
+        let Some(field_name) = field.atom_identifier() else {
+            stop!(BadSyntax => "struct field must be an identifier"; field.span())
+        };
+        if !seen.insert(*field_name) {
+            stop!(BadSyntax => "duplicate struct field"; field.span())
+        }
+    }
+    if fields.len() > 65535 {
+        stop!(BadSyntax => "struct exceeds 65535 fields"; span)
+    }
+    let location = SyntaxObject::new(TokenType::Define, span);
+    let temporary = ExprKind::ident_with_span(
+        &format!(
+            "##immutable-struct-{}",
+            u32::from(location.syntax_object_id)
+        ),
+        span,
+    );
+    let primitive = |name: &str| {
+        let mut identifier = ExprKind::ident_with_span(name, span);
+        if let Some(syntax) = identifier.atom_syntax_object_mut() {
+            syntax.unresolved = true;
+            syntax.introduced_via_macro = true;
+        }
+        identifier
+    };
+    let mut definitions = vec![ExprKind::Define(Box::new(Define::new(
+        temporary.clone(),
+        expr_list![
+            primitive("#%immutable-struct-type"),
+            ExprKind::Quote(Box::new(Quote::new(
+                list.args[1].clone(),
+                SyntaxObject::new(TokenType::Quote, span)
+            ))),
+            expr_usize(fields.len())
+        ],
+        location.clone(),
+    )))];
+    let names = std::iter::once(list.args[1].clone())
+        .chain(std::iter::once(ExprKind::ident_with_span(
+            &format!("{}?", name.resolve()),
+            span,
+        )))
+        .chain(fields.args.iter().map(|field| {
+            ExprKind::ident_with_span(
+                &format!(
+                    "{}-{}",
+                    name.resolve(),
+                    field.atom_identifier().unwrap().resolve()
+                ),
+                field.span(),
+            )
+        }));
+    for (index, binding) in names.enumerate() {
+        definitions.push(ExprKind::Define(Box::new(Define::new(
+            binding,
+            expr_list![
+                primitive("#%immutable-struct-binding"),
+                temporary.clone(),
+                expr_usize(index)
+            ],
+            location.clone(),
+        ))));
+    }
+    Ok(ExprKind::Begin(Box::new(Begin::new(
+        definitions,
+        SyntaxObject::new(TokenType::Begin, span),
+    ))))
+}
+
 // VisitorMutRef
 impl<'a> VisitorMutRef for KernelExpander<'a> {
     type Output = Result<()>;
@@ -1721,6 +1804,15 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
             ExprKind::Macro(m) => self.visit_macro(m),
             ExprKind::Atom(a) => self.visit_atom(a),
             ExprKind::List(l) => {
+                if self.map.is_none()
+                    && l.first_ident()
+                        .is_some_and(|name| name.resolve() == "struct")
+                {
+                    *expr = expand_immutable_struct(l)?;
+                    self.changed = true;
+                    return self.visit(expr);
+                }
+
                 {
                     match l.first() {
                         Some(ExprKind::Atom(Atom {
