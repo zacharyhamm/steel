@@ -11,7 +11,7 @@ use crate::rvals::cycles::BreadthFirstSearchSteelValReferenceVisitor2;
 use crate::rvals::SteelValPointer;
 
 use crate::{
-    compiler::map::SymbolMap,
+    compiler::{constants::ConstantMap, map::SymbolMap},
     gc::{
         shared::{MutContainer, ShareableMut, StandardShared, StandardSharedMut, WeakShared},
         GcMut,
@@ -868,6 +868,91 @@ mod will_tests {
             .flatten()
             .map(|pending| pending.ready)
             .collect()
+    }
+
+    #[test]
+    fn constant_lists_remain_ordinary_will_roots() {
+        let mut engine = engine_with_gc();
+        engine
+            .run(
+                "(define executor (make-will-executor))
+                 (define (live) '(1 2 3 4))
+                 (will-register executor (live) (lambda (value) 42))",
+            )
+            .unwrap();
+        for _ in 0..3 {
+            engine.run("(probe-gc)").unwrap();
+            assert_eq!(readiness(&engine, "executor"), [false]);
+        }
+        assert_eq!(engine.run("(live)").unwrap()[0].to_string(), "(1 2 3 4)");
+    }
+
+    #[test]
+    fn forked_thread_constants_remain_ordinary_will_roots() {
+        use crate::steel_vm::vm::{StackFrame, SteelThread};
+        use std::sync::Arc;
+
+        struct Fork(#[allow(dead_code)] Arc<Mutex<SteelThread>>);
+        impl Custom for Fork {}
+
+        fn retain_in_fork(
+            ctx: &mut VmCore,
+            args: &[SteelVal],
+        ) -> Option<Result<SteelVal, SteelErr>> {
+            let fork = ctx.make_thread();
+            {
+                let mut thread = fork.lock().unwrap();
+                thread.stack.clear();
+                thread.stack_frames.clear();
+                thread.current_frame = StackFrame::main();
+                thread.constant_map = ConstantMap::from_vec(vec![args[0].clone()]);
+            }
+            Some(Fork(fork).into_steelval())
+        }
+
+        let mut engine = engine_with_gc();
+        engine.register_value("probe-fork", SteelVal::BuiltIn(retain_in_fork));
+        engine
+            .run(
+                "(define executor (make-will-executor))
+                 (define owner
+                   (let ((key (list (box 1) 2 3 4)))
+                     (will-register executor key (lambda (value) 42))
+                     (probe-fork key)))",
+            )
+            .unwrap();
+        for _ in 0..3 {
+            engine.run("(probe-gc)").unwrap();
+            assert_eq!(readiness(&engine, "executor"), [false]);
+        }
+        engine.run("(set! owner #f)").unwrap();
+        engine.run("(probe-gc) (probe-gc)").unwrap();
+        assert_eq!(readiness(&engine, "executor"), [true]);
+    }
+
+    #[test]
+    fn shared_list_tails_remain_ordinary_will_roots() {
+        let mut engine = engine_with_gc();
+        engine
+            .run(
+                "(define executor (make-will-executor))
+                 (define owner
+                   (let ((key (list (box 1) 2 3 4)))
+                     (will-register executor key (lambda (value) 42))
+                     (cons 0 key)))",
+            )
+            .unwrap();
+        for _ in 0..3 {
+            engine.run("(probe-gc)").unwrap();
+            assert_eq!(readiness(&engine, "executor"), [false]);
+        }
+        engine.run("(set! owner #f)").unwrap();
+        engine.run("(probe-gc) (probe-gc)").unwrap();
+        assert_eq!(readiness(&engine, "executor"), [true]);
+        assert_eq!(
+            engine.run("(will-execute executor)").unwrap(),
+            [SteelVal::IntV(42)]
+        );
     }
 
     #[test]
@@ -1890,6 +1975,7 @@ impl Heap {
         roots: &'a [SteelVal],
         live_functions: impl Iterator<Item = &'a ByteCodeLambda>,
         globals: &'a [SteelVal],
+        constants: &ConstantMap,
         tls: &'a [SteelVal],
         synchronizer: &'a mut Synchronizer,
         force_full: bool,
@@ -1899,6 +1985,7 @@ impl Heap {
             roots,
             live_functions,
             globals,
+            constants,
             tls,
             synchronizer,
             force_full,
@@ -1923,6 +2010,7 @@ impl Heap {
         roots: &'a [SteelVal],
         live_functions: impl Iterator<Item = &'a ByteCodeLambda>,
         globals: &'a [SteelVal],
+        constants: &ConstantMap,
         tls: &'a [SteelVal],
         synchronizer: &'a mut Synchronizer,
     ) -> HeapRef<SteelVal> {
@@ -1931,6 +2019,7 @@ impl Heap {
             roots,
             live_functions,
             globals,
+            constants,
             tls,
             synchronizer,
             false,
@@ -1944,6 +2033,7 @@ impl Heap {
         roots: &'a [SteelVal],
         live_functions: impl Iterator<Item = &'a ByteCodeLambda>,
         globals: &'a [SteelVal],
+        constants: &ConstantMap,
         tls: &'a [SteelVal],
         synchronizer: &mut Synchronizer,
         force: bool,
@@ -1974,6 +2064,7 @@ impl Heap {
                     roots,
                     live_functions,
                     globals,
+                    constants,
                     tls,
                     synchronizer,
                 );
@@ -2013,6 +2104,7 @@ impl Heap {
         roots: &'a [SteelVal],
         live_functions: impl Iterator<Item = &'a ByteCodeLambda>,
         globals: &'a [SteelVal],
+        constants: &ConstantMap,
         tls: &'a [SteelVal],
         synchronizer: &'a mut Synchronizer,
     ) -> HeapRef<Vec<SteelVal>> {
@@ -2023,6 +2115,7 @@ impl Heap {
             roots,
             live_functions,
             globals,
+            constants,
             tls,
             synchronizer,
             false,
@@ -2038,6 +2131,7 @@ impl Heap {
         roots: &'a [SteelVal],
         live_functions: impl Iterator<Item = &'a ByteCodeLambda>,
         globals: &'a [SteelVal],
+        constants: &ConstantMap,
         tls: &'a [SteelVal],
         synchronizer: &'a mut Synchronizer,
         force: bool,
@@ -2075,6 +2169,7 @@ impl Heap {
                     roots,
                     live_functions,
                     globals,
+                    constants,
                     tls,
                     synchronizer,
                 );
@@ -2115,6 +2210,7 @@ impl Heap {
         roots: &'a [SteelVal],
         live_functions: impl Iterator<Item = &'a ByteCodeLambda>,
         globals: &'a [SteelVal],
+        constants: &ConstantMap,
         tls: &'a [SteelVal],
         synchronizer: &'a mut Synchronizer,
     ) -> HeapRef<Vec<SteelVal>> {
@@ -2150,6 +2246,7 @@ impl Heap {
                     roots,
                     live_functions,
                     globals,
+                    constants,
                     tls,
                     synchronizer,
                 );
@@ -2192,6 +2289,7 @@ impl Heap {
         roots: &'a [SteelVal],
         function_stack: impl Iterator<Item = &'a ByteCodeLambda>,
         globals: &'a [SteelVal],
+        constants: &ConstantMap,
         tls: &'a [SteelVal],
         synchronizer: &mut Synchronizer,
     ) -> MarkAndSweepStats {
@@ -2201,6 +2299,7 @@ impl Heap {
             roots,
             function_stack,
             globals,
+            constants,
             tls,
             synchronizer,
         );
@@ -2236,6 +2335,7 @@ impl Heap {
         roots: &[SteelVal],
         function_stack: impl Iterator<Item = &'a ByteCodeLambda>,
         globals: &[SteelVal],
+        constants: &ConstantMap,
         tls: &[SteelVal],
         synchronizer: &mut Synchronizer,
     ) -> MarkAndSweepStats {
@@ -2266,6 +2366,8 @@ impl Heap {
         for root in tls {
             context.push_back(root.clone());
         }
+
+        constants.trace(&mut context);
 
         log::debug!(target: "gc", "Roots size: {}", roots.len());
         for root in roots {
@@ -3166,8 +3268,17 @@ impl<'a> BreadthFirstSearchSteelValReferenceVisitor2<'a> for MarkAndSweepContext
     fn visit_list(&mut self, list: super::lists::CellPointer<SteelVal>) -> Self::Output {
         unsafe {
             super::lists::List::<SteelVal>::call_from_raw(list, |lst| {
-                for value in lst {
-                    self.push_back(value);
+                let mut node = lst.clone();
+                loop {
+                    for value in node.current_node_iter() {
+                        self.push_back(value);
+                    }
+                    let Some(next) = node.next_ptr_as_usize() else {
+                        break;
+                    };
+                    // tail can copy the next node, so record its original identity first.
+                    self.reachable.insert(next);
+                    node = node.tail(node.index()).unwrap();
                 }
             })
         }

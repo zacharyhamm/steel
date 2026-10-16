@@ -644,6 +644,7 @@ fn box_handler_c(ctx: *mut VmCore, arg: SteelVal) -> SteelVal {
         &this.thread.stack,
         this.thread.stack_frames.iter().map(|x| x.function.as_ref()),
         this.thread.global_env.roots(),
+        &this.constants,
         &this.thread.thread_local_storage,
         &mut this.thread.synchronizer,
     );
