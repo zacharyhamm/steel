@@ -600,29 +600,26 @@ pub(crate) fn make_immutable_struct_type(args: &[SteelVal]) -> Result<SteelVal> 
     if !(0..=65535).contains(count) {
         stop!(ContractViolation => "immutable struct field count must be between 0 and 65535")
     }
-    let (_, constructor, predicate, _, getters) =
-        make_struct_type_inner(name.as_str(), *count as usize, None);
-    let SteelVal::ListV(getters) = getters else {
-        unreachable!("native struct accessors are a list")
-    };
-    Ok(SteelVal::ListV(
-        std::iter::once(constructor)
-            .chain(std::iter::once(predicate))
-            .chain(getters.iter().cloned())
-            .collect(),
-    ))
-}
-
-pub(crate) fn immutable_struct_binding(args: &[SteelVal]) -> Result<SteelVal> {
-    let [SteelVal::ListV(bindings), SteelVal::IntV(index)] = args else {
-        stop!(TypeMismatch => "immutable struct binding expects a binding list and index")
-    };
-    bindings.get(*index as usize).cloned().ok_or_else(|| {
-        SteelErr::new(
-            crate::rerrs::ErrorKind::ContractViolation,
-            "invalid immutable struct binding index".into(),
-        )
-    })
+    let count = *count as usize;
+    let name = InternedString::from(name.as_str());
+    let (descriptor, _, _, _, _) = make_struct_type_inner(name.resolve(), count, None);
+    Ok(SteelVal::BoxedFunction(Gc::new(BoxedDynFunction::new(
+        Arc::new(move |args| {
+            let [SteelVal::IntV(index)] = args else {
+                stop!(TypeMismatch => "immutable struct binding expects one index")
+            };
+            match *index {
+                0 => Ok(UserDefinedStruct::constructor(name, count, descriptor)),
+                1 => Ok(UserDefinedStruct::predicate(descriptor)),
+                index if index >= 2 && (index as usize) < count + 2 => Ok(
+                    UserDefinedStruct::getter_prototype_index(descriptor, index as usize - 2),
+                ),
+                _ => stop!(ContractViolation => "invalid immutable struct binding index"),
+            }
+        }),
+        Some("immutable-struct-binding"),
+        Some(1),
+    ))))
 }
 
 pub fn make_struct_type(args: &[SteelVal]) -> Result<SteelVal> {
