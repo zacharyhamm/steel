@@ -20,7 +20,7 @@ use crate::{
         AsRefSteelVal, Custom, IntoSteelVal, OpaqueIterator, RestArgsIter, SteelComplex,
         SteelVector,
     },
-    steel_vm::vm::{Continuation, ContinuationMark, Synchronizer, VmCore},
+    steel_vm::vm::{Continuation, ContinuationMark, HeapHandle, Synchronizer, VmCore},
     values::lists::List,
     SteelErr,
 };
@@ -796,17 +796,32 @@ static GLOBAL_ROOTS: Lazy<Mutex<Roots>> = Lazy::new(|| Mutex::new(Roots::default
 
 // Snapshot the registry before traversing values that can reenter it.
 fn persistent_roots_snapshot() -> Vec<SteelVal> {
+    persistent_roots_for(None)
+}
+
+// With a heap, leaves out roots that retain other heaps' cells: they keep those cells only for
+// their source heap, so another heap tracing them would keep its own retention alive.
+fn persistent_roots_for(heap: Option<usize>) -> Vec<SteelVal> {
+    fn collect(roots: &Roots, heap: Option<usize>) -> Vec<SteelVal> {
+        roots
+            .roots
+            .iter()
+            .filter(|(key, _)| {
+                heap.is_none()
+                    || roots
+                        .retention
+                        .get(key)
+                        .is_none_or(|source| Some(*source) == heap)
+            })
+            .map(|(_, value)| value.clone())
+            .collect()
+    }
+
     #[cfg(feature = "sync")]
-    let roots = GLOBAL_ROOTS
-        .lock()
-        .unwrap()
-        .roots
-        .values()
-        .cloned()
-        .collect();
+    let roots = collect(&GLOBAL_ROOTS.lock().unwrap(), heap);
     #[cfg(not(feature = "sync"))]
     let roots = ROOTS
-        .try_with(|roots| roots.borrow().roots.values().cloned().collect())
+        .try_with(|roots| collect(&roots.borrow(), heap))
         .unwrap_or_default();
     roots
 }
@@ -843,6 +858,8 @@ pub struct Roots {
     generation: usize,
     offset: usize,
     roots: rustc_hash::FxHashMap<(usize, usize), SteelVal>,
+    // Roots a heap holds to keep another heap's cells, by the address of that source heap.
+    retention: rustc_hash::FxHashMap<(usize, usize), usize>,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -889,8 +906,17 @@ impl Roots {
         RootToken { generation, offset }
     }
 
+    fn root_retained(&mut self, value: SteelVal, source: usize) -> RootToken {
+        let token = self.root(value);
+        self.retention
+            .insert((token.generation, token.offset), source);
+        token
+    }
+
     fn free(&mut self, token: &RootToken) -> Option<SteelVal> {
-        self.roots.remove(&(token.generation, token.offset))
+        let key = (token.generation, token.offset);
+        self.retention.remove(&key);
+        self.roots.remove(&key)
     }
 
     fn increment_generation(&mut self) {
@@ -915,6 +941,23 @@ impl SteelVal {
     // the runtime, we probably want to be marked as rooted
     pub fn as_rooted(&self) -> RootedSteelVal {
         let token = self.mark_rooted();
+
+        RootedSteelVal {
+            token,
+            value: self.clone(),
+        }
+    }
+
+    // A root that only the heap at `source` traces.
+    fn as_retention_root(&self, source: usize) -> RootedSteelVal {
+        #[cfg(feature = "sync")]
+        let token = GLOBAL_ROOTS
+            .lock()
+            .unwrap()
+            .root_retained(self.clone(), source);
+
+        #[cfg(not(feature = "sync"))]
+        let token = ROOTS.with(|x| x.borrow_mut().root_retained(self.clone(), source));
 
         RootedSteelVal {
             token,
@@ -947,6 +990,7 @@ pub struct WillExecutor {
 struct PendingWill {
     pair: Pair,
     ready: bool,
+    collection_domain: Option<std::sync::Weak<()>>,
 }
 
 fn traced_identity(value: &SteelVal) -> Option<usize> {
@@ -1001,15 +1045,13 @@ impl PendingWill {
             // In theory, if this is a weak value, this can be the thing to check
             // the values.
             SteelVal::MutableVector(heap_ref) => {
-                WeakShared::weak_count(&heap_ref.inner) == 1
-                    || !heap_ref.inner.upgrade().unwrap().read().is_reachable()
+                heap_ref.inner.upgrade().is_none() || WeakShared::weak_count(&heap_ref.inner) == 1
             }
             SteelVal::BoxedIterator(gc) => Gc::strong_count(gc) == 1,
             SteelVal::SyntaxObject(gc) => Gc::strong_count(gc) == 1,
             SteelVal::Boxed(gc) => Gc::strong_count(gc) == 1,
             SteelVal::HeapAllocated(heap_ref) => {
-                WeakShared::weak_count(&heap_ref.inner) == 1
-                    || !heap_ref.inner.upgrade().unwrap().read().is_reachable()
+                heap_ref.inner.upgrade().is_none() || WeakShared::weak_count(&heap_ref.inner) == 1
             }
             SteelVal::Reference(gc) => Gc::strong_count(gc) == 1,
             SteelVal::BigNum(gc) => Gc::strong_count(gc) == 1,
@@ -1088,6 +1130,15 @@ impl WillExecutor {
     }
 
     pub fn register(&self, key: SteelVal, func: SteelVal) -> Result<(), SteelErr> {
+        self.register_in_domain(key, func, None)
+    }
+
+    fn register_in_domain(
+        &self,
+        key: SteelVal,
+        func: SteelVal,
+        collection_domain: Option<std::sync::Weak<()>>,
+    ) -> Result<(), SteelErr> {
         log::debug!(target: "will", "Registering: {}", key);
         if !func.is_function() {
             stop!(TypeMismatch => "will-register expects a function, found: {}", func)
@@ -1100,6 +1151,7 @@ impl WillExecutor {
                     cdr: func,
                 },
                 ready: false,
+                collection_domain,
             })
             .unwrap();
 
@@ -1182,14 +1234,31 @@ pub fn will_execute(_ctx: &mut VmCore, args: &[SteelVal]) -> Option<Result<Steel
 }
 
 #[cfg(feature = "sync")]
-#[steel_derive::function(name = "will-register")]
+#[steel_derive::context(name = "will-register", arity = "Exact(3)")]
+pub fn will_register_in_context(
+    ctx: &mut VmCore,
+    args: &[SteelVal],
+) -> Option<Result<SteelVal, SteelErr>> {
+    Some((|| {
+        let will = WillExecutor::as_ref(&args[0])?;
+        let domain = ctx
+            .thread
+            .with_heap(|_, heap| std::sync::Arc::downgrade(&heap.collection_domain));
+        will.register_in_domain(args[1].clone(), args[2].clone(), Some(domain))?;
+        Ok(SteelVal::Void)
+    })())
+}
+
+#[cfg(feature = "sync")]
+pub use WILL_REGISTER_IN_CONTEXT_DEFINITION as WILL_REGISTER_DEFINITION;
+
+#[cfg(feature = "sync")]
 pub fn will_register(
     will: SteelVal,
     value: SteelVal,
     func: SteelVal,
 ) -> Result<SteelVal, SteelErr> {
-    let will = WillExecutor::as_ref(&will)?;
-    will.register(value, func)?;
+    WillExecutor::as_ref(&will)?.register(value, func)?;
     Ok(SteelVal::Void)
 }
 
@@ -1226,6 +1295,76 @@ mod will_tests {
             .flatten()
             .map(|pending| pending.ready)
             .collect()
+    }
+
+    #[test]
+    fn shared_executors_wait_for_the_keys_own_collection() {
+        for key in ["(box 42)", "(vector 42)", "(list (box 42))"] {
+            let mut owner = engine_with_gc();
+            let mut foreign = engine_with_gc();
+            owner.register_value(
+                "probe-finalizer",
+                SteelVal::FuncV(|_| Ok(SteelVal::IntV(42))),
+            );
+            owner
+                .run(format!(
+                    "(define executor (make-will-executor))
+                     (define live {key})
+                     (will-register executor live probe-finalizer)"
+                ))
+                .unwrap();
+            foreign.register_value("executor", owner.extract_value("executor").unwrap());
+            foreign.run("(probe-gc) (probe-gc)").unwrap();
+            assert_eq!(readiness(&owner, "executor"), [false]);
+            let executor = owner.extract_value("executor").unwrap();
+            assert!(WillExecutor::as_ref(&executor)
+                .unwrap()
+                .find_next()
+                .is_none());
+            owner.run("(probe-gc)").unwrap();
+            assert_eq!(readiness(&owner, "executor"), [false]);
+            owner.run("(set! live #f)").unwrap();
+            foreign.run("(probe-gc)").unwrap();
+            owner.run("(probe-gc)").unwrap();
+            assert_eq!(readiness(&owner, "executor"), [true]);
+            assert_eq!(
+                foreign.run("(will-execute executor)").unwrap(),
+                [SteelVal::IntV(42)]
+            );
+            assert!(readiness(&owner, "executor").is_empty());
+        }
+    }
+
+    #[test]
+    fn retained_executors_do_not_root_their_pending_keys() {
+        let mut owner = engine_with_gc();
+        owner.register_value(
+            "probe-finalizer",
+            SteelVal::FuncV(|args| Ok(args[0].as_box_to_inner().unwrap())),
+        );
+        owner
+            .run(
+                "(define executor (make-will-executor))
+                 (define key (box 42))
+                 (will-register executor key probe-finalizer)",
+            )
+            .unwrap();
+        let mut copy = owner.deep_clone();
+        copy.register_value("alias", owner.extract_value("key").unwrap());
+        copy.run("(probe-gc)").unwrap();
+        owner.run("(set! key #f)").unwrap();
+        owner.run("(probe-gc)").unwrap();
+        assert_eq!(readiness(&owner, "executor"), [false]);
+        copy.run("(set! alias #f)").unwrap();
+        copy.run("(probe-gc)").unwrap();
+        owner.run("(probe-gc)").unwrap();
+        assert_eq!(readiness(&owner, "executor"), [true]);
+        drop(owner);
+        copy.run("(probe-gc)").unwrap();
+        assert_eq!(
+            copy.run("(will-execute executor)").unwrap(),
+            [SteelVal::IntV(42)]
+        );
     }
 
     #[test]
@@ -1604,6 +1743,7 @@ fn mark_test_roots(heap: &Heap, roots: &[SteelVal], _borrowed: bool) -> MarkAndS
         let queue = crossbeam_queue::SegQueue::new();
         let mut local_queue = Vec::new();
         let mut marker = MarkAndSweepContextRefQueue {
+            collection_domain: None,
             queue: &queue,
             local_queue: &mut local_queue,
             stats: MarkAndSweepStats::default(),
@@ -1702,6 +1842,7 @@ fn concurrent_collectors_do_not_share_foreign_marks() {
         let queue = crossbeam_queue::SegQueue::new();
         let mut local_queue = Vec::new();
         let mut marker = MarkAndSweepContextRefQueue {
+            collection_domain: None,
             queue: &queue,
             local_queue: &mut local_queue,
             stats: MarkAndSweepStats::default(),
@@ -1899,6 +2040,7 @@ fn borrowed_heap_traversal_keeps_children_after_heap_teardown() {
                 let queue = crossbeam_queue::SegQueue::new();
                 let mut local_queue = Vec::new();
                 let mut marker = MarkAndSweepContextRefQueue {
+                    collection_domain: None,
                     queue: &queue,
                     local_queue: &mut local_queue,
                     stats: MarkAndSweepStats::default(),
@@ -1975,6 +2117,7 @@ fn parallel_mark_counts_each_slot_exactly_once() {
                 let queue = crossbeam_queue::SegQueue::new();
                 let mut local_queue = Vec::new();
                 let mut ctx = MarkAndSweepContextRefQueue {
+                    collection_domain: None,
                     local_queue: &mut local_queue,
                     queue: &queue,
                     stats: MarkAndSweepStats::default(),
@@ -2574,6 +2717,8 @@ fn spawn_background_dropper<T: HeapAble + Sync + Send + 'static>(
 /// we attempt to do a small collection by just dropping any values with no weak counts
 /// pointing to it.
 pub struct Heap {
+    #[cfg(feature = "sync")]
+    collection_domain: std::sync::Arc<()>,
     count: usize,
     mark_and_sweep_queue: Vec<SteelVal>,
 
@@ -2586,6 +2731,16 @@ pub struct Heap {
     // Copies a collection made of values it does not own. Their destructors can reenter this
     // heap, so `SteelThread::with_heap` drops them once the heap is unlocked.
     pub(crate) released: Vec<SteelVal>,
+    retained: Vec<RetainedHeap>,
+    pub(crate) released_retained: Vec<RetainedHeap>,
+}
+
+// Drop the roots before their source storage, and always outside collection locks.
+pub(crate) struct RetainedHeap {
+    values: Vec<RootedSteelVal>,
+    // Aliases root cells only while ordinarily reachable, so will keys remain weak.
+    cells: Vec<RootedSteelVal>,
+    heap: HeapHandle,
 }
 
 #[cfg(feature = "sync")]
@@ -3356,6 +3511,162 @@ struct MemorySpace {
 type MemoryBlock = (Vec<HeapValue>, Vec<HeapVector>);
 
 impl Heap {
+    // Retention roots are traced only by their source heap, which a heap's address identifies
+    // while a retained handle keeps it alive.
+    fn retention_source(heap: &HeapHandle) -> usize {
+        heap.data_ptr() as usize
+    }
+
+    pub(crate) fn retain_shared(values: Vec<SteelVal>, heap: &HeapHandle) -> RetainedHeap {
+        let source = Self::retention_source(heap);
+        RetainedHeap {
+            values: values
+                .iter()
+                .map(|value| value.as_retention_root(source))
+                .collect(),
+            cells: Vec::new(),
+            heap: heap.clone_for_storage(),
+        }
+    }
+
+    pub(crate) fn retain_heap(&mut self, retained: RetainedHeap) {
+        self.retained.push(retained);
+    }
+
+    /// Copies of this heap's retention, except of the heap at `except`. A heap whose values
+    /// were copied from this one can reach the same retained values and cells.
+    pub(crate) fn inherited_retention(&self, except: Option<&HeapHandle>) -> Vec<RetainedHeap> {
+        let except = except.map(Self::retention_source);
+        self.retained
+            .iter()
+            .filter_map(|entry| {
+                let source = Self::retention_source(&entry.heap);
+                (Some(source) != except).then(|| {
+                    let reroot = |roots: &[RootedSteelVal]| {
+                        roots
+                            .iter()
+                            .map(|root| root.value().as_retention_root(source))
+                            .collect()
+                    };
+                    RetainedHeap {
+                        values: reroot(&entry.values),
+                        cells: reroot(&entry.cells),
+                        heap: entry.heap.clone_for_storage(),
+                    }
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn persistent_roots(&self) -> Vec<SteelVal> {
+        persistent_roots_for(Some(self as *const Heap as usize))
+    }
+
+    fn reaches_any_cell(&self, reachable: &rustc_hash::FxHashSet<usize>) -> bool {
+        self.memory_free_list
+            .elements
+            .iter()
+            .map(|cell| StandardShared::as_ptr(cell) as usize)
+            .chain(
+                self.vector_free_list
+                    .elements
+                    .iter()
+                    .map(|cell| StandardShared::as_ptr(cell) as usize),
+            )
+            .any(|cell| reachable.contains(&cell))
+    }
+
+    pub(crate) fn prune_retained(
+        &mut self,
+        reachable: &rustc_hash::FxHashSet<usize>,
+        ordinary: Option<&rustc_hash::FxHashSet<usize>>,
+    ) {
+        for mut entry in core::mem::take(&mut self.retained) {
+            let source = Self::retention_source(&entry.heap);
+            let aliases = match (entry.heap.try_lock(), ordinary) {
+                (Some(heap), Some(ordinary)) => {
+                    let known = entry
+                        .cells
+                        .iter()
+                        .filter_map(|root| traced_identity(root.value()))
+                        .collect();
+                    let roots = heap.root_reached_cells(ordinary, &known, source);
+                    Some((heap.reaches_any_cell(reachable), roots))
+                }
+                // Teardown already starts from persistent roots, which protect their cells.
+                (Some(heap), None) => Some((heap.reaches_any_cell(reachable), Vec::new())),
+                // Teardown needs the source only to decide whether to keep its storage.
+                (None, None) => Some((true, Vec::new())),
+                (None, Some(_)) => None,
+            };
+            let Some((keep_storage, aliases)) = aliases else {
+                // Another collector may hold the source and need this heap; retry next GC.
+                self.retained.push(entry);
+                continue;
+            };
+            entry.cells.extend(aliases);
+            let (live_cells, dead_cells): (Vec<_>, Vec<_>) =
+                entry.cells.into_iter().partition(|root| {
+                    ordinary.is_some_and(|ordinary| {
+                        ordinary.contains(&traced_identity(root.value()).unwrap())
+                    })
+                });
+            entry.cells = live_cells;
+            let (live, mut dead): (Vec<_>, Vec<_>) = entry.values.into_iter().partition(|root| {
+                traced_identity(root.value()).is_some_and(|identity| reachable.contains(&identity))
+            });
+            entry.values = live;
+            dead.extend(dead_cells);
+            if !dead.is_empty() {
+                self.released_retained.push(RetainedHeap {
+                    values: dead,
+                    cells: Vec::new(),
+                    heap: entry.heap.clone_for_storage(),
+                });
+            }
+            if entry.values.is_empty() && entry.cells.is_empty() && !keep_storage {
+                self.released_retained.push(entry);
+            } else {
+                self.retained.push(entry);
+            }
+        }
+    }
+
+    fn root_reached_cells(
+        &self,
+        reachable: &rustc_hash::FxHashSet<usize>,
+        known: &rustc_hash::FxHashSet<usize>,
+        source: usize,
+    ) -> Vec<RootedSteelVal> {
+        fn reached<T: HeapAble>(
+            cells: &FreeList<T>,
+            reachable: &rustc_hash::FxHashSet<usize>,
+            known: &rustc_hash::FxHashSet<usize>,
+        ) -> Vec<HeapRef<T>> {
+            cells
+                .elements
+                .iter()
+                .filter_map(|cell| {
+                    let identity = StandardShared::as_ptr(cell) as usize;
+                    (reachable.contains(&identity) && !known.contains(&identity)).then(|| HeapRef {
+                        inner: StandardShared::downgrade(cell),
+                    })
+                })
+                .collect()
+        }
+
+        reached(&self.memory_free_list, reachable, known)
+            .into_iter()
+            .map(SteelVal::HeapAllocated)
+            .chain(
+                reached(&self.vector_free_list, reachable, known)
+                    .into_iter()
+                    .map(SteelVal::MutableVector),
+            )
+            .map(|value| value.as_retention_root(source))
+            .collect()
+    }
+
     fn cell_addresses(&self) -> rustc_hash::FxHashSet<usize> {
         self.memory_free_list
             .elements
@@ -3374,7 +3685,14 @@ impl Heap {
     // values for holders outside the heap, so a value held elsewhere stays valid only while
     // its heap is alive and reaches it from its own roots or a registered root. Values meant to
     // outlive their engine are rooted, joined into another heap, or deep cloned.
+    #[cfg(test)]
     pub(crate) fn trace_teardown_roots() -> (rustc_hash::FxHashSet<usize>, Vec<SteelVal>) {
+        Self::trace_teardown_roots_from(persistent_roots_snapshot())
+    }
+
+    pub(crate) fn trace_teardown_roots_from(
+        roots: Vec<SteelVal>,
+    ) -> (rustc_hash::FxHashSet<usize>, Vec<SteelVal>) {
         let mut queue = Vec::new();
         let mut context = MarkAndSweepContext {
             queue: &mut queue,
@@ -3385,7 +3703,7 @@ impl Heap {
             visited_lists: Default::default(),
             struct_types: Default::default(),
         };
-        for root in persistent_roots_snapshot() {
+        for root in roots {
             context.push_back(root);
         }
         context.visit();
@@ -3419,6 +3737,8 @@ impl Heap {
     /// Copy every cell. The remapper then points copied values at the copies.
     pub(crate) fn copy_cells(&self) -> (Heap, HeapRemapper) {
         let copy = Heap {
+            #[cfg(feature = "sync")]
+            collection_domain: std::sync::Arc::new(()),
             count: self.count,
             mark_and_sweep_queue: Vec::with_capacity(256),
             maybe_memory_size: self.maybe_memory_size,
@@ -3426,6 +3746,9 @@ impl Heap {
             memory_free_list: self.memory_free_list.clone(),
             vector_free_list: self.vector_free_list.clone(),
             released: Vec::new(),
+            // The copied cells and shared values can reach what this heap retains.
+            retained: self.inherited_retention(None),
+            released_retained: Vec::new(),
         };
         let remapper = HeapRemapper::new(
             copied_cells(&self.memory_free_list, &copy.memory_free_list),
@@ -3489,6 +3812,8 @@ impl Heap {
 
     pub fn new() -> Self {
         Heap {
+            #[cfg(feature = "sync")]
+            collection_domain: std::sync::Arc::new(()),
             count: 0,
             // mark_and_sweep_queue: VecDeque::with_capacity(256),
             mark_and_sweep_queue: Vec::with_capacity(256),
@@ -3500,11 +3825,15 @@ impl Heap {
             memory_free_list: FreeList::new(),
             vector_free_list: FreeList::new(),
             released: Vec::new(),
+            retained: Vec::new(),
+            released_retained: Vec::new(),
         }
     }
 
     pub fn new_empty() -> Self {
         Heap {
+            #[cfg(feature = "sync")]
+            collection_domain: std::sync::Arc::new(()),
             count: 0,
             mark_and_sweep_queue: Vec::new(),
             maybe_memory_size: 0,
@@ -3512,6 +3841,8 @@ impl Heap {
             memory_free_list: FreeList::new(),
             vector_free_list: FreeList::new(),
             released: Vec::new(),
+            retained: Vec::new(),
+            released_retained: Vec::new(),
         }
     }
 
@@ -3890,7 +4221,9 @@ impl Heap {
         #[cfg(feature = "profiling")]
         let now = crate::time::Instant::now();
 
+        synchronizer.stop_threads();
         let owned = self.cell_addresses();
+        let persistent_roots = self.persistent_roots();
         let mut context = MarkAndSweepContext {
             queue: &mut self.mark_and_sweep_queue,
             stats: MarkAndSweepStats::default(),
@@ -3901,8 +4234,6 @@ impl Heap {
             struct_types: Default::default(),
         };
 
-        // Pause all threads
-        synchronizer.stop_threads();
         unsafe {
             synchronizer.enumerate_stacks(&mut context);
         }
@@ -3920,7 +4251,7 @@ impl Heap {
         }
 
         constants.trace(&mut context);
-        for root in persistent_roots_snapshot() {
+        for root in persistent_roots {
             context.push_back(root);
         }
 
@@ -3947,10 +4278,11 @@ impl Heap {
         // Each confined interpreter has its own memory budget. Mark on its current
         // thread instead of allocating a machine-sized worker pool at the first GC.
         #[cfg(feature = "sync")]
-        let stats = {
+        let (stats, ordinary) = {
             let queue = crossbeam_queue::SegQueue::new();
             let mut local_queue = Vec::with_capacity(4096);
             let mut marker = MarkAndSweepContextRefQueue {
+                collection_domain: Some(&self.collection_domain),
                 queue: &queue,
                 local_queue: &mut local_queue,
                 stats: MarkAndSweepStats::default(),
@@ -3964,16 +4296,24 @@ impl Heap {
                 marker.push_back(value);
             }
             marker.visit();
+            let ordinary = (!self.retained.is_empty()).then(|| marker.reachable.clone());
             marker.retain_wills();
+            // The marker records reachability in its own set, not in its stats.
+            marker.stats.reachable = core::mem::take(&mut marker.reachable);
             // A root snapshot can hold the last reference to a root released meanwhile.
             self.released.append(context.queue);
-            marker.stats
+            (marker.stats, ordinary)
         };
+        // Without wills, everything traced is ordinarily reachable.
         #[cfg(not(feature = "sync"))]
-        let stats = {
+        let (stats, ordinary) = {
             context.visit();
-            context.stats
+            (context.stats, None::<rustc_hash::FxHashSet<usize>>)
         };
+        self.prune_retained(
+            &stats.reachable,
+            Some(ordinary.as_ref().unwrap_or(&stats.reachable)),
+        );
         // Free slots must release their payloads even if no later allocation reuses them.
         self.memory_free_list.strong_collection();
         self.vector_free_list.strong_collection();
@@ -4134,6 +4474,13 @@ pub struct MarkAndSweepContext<'a> {
 }
 
 impl<'a> MarkAndSweepContext<'a> {
+    // Only collections read reachability; traversal-only scans track `visited` instead.
+    fn record_reachable(&mut self, identity: usize) {
+        if self.owned.is_some() {
+            self.stats.reachable.insert(identity);
+        }
+    }
+
     // Values that can recreate a struct type's instances keep its properties reachable.
     pub(crate) fn visit_struct_type(&mut self, descriptor: StructTypeDescriptor) {
         if let Some(properties) = self.struct_types.properties(descriptor) {
@@ -4146,6 +4493,7 @@ impl<'a> MarkAndSweepContext<'a> {
         heap_ref: &StandardSharedMut<HeapAllocated<SteelVal>>,
     ) {
         let identity = StandardShared::as_ptr(heap_ref) as usize;
+        self.record_reachable(identity);
         if self.owned.is_some_and(|owned| owned.contains(&identity)) {
             let mut guard = heap_ref.write();
             if guard.is_reachable() {
@@ -4166,6 +4514,7 @@ impl<'a> MarkAndSweepContext<'a> {
         heap_vector: &StandardSharedMut<HeapAllocated<Vec<SteelVal>>>,
     ) {
         let identity = StandardShared::as_ptr(heap_vector) as usize;
+        self.record_reachable(identity);
         if self.owned.is_some_and(|owned| owned.contains(&identity)) {
             let mut guard = heap_vector.write();
             if guard.is_reachable() {
@@ -4189,6 +4538,7 @@ struct MarkAndSweepStats {
     memory_reached_count: usize,
     vector_reached_count: usize,
     keep_alive: Vec<SteelVal>,
+    reachable: rustc_hash::FxHashSet<usize>,
 }
 
 impl core::ops::Add for MarkAndSweepStats {
@@ -4198,12 +4548,14 @@ impl core::ops::Add for MarkAndSweepStats {
         self.object_count += rhs.object_count;
         self.memory_reached_count += rhs.memory_reached_count;
         self.vector_reached_count += rhs.vector_reached_count;
+        self.reachable.extend(rhs.reachable);
         self
     }
 }
 
 #[cfg(feature = "sync")]
 pub struct MarkAndSweepContextRefQueue<'a> {
+    collection_domain: Option<&'a std::sync::Arc<()>>,
     // Thread local queue + larger queue when it runs out?
     // Try to push on to local queue first.
     local_queue: &'a mut Vec<SteelValPointer>,
@@ -4231,10 +4583,28 @@ impl<'a> MarkAndSweepContextRefQueue<'a> {
                 let mut values = executor.values.lock().unwrap();
                 values.extend(executor.incoming.try_iter().map(Some));
                 for pending in values.iter_mut().flatten() {
-                    pending.ready |= traced_identity(pending.pair.car_ref()).map_or_else(
-                        || pending.is_unreachable(),
-                        |identity| !reachable.contains(&identity),
-                    );
+                    let key = pending.pair.car_ref();
+                    let local = match key {
+                        SteelVal::HeapAllocated(cell) => self.owned.contains(&cell.as_ptr_usize()),
+                        SteelVal::MutableVector(cell) => self.owned.contains(&cell.as_ptr_usize()),
+                        _ => self
+                            .collection_domain
+                            .zip(pending.collection_domain.as_ref())
+                            .is_some_and(|(domain, registered)| {
+                                core::ptr::eq(
+                                    std::sync::Weak::as_ptr(registered),
+                                    std::sync::Arc::as_ptr(domain),
+                                )
+                            }),
+                    };
+                    pending.ready |= if local {
+                        traced_identity(key).map_or_else(
+                            || pending.is_unreachable(),
+                            |identity| !reachable.contains(&identity),
+                        )
+                    } else {
+                        pending.is_unreachable()
+                    };
                 }
             }
             for index in processed..end {
@@ -4244,6 +4614,9 @@ impl<'a> MarkAndSweepContextRefQueue<'a> {
             self.visit();
             processed = end;
         }
+        // Merge what retention reached into the ordinary set, which is usually far larger.
+        let retained = core::mem::replace(&mut self.reachable, reachable);
+        self.reachable.extend(retained);
     }
 
     fn visit_custom_children(&mut self, custom_type: &MutContainer<Box<dyn CustomType>>) {
@@ -4265,6 +4638,7 @@ impl<'a> MarkAndSweepContextRefQueue<'a> {
         self.stats.memory_reached_count += temporary_queue.stats.memory_reached_count;
         self.stats.object_count += temporary_queue.stats.object_count;
         self.stats.vector_reached_count += temporary_queue.stats.vector_reached_count;
+        self.reachable.extend(temporary_queue.stats.reachable);
 
         for value in queue {
             self.push_back(&value);
@@ -4277,6 +4651,7 @@ impl<'a> MarkAndSweepContextRefQueue<'a> {
         heap_ref: &StandardSharedMut<HeapAllocated<SteelVal>>,
     ) {
         let identity = StandardShared::as_ptr(heap_ref) as usize;
+        self.reachable.insert(identity);
         let local = self.owned.contains(&identity);
         if local {
             let mut guard = heap_ref.write();
@@ -4303,6 +4678,7 @@ impl<'a> MarkAndSweepContextRefQueue<'a> {
         heap_vector: &StandardSharedMut<HeapAllocated<Vec<SteelVal>>>,
     ) {
         let identity = StandardShared::as_ptr(heap_vector) as usize;
+        self.reachable.insert(identity);
         let local = self.owned.contains(&identity);
         if local {
             let mut guard = heap_vector.write();
@@ -4465,6 +4841,9 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
     }
 
     fn push_back(&mut self, value: SteelVal) {
+        if let Some(identity) = traced_identity(&value) {
+            self.record_reachable(identity);
+        }
         if self.trace_once {
             // List slices can share an address while exposing different elements, so a list
             // is identified by its whole node.

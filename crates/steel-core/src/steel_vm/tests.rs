@@ -1573,6 +1573,7 @@ mod embedding_regressions {
 
         let mut template = Engine::new();
         template.register_fn("make-holder", Holder);
+        register_gc(&mut template);
         template.register_fn("holder-value", |holder: SteelVal| {
             Holder::as_ref(&holder).map(|holder| holder.0.clone())
         });
@@ -1587,8 +1588,151 @@ mod embedding_regressions {
             copy.run("((holder-value h))").unwrap().last(),
             Some(&SteelVal::IntV(1))
         );
-        drop(copy);
+        copy.run("(define borrowed (holder-value h)) (set! h #f)")
+            .unwrap();
+        copy.run("(probe-gc)").unwrap();
+        assert_eq!(
+            copy.run("(borrowed)").unwrap().last(),
+            Some(&SteelVal::IntV(1))
+        );
+        copy.run("(set! borrowed #f)").unwrap();
+        copy.run("(probe-gc) (probe-gc)").unwrap();
         assert!(template_heap.upgrade().is_none());
+    }
+
+    #[test]
+    fn deep_clones_release_shared_values_individually() {
+        use crate::{
+            rvals::{cycles::BreadthFirstSearchSteelValVisitor, Custom},
+            steel_vm::register_fn::RegisterFn,
+            values::closed::MarkAndSweepContext,
+            SteelVal,
+        };
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        struct Holder(SteelVal, Arc<AtomicUsize>);
+        impl Custom for Holder {
+            fn gc_visit_children(&self, context: &mut MarkAndSweepContext) {
+                context.push_back(self.0.clone());
+            }
+        }
+        impl Drop for Holder {
+            fn drop(&mut self) {
+                self.1.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let factory = dropped.clone();
+        let mut source = Engine::new();
+        register_gc(&mut source);
+        source.register_fn("make-holder", move |value: SteelVal| {
+            Holder(value, factory.clone())
+        });
+        source
+            .run("(define first-holder (make-holder (box 1))) (define second-holder (make-holder (box 2)))")
+            .unwrap();
+        let source_heap = Arc::downgrade(&source.virtual_machine.heap);
+        let mut copy = source.deep_clone();
+        drop(source);
+        copy.run("(probe-gc)").unwrap();
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+        copy.run("(set! first-holder #f)").unwrap();
+        copy.run("(probe-gc)").unwrap();
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert!(source_heap.upgrade().is_some());
+        copy.run("(set! second-holder #f)").unwrap();
+        copy.run("(probe-gc)").unwrap();
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
+        assert!(source_heap.upgrade().is_none());
+    }
+
+    #[test]
+    fn sibling_clones_release_shared_values() {
+        use crate::{
+            rvals::{cycles::BreadthFirstSearchSteelValVisitor, Custom},
+            steel_vm::register_fn::RegisterFn,
+            values::closed::MarkAndSweepContext,
+            SteelVal,
+        };
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        struct Holder(SteelVal, Arc<AtomicUsize>);
+        impl Custom for Holder {
+            fn gc_visit_children(&self, context: &mut MarkAndSweepContext) {
+                context.push_back(self.0.clone());
+            }
+        }
+        impl Drop for Holder {
+            fn drop(&mut self) {
+                self.1.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let factory = dropped.clone();
+        let mut source = Engine::new();
+        register_gc(&mut source);
+        source.register_fn("make-holder", move |value: SteelVal| {
+            Holder(value, factory.clone())
+        });
+        source
+            .run("(define first-holder (make-holder (box 1)))")
+            .unwrap();
+        let source_heap = Arc::downgrade(&source.virtual_machine.heap);
+        let mut first = source.deep_clone();
+        let mut second = source.deep_clone();
+        drop(source);
+        // Each clone's retention must not keep the other's reachable.
+        first.run("(set! first-holder #f)").unwrap();
+        second.run("(set! first-holder #f)").unwrap();
+        first.run("(probe-gc)").unwrap();
+        second.run("(probe-gc)").unwrap();
+        first.run("(probe-gc)").unwrap();
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert!(source_heap.upgrade().is_none());
+    }
+
+    #[test]
+    fn clones_of_clones_keep_the_original_template_cells() {
+        use crate::{
+            rvals::{cycles::BreadthFirstSearchSteelValVisitor, AsRefSteelVal, Custom},
+            steel_vm::register_fn::RegisterFn,
+            values::closed::MarkAndSweepContext,
+            SteelVal,
+        };
+
+        struct Holder(SteelVal);
+        impl Custom for Holder {
+            fn gc_visit_children(&self, context: &mut MarkAndSweepContext) {
+                context.push_back(self.0.clone());
+            }
+        }
+
+        let mut template = Engine::new();
+        register_gc(&mut template);
+        template.register_fn("make-holder", Holder);
+        template.register_fn("holder-value", |holder: SteelVal| {
+            Holder::as_ref(&holder).map(|holder| holder.0.clone())
+        });
+        template.run("(define h (make-holder (box 1)))").unwrap();
+        let mut middle = template.deep_clone();
+        drop(template);
+        // The last clone shares the holder, which reaches only the first template's box.
+        let mut last = middle.deep_clone();
+        middle.run("(set! h #f)").unwrap();
+        middle.run("(probe-gc) (probe-gc)").unwrap();
+        last.run("(probe-gc)").unwrap();
+        assert_eq!(
+            last.run("(unbox (holder-value h))").unwrap().last(),
+            Some(&SteelVal::IntV(1))
+        );
     }
 
     #[test]
@@ -2521,6 +2665,97 @@ mod embedding_regressions {
             engine.run("(set! joined #f)").unwrap();
             engine.run("(probe-gc)").unwrap();
             assert_eq!(Arc::strong_count(&count), 2);
+        }
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn discarded_shared_thread_results_release_source_heaps() {
+        use crate::{
+            rvals::Custom,
+            steel_vm::{register_fn::RegisterFn, vm::threads::thread_finished},
+        };
+        use std::{
+            sync::Arc,
+            time::{Duration, Instant},
+        };
+
+        struct Probe(#[allow(dead_code)] Arc<()>);
+        impl Custom for Probe {}
+
+        let mut destination = Engine::new();
+        register_gc(&mut destination);
+        for alias in [None, Some("receiver"), Some("cell")] {
+            let count = Arc::new(());
+            let factory = count.clone();
+            let mut source = Engine::new();
+            source.register_fn("probe-value", move || Probe(factory.clone()));
+            let heap = Arc::downgrade(&source.virtual_machine.heap);
+            let worker = source
+                .run(
+                    "(spawn-native-thread
+                   (lambda ()
+                     (let ((channel (channels/new)))
+                       (channel/send (channels-sender channel) (box (probe-value)))
+                       channel)))",
+                )
+                .unwrap()
+                .pop()
+                .unwrap();
+            source.enter_safepoint(|| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while thread_finished(&worker).unwrap() != crate::SteelVal::BoolV(true) {
+                    assert!(Instant::now() < deadline, "worker did not finish");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+            drop(source);
+            destination.register_value("worker", worker);
+            destination
+                .run("(define joined (thread-join! worker))")
+                .unwrap();
+            destination.run("(probe-gc)").unwrap();
+            assert!(heap.upgrade().is_some());
+            assert!(Arc::strong_count(&count) > 1);
+            if let Some(alias) = alias {
+                destination
+                    .run("(define receiver (channels-receiver joined))")
+                    .unwrap();
+                if alias == "cell" {
+                    destination
+                        .run("(define cell (channel/recv receiver)) (set! receiver #f)")
+                        .unwrap();
+                }
+                destination.run("(set! joined #f)").unwrap();
+                destination.run("(probe-gc)").unwrap();
+                assert!(
+                    heap.upgrade().is_some(),
+                    "a live alias lost its source heap"
+                );
+                if alias == "receiver" {
+                    destination
+                        .run("(define cell (channel/recv receiver)) (set! receiver #f)")
+                        .unwrap();
+                    destination.run("(probe-gc)").unwrap();
+                }
+                let value = destination.run("(unbox cell)").unwrap().pop().unwrap();
+                assert!(matches!(value, crate::SteelVal::Custom(_)));
+                drop(value);
+                destination.run("(set! cell #f)").unwrap();
+            }
+            destination
+                .run("(set! joined #f) (set! worker #f)")
+                .unwrap();
+            destination.run("(probe-gc) (probe-gc)").unwrap();
+            assert_eq!(
+                Arc::strong_count(&count),
+                1,
+                "discarded payload stayed rooted"
+            );
+            assert!(
+                heap.upgrade().is_none(),
+                "discarded result retained its heap"
+            );
         }
     }
 

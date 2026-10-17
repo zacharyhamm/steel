@@ -126,10 +126,29 @@ fn adopt_thread_result(
 ) -> SteelVal {
     let mut value = result.value().clone();
     if !Arc::ptr_eq(&*heap, &*thread.heap) {
-        let cells = heap.lock().reached_cells(&value);
-        let adopted = thread.with_heap(|_, target| target.adopt(cells));
+        let (cells, inherited) = {
+            let source = heap.lock();
+            // The result can also reach what its heap retains from other heaps.
+            (
+                source.reached_cells(&value),
+                source.inherited_retention(Some(&thread.heap)),
+            )
+        };
+        let adopted = thread.with_heap(|_, target| {
+            for retained in inherited {
+                target.retain_heap(retained);
+            }
+            target.adopt(cells)
+        });
         let retained = adopted.rewrite(&mut value);
-        thread.heap.retain(retained, &heap);
+        if !retained.is_empty() {
+            let retained = super::Heap::retain_shared(retained, &heap);
+            // Waiting for the heap is a safepoint, and only this value reaches the adopted
+            // cells until it is returned to the stack.
+            let rooted = value.as_rooted();
+            thread.with_heap(|_, target| target.retain_heap(retained));
+            drop(rooted);
+        }
     }
     // The root and the handle kept the result's cells while it still referred to them.
     drop(result);

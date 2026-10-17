@@ -33,7 +33,6 @@ use crate::steel_vm::primitives::steel_unbox_mutable;
 use crate::steel_vm::primitives::{gt_primitive, gte_primitive, lt_primitive, steel_not};
 use crate::values::closed::Heap;
 use crate::values::closed::MarkAndSweepContext;
-use crate::values::closed::RootedSteelVal;
 use crate::values::functions::CaptureVec;
 use crate::values::functions::RootedInstructions;
 use crate::values::functions::SerializedLambda;
@@ -436,24 +435,13 @@ pub(crate) struct HeapState {
     execution_owners: std::sync::atomic::AtomicUsize,
     // 0: idle, 1: tracing, 2: tracing with another release to process.
     teardown: std::sync::atomic::AtomicU8,
-    retained: parking_lot::Mutex<Vec<RetainedHeap>>,
-}
-
-// Values this heap shares with another heap that still reach that heap's cells. Rooting them
-// keeps those cells through the other heap's teardown, and the handle keeps its storage. The
-// roots are released before the handle.
-struct RetainedHeap {
-    _values: Vec<RootedSteelVal>,
-    _heap: HeapHandle,
 }
 
 impl HeapState {
     pub(crate) fn retain(&self, values: Vec<SteelVal>, heap: &HeapHandle) {
         if !values.is_empty() {
-            self.retained.lock().push(RetainedHeap {
-                _values: values.iter().map(SteelVal::as_rooted).collect(),
-                _heap: heap.clone_for_storage(),
-            });
+            let retained = Heap::retain_shared(values, heap);
+            self.lock().retain_heap(retained);
         }
     }
 }
@@ -478,7 +466,6 @@ impl HeapHandle {
                 heap: parking_lot::Mutex::new(heap),
                 execution_owners: std::sync::atomic::AtomicUsize::new(1),
                 teardown: std::sync::atomic::AtomicU8::new(0),
-                retained: parking_lot::Mutex::new(Vec::new()),
             }),
             execution_owner: true,
         }
@@ -538,12 +525,19 @@ impl Drop for HeapHandle {
         }
         loop {
             self.shared.teardown.store(1, Release);
-            let (reachable, keep_alive) = Heap::trace_teardown_roots();
-            let detached = self.shared.lock().detach_unreachable(&reachable);
-            let changed = !detached.is_empty();
+            let roots = self.shared.lock().persistent_roots();
+            let (reachable, keep_alive) = Heap::trace_teardown_roots_from(roots);
+            let (detached, retained) = {
+                let mut heap = self.shared.lock();
+                heap.prune_retained(&reachable, None);
+                let detached = heap.detach_unreachable(&reachable);
+                (detached, core::mem::take(&mut heap.released_retained))
+            };
+            let changed = !detached.is_empty() || !retained.is_empty();
             // Payload destructors can release roots and heap handles, so run them unlocked.
             drop(detached);
             drop(keep_alive);
+            drop(retained);
             if !changed
                 && self
                     .shared
@@ -619,6 +613,60 @@ mod heap_handle_tests {
             .allocate_without_collection(probe.into_steelval().unwrap());
         drop(heap);
         assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn closed_destinations_release_retention_outside_heap_locks() {
+        use crate::{
+            rvals::cycles::BreadthFirstSearchSteelValVisitor, values::closed::MarkAndSweepContext,
+            SteelVal,
+        };
+
+        struct Holder(SteelVal);
+        impl Custom for Holder {
+            fn gc_visit_children(&self, context: &mut MarkAndSweepContext) {
+                context.push_back(self.0.clone());
+            }
+        }
+        struct Probe {
+            source: HeapHandle,
+            destination: Weak<super::HeapState>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Custom for Probe {}
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                assert!(self.source.try_lock().is_some());
+                assert!(self.destination.upgrade().unwrap().try_lock().is_some());
+                self.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let source = HeapHandle::new(Heap::new());
+        let source_storage = Arc::downgrade(&source);
+        let destination = HeapHandle::new(Heap::new());
+        let snapshot = destination.clone_for_storage();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let probe = Probe {
+            source: source.clone_for_storage(),
+            destination: Arc::downgrade(&destination),
+            drops: drops.clone(),
+        }
+        .into_steelval()
+        .unwrap();
+        let cell = source.lock().allocate_without_collection(probe);
+        destination.retain(
+            vec![Holder(SteelVal::HeapAllocated(cell))
+                .into_steelval()
+                .unwrap()],
+            &source,
+        );
+        drop(source);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        drop(destination);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert!(source_storage.upgrade().is_none());
+        drop(snapshot);
     }
 }
 
@@ -1098,8 +1146,10 @@ impl SteelThread {
         let mut guard = self.enter_safepoint(|_| heap.lock());
         let result = thunk(self, &mut guard);
         let released = core::mem::take(&mut guard.released);
+        let retained = core::mem::take(&mut guard.released_retained);
         drop(guard);
         drop(released);
+        drop(retained);
         result
     }
 

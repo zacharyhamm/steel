@@ -148,3 +148,20 @@ regressions.
 - `src/rvals/cycles.rs`: a pair whose fields cannot recurse skips the drop buffer. Car
   is released before cdr is classified, so a child held by both fields still drains
   iteratively when its last reference goes.
+
+- `src/values/closed.rs`, `src/steel_vm/vm.rs`, and `src/steel_vm/vm/threads.rs`: a heap
+  that retains another heap's shared values for a deep clone or a joined result releases
+  each one once its own collection no longer reaches it, and the other heap's storage once
+  it reaches none of that heap's cells. Retaining them for the heap's whole life kept
+  every discarded payload. A cell of the other heap that the collection still reaches
+  directly is rooted instead, until it is no longer ordinarily reachable, so will keys
+  stay weak. Only the other heap traces these roots: a heap that traced its own, or a
+  sibling clone's, would keep them reachable forever. A clone and a joined result also
+  retain what their source heap retains, since their copied cells can reach it. Releasing
+  them runs destructors after the heap is unlocked.
+
+- `src/values/closed.rs`: `will-register` records the heap it was called from. A
+  collection decides a key's readiness from its own reachability only for keys it owns,
+  and otherwise from the key's reference count, since another heap's collection does not
+  trace the owner's roots and marked live keys ready. Keys registered from Rust with
+  `WillExecutor::register` have no owner and use the reference count.
