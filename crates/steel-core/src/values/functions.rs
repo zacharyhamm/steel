@@ -286,6 +286,7 @@ impl ByteCodeLambda {
 
         let mut new_body = Vec::with_capacity(value.body_exp.len());
         let mut closures_to_rewrite = Vec::new();
+        let mut pure_functions = Vec::new();
 
         for (idx, instr) in value.body_exp.iter().enumerate() {
             let mut instr = *instr;
@@ -336,6 +337,11 @@ impl ByteCodeLambda {
                         closures_to_rewrite.push((idx + 2, fresh_function_id() as _));
                     }
                 }
+                // A nested lambda without captures keeps its id, and its inline body is
+                // rewritten along with this one.
+                OpCode::PUREFUNC => {
+                    pure_functions.push(value.body_exp.get(idx + 2).unwrap().payload_size.to_u32());
+                }
                 _ => {}
             }
 
@@ -345,9 +351,13 @@ impl ByteCodeLambda {
         // The body now refers to the receiving thread's global slots.
         let mut compiler = heap.thread.compiler.write();
         compiler.function_ids.insert(value.id);
+        compiler.function_ids.extend(pure_functions);
         for (idx, id) in closures_to_rewrite {
             new_body[idx].payload_size = u24::from_u32(id);
-            compiler.function_ids.insert(id);
+            // The VM reads the closure's id back from the payload.
+            compiler
+                .function_ids
+                .insert(new_body[idx].payload_size.to_u32());
         }
         drop(compiler);
 

@@ -2392,13 +2392,15 @@ impl SteelVal {
     }
 
     /// `eqv?` compares numbers by value, keeping exactness, and everything else like `eq?`.
+    /// Whatever is `eq?` is also `eqv?`, even a complex number with a NaN part.
     pub(crate) fn eqv(&self, other: &SteelVal) -> bool {
-        match (self, other) {
-            (BigNum(l), BigNum(r)) => l == r,
-            (BigRational(l), BigRational(r)) => l == r,
-            (Complex(l), Complex(r)) => l == r,
-            _ => self.ptr_eq(other),
-        }
+        self.ptr_eq(other)
+            || match (self, other) {
+                (BigNum(l), BigNum(r)) => l == r,
+                (BigRational(l), BigRational(r)) => l == r,
+                (Complex(l), Complex(r)) => l == r,
+                _ => false,
+            }
     }
 }
 

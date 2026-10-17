@@ -435,6 +435,9 @@ pub(crate) struct HeapState {
     execution_owners: std::sync::atomic::AtomicUsize,
     // 0: idle, 1: tracing, 2: tracing with another release to process.
     teardown: std::sync::atomic::AtomicU8,
+    // Readable without the heap lock, whose wait is a safepoint.
+    #[cfg(feature = "sync")]
+    collection_domain: std::sync::Weak<()>,
 }
 
 impl HeapState {
@@ -443,6 +446,12 @@ impl HeapState {
             let retained = Heap::retain_shared(values, heap);
             self.lock().retain_heap(retained);
         }
+    }
+
+    /// The domain whose collections decide readiness for wills registered on this heap.
+    #[cfg(feature = "sync")]
+    pub(crate) fn collection_domain(&self) -> std::sync::Weak<()> {
+        self.collection_domain.clone()
     }
 }
 
@@ -463,6 +472,8 @@ impl HeapHandle {
     fn new(heap: Heap) -> Self {
         Self {
             shared: Arc::new(HeapState {
+                #[cfg(feature = "sync")]
+                collection_domain: heap.collection_domain(),
                 heap: parking_lot::Mutex::new(heap),
                 execution_owners: std::sync::atomic::AtomicUsize::new(1),
                 teardown: std::sync::atomic::AtomicU8::new(0),

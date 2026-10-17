@@ -1808,6 +1808,136 @@ mod embedding_regressions {
     }
 
     #[test]
+    fn deep_clone_rebuilds_tails_their_own_elements_refer_to() {
+        // Each element closes over the list it is consed onto. Consing onto a mostly full
+        // node links to that node, so an element's tail is its own list's cdr.
+        let mut template = Engine::new();
+        template
+            .run(
+                "(define (push x st) (cons (let ((b (box x))) (lambda (k) (if k b st))) st))
+                 (define s (push 4 (push 3 (push 2 (push 1 (push 0 '()))))))",
+            )
+            .unwrap();
+        assert_eq!(
+            template.run("(eq? ((cadr s) #f) (cddr s))").unwrap().last(),
+            Some(&crate::SteelVal::BoolV(true))
+        );
+        let mut copy = template.deep_clone();
+        copy.run("(set-box! ((car ((cadr s) #f)) #t) 99)").unwrap();
+        assert_eq!(
+            template.run("(unbox ((caddr s) #t))").unwrap().last(),
+            Some(&crate::SteelVal::IntV(2))
+        );
+        drop(template);
+        let read = copy
+            .run("(list (unbox ((car ((cadr s) #f)) #t)) (unbox ((caddr s) #t)))")
+            .unwrap();
+        assert_eq!(read.last().unwrap().to_string(), "(99 99)");
+
+        // A list whose first element is its own tail.
+        let mut template = Engine::new();
+        template
+            .run("(define s (list (box 1) 2 3)) (define l (cons s s))")
+            .unwrap();
+        assert_eq!(
+            template.run("(eq? (cdr l) s)").unwrap().last(),
+            Some(&crate::SteelVal::BoolV(true))
+        );
+        let mut copy = template.deep_clone();
+        copy.run("(set-box! (car s) 99)").unwrap();
+        assert_eq!(
+            template.run("(unbox (car s))").unwrap().last(),
+            Some(&crate::SteelVal::IntV(1))
+        );
+        drop(template);
+        let read = copy
+            .run("(list (unbox (car s)) (unbox (cadr l)) (unbox (car (car l))))")
+            .unwrap();
+        assert_eq!(read.last().unwrap().to_string(), "(99 99 99)");
+    }
+
+    #[test]
+    fn recycling_keeps_the_slots_that_kept_slots_refer_to() {
+        // The closures are built at run time, so no call is inlined into its caller.
+        let mut engine = Engine::new_raw_no_kernel();
+        crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+        engine
+            .run(
+                "(require-builtin steel/base)
+                 (define c (let ((tag 'c)) (lambda () (list tag))))
+                 (define b (let ((tag 'b)) (lambda () (list tag (c)))))
+                 (define a (let ((tag 'a)) (lambda () (list tag (b)))))
+                 (define keep a)",
+            )
+            .unwrap();
+        // Only `keep` still reaches the old `a`, whose old `b` calls the old `c`.
+        engine
+            .run("(define c 0) (define b 0) (define a 0)")
+            .unwrap();
+        // Redefining past the threshold recycles the shadowed slots.
+        for i in 0.. {
+            engine.run(format!("(define x {i})")).unwrap();
+            let compiler = engine.virtual_machine.compiler.read();
+            if compiler.symbol_map.free_list.shadowed_count() == 0 {
+                break;
+            }
+            assert!(i < 200, "shadowed slots were never recycled");
+        }
+        assert_eq!(
+            engine.run("(keep)").unwrap().last().unwrap().to_string(),
+            "(a (b (c)))"
+        );
+    }
+
+    #[test]
+    fn deep_clones_retain_other_heaps_cells_that_reach_template_cells() {
+        // The vector belongs to another engine's heap, so neither copy owns it.
+        let mut other = Engine::new();
+        other.run("(define F (vector #f))").unwrap();
+        let mut template = Engine::new();
+        template.register_value("F", other.extract_value("F").unwrap());
+        template
+            .run("(vector-set! F 0 (let ((n 0)) (lambda () (set! n (+ n 1)) n)))")
+            .unwrap();
+        let mut copy = template.deep_clone();
+        drop(template);
+        assert_eq!(
+            copy.run("((vector-ref F 0))").unwrap().last(),
+            Some(&crate::SteelVal::IntV(1))
+        );
+        drop(other);
+    }
+
+    #[test]
+    fn deep_clones_keep_struct_property_cells_the_template_drops() {
+        let mut template = Engine::new();
+        register_gc(&mut template);
+        template
+            .run("(define p (let () (struct holder (x) #:payload (box 42)) (holder 1)))")
+            .unwrap();
+        let template_heap = std::sync::Arc::downgrade(&template.virtual_machine.heap);
+        let mut copy = template.deep_clone();
+        let payload = "(unbox (#%struct-property-ref p '#:payload))";
+        // Only the copy's instance still reaches the type, whose properties live in the vtable.
+        // A `set!` returns the old value, which stays rooted until its program finishes.
+        template.run("(set! p #f)").unwrap();
+        template.run("(probe-gc) (probe-gc)").unwrap();
+        assert_eq!(
+            copy.run(payload).unwrap().last(),
+            Some(&crate::SteelVal::IntV(42))
+        );
+        drop(template);
+        assert_eq!(
+            copy.run(payload).unwrap().last(),
+            Some(&crate::SteelVal::IntV(42))
+        );
+        // Once the copy no longer reaches the type, it releases the template's storage.
+        copy.run("(set! p #f)").unwrap();
+        copy.run("(probe-gc) (probe-gc)").unwrap();
+        assert!(template_heap.upgrade().is_none());
+    }
+
+    #[test]
     fn closed_heaps_reclaim_cycles_as_pending_roots_are_released() {
         use std::sync::{atomic::Ordering, Arc};
 
@@ -2195,6 +2325,18 @@ mod embedding_regressions {
         );
     }
 
+    #[test]
+    fn eqv_holds_whenever_eq_does() {
+        let mut engine = Engine::new();
+        let results = engine
+            .run(
+                "(let ([z (make-rectangular +nan.0 1.0)])
+                   (list (eq? z z) (eqv? z z) (pair? (memv z (list z)))))",
+            )
+            .unwrap();
+        assert_eq!(results.last().unwrap().to_string(), "(#true #true #true)");
+    }
+
     // The test body runs in a child process, either because a failure aborts inside a
     // thread-local destructor or because other tests' collections must not trace its roots.
     // Returns whether this is the child.
@@ -2300,6 +2442,56 @@ mod embedding_regressions {
             ENGINE.with(|_| {});
             let mut engine = Engine::new_raw_no_kernel();
             engine.register_value("nested", deeply_nested_list());
+            ENGINE.with(|slot| *slot.borrow_mut() = Some(engine));
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn thread_local_engine_teardown_traces_lists_without_list_storage() {
+        use crate::steel_vm::vm::threads::thread_finished;
+        use std::{
+            cell::RefCell,
+            time::{Duration, Instant},
+        };
+
+        if !in_teardown_child("thread_local_engine_teardown_traces_lists_without_list_storage") {
+            return;
+        }
+
+        thread_local! {
+            static WORKER: RefCell<Option<crate::SteelVal>> = const { RefCell::new(None) };
+            static ENGINE: RefCell<Option<Engine>> = const { RefCell::new(None) };
+        }
+
+        std::thread::spawn(|| {
+            #[cfg(all(feature = "sync", feature = "biased"))]
+            steel_rc::register_thread();
+            // Register both slots before the engine creates im-lists' empty-list storage. The
+            // pending result keeps the heap's storage, so dropping the engine after that
+            // storage is destroyed traces the result's rooted list.
+            WORKER.with(|_| {});
+            ENGINE.with(|_| {});
+            let mut engine = Engine::new_raw_no_kernel();
+            crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+            let worker = engine
+                .run(
+                    "(require-builtin steel/base) (require-builtin steel/threads)
+                     (spawn-native-thread (lambda () (list 1 2 3)))",
+                )
+                .unwrap()
+                .pop()
+                .unwrap();
+            engine.enter_safepoint(|| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while thread_finished(&worker).unwrap() != crate::SteelVal::BoolV(true) {
+                    assert!(Instant::now() < deadline, "worker did not finish");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+            WORKER.with(|slot| *slot.borrow_mut() = Some(worker));
             ENGINE.with(|slot| *slot.borrow_mut() = Some(engine));
         })
         .join()
@@ -2664,7 +2856,14 @@ mod embedding_regressions {
             // set! returns the old value, which stays rooted until the execution ends.
             engine.run("(set! joined #f)").unwrap();
             engine.run("(probe-gc)").unwrap();
-            assert_eq!(Arc::strong_count(&count), 2);
+            // Collectors in concurrently running tests trace every registered root, including
+            // the pending result, and hold copies of its payload until their own pass ends.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Arc::strong_count(&count) != 2 {
+                assert!(Instant::now() < deadline, "the joined payload stayed alive");
+                std::thread::yield_now();
+                engine.run("(probe-gc)").unwrap();
+            }
         }
     }
 
@@ -2747,16 +2946,55 @@ mod embedding_regressions {
                 .run("(set! joined #f) (set! worker #f)")
                 .unwrap();
             destination.run("(probe-gc) (probe-gc)").unwrap();
-            assert_eq!(
-                Arc::strong_count(&count),
-                1,
-                "discarded payload stayed rooted"
-            );
+            // Collectors in concurrently running tests trace every registered root, including
+            // the pending result, and hold copies of its payload until their own pass ends.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Arc::strong_count(&count) != 1 {
+                assert!(Instant::now() < deadline, "discarded payload stayed rooted");
+                std::thread::yield_now();
+                destination.run("(probe-gc)").unwrap();
+            }
             assert!(
                 heap.upgrade().is_none(),
                 "discarded result retained its heap"
             );
         }
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn joined_results_from_other_heaps_keep_shared_strong_boxes() {
+        use crate::steel_vm::vm::threads::thread_finished;
+        use std::time::{Duration, Instant};
+
+        // A strong box lives outside any heap, so both engines can hold the same one.
+        let shared = crate::SteelVal::boxed(crate::SteelVal::IntV(1));
+        let mut destination = Engine::new();
+        destination.register_value("shared", shared.clone());
+        let mut source = Engine::new();
+        source.register_value("shared", shared);
+        let worker = source
+            .run("(spawn-native-thread (lambda () (list shared (box 2))))")
+            .unwrap()
+            .pop()
+            .unwrap();
+        source.enter_safepoint(|| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while thread_finished(&worker).unwrap() != crate::SteelVal::BoolV(true) {
+                assert!(Instant::now() < deadline, "worker did not finish");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        drop(source);
+        destination.register_value("worker", worker);
+        let read = destination
+            .run(
+                "(define joined (thread-join! worker))
+                 (set-strong-box! (car joined) 3)
+                 (list (eq? (car joined) shared) (unbox-strong shared) (unbox (cadr joined)))",
+            )
+            .unwrap();
+        assert_eq!(read.last().unwrap().to_string(), "(#true 3 2)");
     }
 
     #[cfg(feature = "sync")]

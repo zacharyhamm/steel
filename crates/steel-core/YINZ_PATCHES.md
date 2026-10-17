@@ -82,13 +82,19 @@ regressions.
   that share a tail only through a linked node are rebuilt separately, because im-lists
   cannot link a new node to an existing view. A closure's contract can refer back to the
   closure, so it is remapped after the rest of the graph and attached to the closure's
-  copy. Kernel struct property maps still refer to the template heap.
+  copy. A tail that one of its own list's elements refers to, such as a closure over the
+  list it was consed onto, is rebuilt on its own, since the copy it would be a view of
+  does not exist yet; that element's tail is then not `eq?` to the copy's `cdr`. Struct
+  property maps stay in the shared vtable and other heaps' cells stay shared, so the copy
+  retains those that reach template cells, like other shared values.
 
 - `src/values/structs.rs`, `src/values/closed.rs`, and `src/steel_vm/builtin.rs`: trace
   a struct type's properties only when a collection reaches one of its instances, its
   descriptor, its constructor, predicate, or accessors, or a `serialize-value` result
   that refers to it. A registered builtin module traces its values, so a struct function
-  exported before it is imported keeps its type's properties. Rooting every vtable entry
+  exported before it is imported keeps its type's properties. Registering a module
+  generates its context-function wrappers without holding the module's lock, which a
+  collection on another thread can need meanwhile. Rooting every vtable entry
   pinned the properties of each evaluated local `struct`
   form forever and grew every collection's root set. Same-named types sent to another
   thread resolve to their own descriptor, then to the newest match. Deserialization
@@ -103,7 +109,8 @@ regressions.
 - `src/rvals.rs` and `src/steel_vm/primitives.rs`: `eqv?` compares big integers, big
   rationals, and complex numbers by value and exactness, as R7RS requires. Comparing them
   by identity missed equal numbers, so `memv` and `assv` did not find matching keys. `eq?`
-  and constant interning still compare them by identity.
+  and constant interning still compare them by identity, and whatever is `eq?` is also
+  `eqv?`, even a complex number with a NaN part.
 
 - `src/values/lists.rs`, `src/rvals/cycles.rs`, and `src/values/closed.rs`: drop lists
   without im-lists' thread-local empty list once that storage is destroyed. Rust does not
@@ -113,13 +120,17 @@ regressions.
   destroyed. From then on, each list's elements are cloned out before its nodes are
   released, so nested lists are still released iteratively. Other drops keep draining,
   which stops at shared nodes. A root released after the root table is ignored.
+  Collections and teardown traces borrow a list's elements, since consuming a list also
+  builds an empty one in that storage.
 
 - `src/steel_vm/vm/threads.rs` and `src/values/closed.rs`: `thread-join!` copies a result
   from another heap into the joining thread's heap. A pending result's heap is freed once
   its handle is released, so the joined value pointed into a freed heap. Shared values that
-  still reach the result's heap keep it, as in deep clones. A join on the same heap is
-  unchanged. A closure keeps its engine's global slots, so calling one in an unrelated
-  engine is still unsupported. The copy traces each value once, as teardown does.
+  still reach the result's heap keep it, as in deep clones. Boxes, continuations, and
+  iterators in the result stay shared too, since the joining engine can hold them as
+  well. A join on the same heap is unchanged. A closure keeps its engine's global slots,
+  so calling one in an unrelated engine is still unsupported. The copy traces each value
+  once, as teardown does.
 
 - `src/steel_vm/vm.rs` and `src/values/closed.rs`: a closed heap keeps what the registered
   roots reach, the same values a live collection keeps for holders outside the heap. A
@@ -133,7 +144,9 @@ regressions.
 - `src/compiler/compiler.rs`, `src/values/closed.rs`, and `src/steel_vm/engine.rs`: a
   closure reached only through a registered root keeps its global slots from recycling
   only if its compiler generated it. The compiler records the ids of the functions it
-  generates, and of deserialized ones. Roots are process-wide in sync builds and
+  generates, and of deserialized ones and the capture-free lambdas nested in them.
+  Recycling also traces the value of each shadowed slot that a traced closure keeps, so
+  the slots that value refers to are kept too. Roots are process-wide in sync builds and
   per-thread otherwise, so other engines' rooted closures kept this engine's shadowed slots
   with the same numbers. Engines deep cloned from one template still share the ids
   generated before the clone. Closures reached from the globals keep their slots as before.
@@ -142,8 +155,13 @@ regressions.
   makes of values it does not own once the heap is unlocked, and global-slot recycling once
   the heap and environment are unlocked. Another engine or thread can replace the original
   while the copy is held, so dropping the copy can run that value's destructor, which
-  could deadlock if it reentered this heap. Collections in sync builds still trace every
-  registered root, so they briefly hold copies of other engines' values.
+  could deadlock if it reentered this heap. That includes native functions and futures,
+  which a collection does not otherwise queue. The interner drops lifted pure functions
+  only after recycling releases its copies, since a freed slot can hold their last other
+  reference. Collections in sync builds still trace every registered root, so they
+  briefly hold copies of other engines' values. A collection reads the registered roots
+  only after the heap's other threads have stopped, since a thread can root a value right
+  up to its safepoint, when its stack no longer holds the value.
 
 - `src/rvals/cycles.rs`: a pair whose fields cannot recurse skips the drop buffer. Car
   is released before cdr is classified, so a child held by both fields still drains
@@ -160,7 +178,9 @@ regressions.
   retain what their source heap retains, since their copied cells can reach it. Releasing
   them runs destructors after the heap is unlocked.
 
-- `src/values/closed.rs`: `will-register` records the heap it was called from. A
+- `src/values/closed.rs`: `will-register` records the heap it was called from, which it
+  reads without the heap lock: waiting for that lock is a safepoint, and the arguments have
+  already left the VM stack, so another thread's collection would not see them. A
   collection decides a key's readiness from its own reachability only for keys it owns,
   and otherwise from the key's reference count, since another heap's collection does not
   trace the owner's roots and marked live keys ready. Keys registered from Rust with

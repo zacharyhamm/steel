@@ -1612,9 +1612,12 @@ impl Engine {
     pub fn register_module(&mut self, module: BuiltInModule) -> &mut Self {
         {
             use crate::gc::ShareableMut;
-            let mut guard = module.module.write();
-            if !guard.context_functions.is_empty() {
-                let funcs = register_context_functions(self, &mut guard.context_functions);
+            // Generating the wrappers waits for the heap at a safepoint, where a collection on
+            // another thread can visit this module, so the module stays unlocked meanwhile.
+            let mut context_functions = module.module.read().context_functions.clone();
+            if !context_functions.is_empty() {
+                let funcs = register_context_functions(self, &mut context_functions);
+                let mut guard = module.module.write();
                 // Overwrite the existing values, and then insert the module.
                 for (key, func) in funcs {
                     guard.register_value(&key, func);
@@ -1963,11 +1966,6 @@ impl Engine {
                     // Released by `with_heap` once the heap and environment are unlocked.
                     heap.released.extend(released);
 
-                    // Drop the pure functions which have been lifted.
-                    ctx.function_interner
-                        .pure_function_interner
-                        .retain(|key, value| crate::gc::Gc::strong_count(value) > 1);
-
                     // TODO:
                     // It is also necessary to keep track of the values to drop
                     // for closures - this can be done by tracking the closure id
@@ -1997,11 +1995,6 @@ impl Engine {
                     // Released by `with_heap` once the heap is unlocked.
                     heap.released.extend(released);
 
-                    // Drop the pure functions which have been lifted.
-                    ctx.function_interner
-                        .pure_function_interner
-                        .retain(|key, value| crate::gc::Gc::strong_count(value) > 1);
-
                     // TODO:
                     // It is also necessary to keep track of the values to drop
                     // for closures - this can be done by tracking the closure id
@@ -2016,6 +2009,13 @@ impl Engine {
                         .increment_generation();
                 });
             });
+
+            // Drop the pure functions which have been lifted. This runs once `with_heap` has
+            // released the freed slots' values, which can hold their last other reference.
+            self.virtual_machine
+                .function_interner
+                .pure_function_interner
+                .retain(|_, value| crate::gc::Gc::strong_count(value) > 1);
         }
     }
 
