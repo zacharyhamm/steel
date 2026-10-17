@@ -1400,7 +1400,22 @@ mod embedding_regressions {
         use std::sync::{atomic::Ordering, Arc};
 
         let mut original = Engine::new_raw_no_kernel();
+        let cell = crate::SteelVal::HeapAllocated(
+            original
+                .virtual_machine
+                .heap
+                .lock()
+                .allocate_without_collection(crate::SteelVal::IntV(7)),
+        );
+        original.register_value("cell", cell);
         let mut isolated = original.deep_clone();
+        let (crate::SteelVal::HeapAllocated(original_cell), crate::SteelVal::HeapAllocated(copy)) = (
+            original.extract_value("cell").unwrap(),
+            isolated.extract_value("cell").unwrap(),
+        ) else {
+            panic!("expected heap cells");
+        };
+        assert!(!original_cell.ptr_eq(&copy));
         let original_heap = Arc::downgrade(&original.virtual_machine.heap);
         let isolated_heap = Arc::downgrade(&isolated.virtual_machine.heap);
         let original_drops = store_thread_clone(&mut original, false);
@@ -1408,11 +1423,244 @@ mod embedding_regressions {
         drop(original);
         assert_eq!(original_drops.load(Ordering::SeqCst), 1);
         assert!(original_heap.upgrade().is_none());
+        assert_eq!(copy.get(), crate::SteelVal::IntV(7));
         assert_eq!(isolated_drops.load(Ordering::SeqCst), 0);
         assert!(isolated_heap.upgrade().is_some());
         drop(isolated);
         assert_eq!(isolated_drops.load(Ordering::SeqCst), 1);
         assert!(isolated_heap.upgrade().is_none());
+    }
+
+    #[test]
+    fn deep_cloned_engines_do_not_share_heap_cells() {
+        for drop_template_first in [true, false] {
+            let mut template = Engine::new();
+            register_gc(&mut template);
+            template
+                .run(
+                    "(define b (box 1))
+                     (define counter (let ((n 0)) (lambda () (set! n (+ n 1)) n)))
+                     (define v (vector (box 10)))
+                     (struct point (x) #:mutable)
+                     (define p (point 1))
+                     (define shared (list b v))",
+                )
+                .unwrap();
+            let mut copy = template.deep_clone();
+            copy.run("(set-box! b 2) (counter) (set-box! (vector-ref v 0) 20) (set-point-x! p 5)")
+                .unwrap();
+            let (mut survivor, expected) = if drop_template_first {
+                drop(template);
+                (copy, "(2 2 20 5 #true #true)")
+            } else {
+                drop(copy);
+                (template, "(1 1 10 1 #true #true)")
+            };
+            survivor.run("(probe-gc) (probe-gc)").unwrap();
+            let read = survivor
+                .run(
+                    "(list (unbox b) (counter) (unbox (vector-ref v 0)) (point-x p)
+                           (eq? (car shared) b) (eq? (cadr shared) v))",
+                )
+                .unwrap();
+            assert_eq!(read.last().unwrap().to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn deep_clones_remap_streams_transducers_reducers_and_iterators() {
+        for drop_template_first in [true, false] {
+            let mut template = Engine::new();
+            // Each closure captures its box, so only the remapper can rewrite it.
+            template
+                .run(
+                    "(define sb (box 1))
+                     (define s (let ((b sb)) (stream-cons 0 (lambda () (unbox b)))))
+                     (define tb (box 1))
+                     (define t (let ((b tb)) (mapping (lambda (x) (+ x (unbox b))))))
+                     (define rb (box 1))
+                     (define r (let ((b rb)) (into-reducer (lambda (acc x) (+ acc x (unbox b))) 0)))
+                     (define fb (box 0))
+                     (define fe (let ((b fb)) (into-for-each (lambda (x) (set-box! b x)))))
+                     (define ib (box 1))
+                     (define it (value->iterator (list ib)))",
+                )
+                .unwrap();
+            let template_heap = std::sync::Arc::downgrade(&template.virtual_machine.heap);
+            let mut copy = template.deep_clone();
+            copy.run(
+                "(set-box! sb 2) (set-box! tb 2) (set-box! rb 2) (set-box! ib 2)
+                 (transduce (list 7) (mapping (lambda (x) x)) fe)",
+            )
+            .unwrap();
+            let (mut survivor, expected) = if drop_template_first {
+                drop(template);
+                // Nothing in the copy needs the template's cells.
+                assert!(template_heap.upgrade().is_none());
+                (copy, "(2 (2) 2 7 #true 2)")
+            } else {
+                drop(copy);
+                (template, "(1 (1) 1 0 #true 1)")
+            };
+            let read = survivor
+                .run(
+                    "(list ((#%stream-cdr s))
+                           (transduce (list 0) t (into-list))
+                           (transduce (list 0) (mapping (lambda (x) x)) r)
+                           (unbox fb)
+                           (eq? (iter-next! it) ib)
+                           (unbox ib))",
+                )
+                .unwrap();
+            assert_eq!(read.last().unwrap().to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn deep_clones_remap_continuations() {
+        use crate::{gc::shared::ShareableMut, steel_vm::vm::ContinuationMark, SteelVal};
+
+        let mut template = Engine::new();
+        template
+            .run(
+                "(define kb (box 1))
+                 (define saved #f)
+                 (define (capture)
+                   (let ((b kb))
+                     (#%prim.call/cc (lambda (k) (set! saved k)))
+                     (unbox b)))
+                 (capture)",
+            )
+            .unwrap();
+        let template_heap = std::sync::Arc::downgrade(&template.virtual_machine.heap);
+        let copy = template.deep_clone();
+        drop(template);
+        assert!(template_heap.upgrade().is_none());
+
+        let SteelVal::HeapAllocated(kb) = copy.extract_value("kb").unwrap() else {
+            panic!("expected a box");
+        };
+        let SteelVal::ContinuationFunction(saved) = copy.extract_value("saved").unwrap() else {
+            panic!("expected a continuation");
+        };
+        let mark = saved.inner.read();
+        let ContinuationMark::Closed(closed) = &*mark else {
+            panic!("expected a closed continuation");
+        };
+        // The captured local refers to the copy's box, which outlives the template.
+        assert!(closed.stack.iter().any(|value| matches!(
+            value,
+            SteelVal::HeapAllocated(cell) if cell.ptr_eq(&kb)
+        )));
+    }
+
+    #[test]
+    fn deep_clones_retain_shared_custom_values_that_reach_template_cells() {
+        use crate::{
+            rvals::{AsRefSteelVal, Custom},
+            steel_vm::register_fn::RegisterFn,
+            values::closed::MarkAndSweepContext,
+            SteelVal,
+        };
+
+        struct Holder(SteelVal);
+        impl Custom for Holder {
+            fn gc_visit_children(&self, context: &mut MarkAndSweepContext) {
+                use crate::rvals::cycles::BreadthFirstSearchSteelValVisitor;
+                context.push_back(self.0.clone());
+            }
+        }
+
+        let mut template = Engine::new();
+        template.register_fn("make-holder", Holder);
+        template.register_fn("holder-value", |holder: SteelVal| {
+            Holder::as_ref(&holder).map(|holder| holder.0.clone())
+        });
+        template
+            .run("(define h (let ((b (box 1))) (make-holder (lambda () (unbox b)))))")
+            .unwrap();
+        let template_heap = std::sync::Arc::downgrade(&template.virtual_machine.heap);
+        let mut copy = template.deep_clone();
+        drop(template);
+        // The shared holder still refers to the template's box, so the copy keeps it.
+        assert_eq!(
+            copy.run("((holder-value h))").unwrap().last(),
+            Some(&SteelVal::IntV(1))
+        );
+        drop(copy);
+        assert!(template_heap.upgrade().is_none());
+    }
+
+    #[test]
+    fn deep_clone_keeps_list_tails_distinct() {
+        // Appending shares the prefix's storage and offset, so only the tails differ.
+        let mut template = Engine::new();
+        template
+            .run(
+                "(define prefix (map box (range 0 50)))
+                 (define left (append prefix (list 'left)))
+                 (define right (append prefix (list 'right)))",
+            )
+            .unwrap();
+        let mut copy = template.deep_clone();
+        let read = copy
+            .run(
+                "(list (length prefix) (length left) (length right)
+                       (list-ref left 50) (list-ref right 50))",
+            )
+            .unwrap();
+        assert_eq!(read.last().unwrap().to_string(), "(50 51 51 left right)");
+    }
+
+    #[test]
+    fn deep_clone_keeps_list_suffixes_shared() {
+        // The cdr must stay a view of the copied list whichever of the two is reached first.
+        for program in [
+            "(define xs (list (box 1) (box 2) (box 3)))
+             (define ys (cdr xs))",
+            "(define ys #f)
+             (define xs (list (box 1) (box 2) (box 3)))
+             (set! ys (cdr xs))",
+        ] {
+            let mut template = Engine::new();
+            template.run(program).unwrap();
+            let mut copy = template.deep_clone();
+            drop(template);
+            let read = copy
+                .run(
+                    "(set-box! (car ys) 20)
+                     (list (eq? (cdr xs) ys) (eq? (car ys) (cadr xs)) (unbox (cadr xs)))",
+                )
+                .unwrap();
+            assert_eq!(read.last().unwrap().to_string(), "(#true #true 20)");
+        }
+    }
+
+    #[test]
+    fn deep_clone_reconnects_contracts_that_refer_to_their_closure() {
+        // Dropping the template releases its heap, so a contract still holding the template's
+        // closure would read a dead cell. Collection is not run: marking does not yet stop at
+        // a closure that its own contract reaches.
+        let mut template = Engine::new();
+        template
+            .run(
+                "(struct holder (f))
+                 (define f
+                   (let ((b (box 0)))
+                     (lambda () (set-box! b (+ (unbox b) 1)) (unbox b))))
+                 (attach-contract-struct! f (holder f))",
+            )
+            .unwrap();
+        let mut copy = template.deep_clone();
+        drop(template);
+        let read = copy
+            .run(
+                "(f)
+                 (define contracted (holder-f (get-contract-struct f)))
+                 (list (eq? contracted f) (contracted))",
+            )
+            .unwrap();
+        assert_eq!(read.last().unwrap().to_string(), "(#true 2)");
     }
 
     #[test]
@@ -1488,6 +1736,19 @@ mod embedding_regressions {
         }
         worker.join().unwrap();
         drop(rooted);
+    }
+
+    // Joins from the host. The result stays valid only while the worker's heap is alive.
+    #[cfg(feature = "sync")]
+    fn join_thread(worker: &crate::SteelVal) -> crate::rvals::Result<crate::SteelVal> {
+        use crate::{
+            rvals::AsRefSteelVal,
+            steel_vm::vm::threads::{thread_join_impl, ThreadHandle},
+        };
+
+        ThreadHandle::as_ref(worker)
+            .and_then(|handle| thread_join_impl(&handle))
+            .map(|(result, _heap)| result.value().clone())
     }
 
     fn register_gc(engine: &mut Engine) {
@@ -1574,7 +1835,23 @@ mod embedding_regressions {
 
     #[test]
     fn cyclic_struct_properties_keep_heap_values_alive() {
-        use crate::{gc::Gc, values::structs::VTable, SteelVal};
+        use crate::{
+            gc::Gc,
+            values::{
+                structs::{StructTypeDescriptor, VTable},
+                HashMap,
+            },
+            SteelVal,
+        };
+
+        // Restore the process-wide table even when an assertion fails.
+        struct RestoreProperties(StructTypeDescriptor, Gc<HashMap<SteelVal, SteelVal>>);
+
+        impl Drop for RestoreProperties {
+            fn drop(&mut self) {
+                VTable::set_entry(&self.0, None, self.1.clone());
+            }
+        }
 
         let mut engine = Engine::new();
         register_gc(&mut engine);
@@ -1584,9 +1861,13 @@ mod embedding_regressions {
         let SteelVal::CustomStruct(owner) = engine.extract_value("owner").unwrap() else {
             panic!("expected a struct");
         };
-        let mut properties = crate::values::HashMap::default();
+        let mut properties = HashMap::default();
         let payload = engine.run("(box 42)").unwrap().pop().unwrap();
         properties.insert(payload.clone(), SteelVal::CustomStruct(owner.clone()));
+        let _restore = RestoreProperties(
+            owner.type_descriptor,
+            VTable::properties(owner.type_descriptor).unwrap(),
+        );
         VTable::set_entry(&owner.type_descriptor, None, Gc::new(properties));
         engine.run("(probe-gc) (probe-gc)").unwrap();
         for _ in 0..150 {
@@ -1597,7 +1878,288 @@ mod embedding_regressions {
             panic!("expected the property to refer back to the struct");
         };
         assert!(Gc::ptr_eq(&property_owner, &owner));
-        VTable::set_entry(&owner.type_descriptor, None, Gc::new(Default::default()));
+    }
+
+    #[test]
+    fn unreachable_struct_types_release_property_heap_values() {
+        use crate::steel_vm::register_fn::RegisterFn;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        struct Probe(Arc<AtomicUsize>);
+        impl crate::rvals::Custom for Probe {}
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        // Each handle alone keeps the type's properties reachable.
+        for handle in ["(holder)", "holder", "struct:holder"] {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let factory = drops.clone();
+            let mut engine = Engine::new();
+            register_gc(&mut engine);
+            engine.register_fn("make-probe", move || Probe(factory.clone()));
+            engine
+                .run(format!(
+                    "(define owner
+                       (let ()
+                         (struct holder () #:payload (box (make-probe)))
+                         {handle}))"
+                ))
+                .unwrap();
+            engine.run("(probe-gc) (probe-gc)").unwrap();
+            assert_eq!(
+                drops.load(Ordering::SeqCst),
+                0,
+                "{handle} lost its properties"
+            );
+            engine.run("(set! owner #f)").unwrap();
+            engine.run("(probe-gc) (probe-gc)").unwrap();
+            assert_eq!(drops.load(Ordering::SeqCst), 1, "{handle} kept a dead type");
+        }
+    }
+
+    #[test]
+    fn registered_module_exports_keep_struct_properties() {
+        use crate::{steel_vm::builtin::BuiltInModule, values::structs::VTable, SteelVal};
+
+        let mut engine = Engine::new();
+        register_gc(&mut engine);
+        let constructor = engine
+            .run("(let () (struct holder () #:payload (box 42)) holder)")
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut module = BuiltInModule::new("test/holder");
+        module.register_value("make-holder", constructor);
+        engine.register_module(module);
+        // Only the module refers to the constructor until it is imported.
+        engine.run("(probe-gc) (probe-gc)").unwrap();
+        let SteelVal::CustomStruct(holder) = engine
+            .run("(require-builtin test/holder) (make-holder)")
+            .unwrap()
+            .pop()
+            .unwrap()
+        else {
+            panic!("expected a struct");
+        };
+        let properties = VTable::properties(holder.type_descriptor).unwrap();
+        let Some(SteelVal::HeapAllocated(payload)) =
+            properties.get(&SteelVal::SymbolV("#:payload".into()))
+        else {
+            panic!("expected a boxed payload");
+        };
+        assert_eq!(payload.get(), SteelVal::IntV(42));
+    }
+
+    #[cfg(not(feature = "without-drop-protection"))]
+    #[test]
+    fn pairs_sharing_a_child_drop_iteratively() {
+        use crate::{values::lists::Pair, SteelVal};
+
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                #[cfg(all(feature = "sync", feature = "biased"))]
+                steel_rc::register_thread();
+                // Both fields hold the next node, so each count is two until one field drops.
+                let mut node = SteelVal::IntV(0);
+                for _ in 0..100_000 {
+                    node = Pair::cons(node.clone(), node).into();
+                }
+                drop(node);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn serialized_struct_types_keep_property_heap_values() {
+        use crate::{values::structs::VTable, SteelVal};
+
+        let mut engine = Engine::new();
+        register_gc(&mut engine);
+        engine
+            .run(
+                "(define serialized
+                   (let ()
+                     (struct holder () #:payload (box 42))
+                     (serialize-value holder)))",
+            )
+            .unwrap();
+        engine.run("(probe-gc) (probe-gc)").unwrap();
+        engine
+            .run("(define restored ((deserialize-value serialized)))")
+            .unwrap();
+        let SteelVal::CustomStruct(restored) = engine.extract_value("restored").unwrap() else {
+            panic!("expected a struct");
+        };
+        let properties = VTable::properties(restored.type_descriptor).unwrap();
+        let Some(SteelVal::HeapAllocated(payload)) =
+            properties.get(&SteelVal::SymbolV("#:payload".into()))
+        else {
+            panic!("expected a boxed payload");
+        };
+        assert_eq!(payload.get(), SteelVal::IntV(42));
+    }
+
+    #[test]
+    fn eq_compares_identity_for_boxes_structs_and_rationals() {
+        let mut engine = Engine::new();
+        let results = engine
+            .run(
+                "(struct point (x))
+                 (define p (point 1))
+                 (define b (box 1))
+                 (list (eq? b b) (eq? p p) (eqv? p p) (eq? p (point 1))
+                       (eq? (box 1) (box 1)) (eqv? 1/2 1/2))",
+            )
+            .unwrap();
+        assert_eq!(
+            results.last().unwrap().to_string(),
+            "(#true #true #true #false #false #true)"
+        );
+    }
+
+    #[test]
+    fn eqv_compares_numbers_by_value() {
+        let mut engine = Engine::new();
+        let results = engine
+            .run(
+                "(define big (expt 10 30))
+                 (define ratio (/ big 7))
+                 (define complex (make-rectangular big 2))
+                 (list (eqv? (expt 10 30) big)
+                       (eqv? (/ (expt 10 30) 7) ratio)
+                       (eqv? (make-rectangular (expt 10 30) 2) complex)
+                       (pair? (memv (/ (expt 10 30) 7) (list 1 ratio)))
+                       (pair? (assv (/ (expt 10 30) 7) (list (cons ratio 'found))))
+                       (eqv? 1/2 0.5)
+                       (eqv? ratio (exact->inexact ratio))
+                       (eqv? (make-rectangular 1 2) (make-rectangular 1.0 2))
+                       (eqv? ratio (/ big 9)))",
+            )
+            .unwrap();
+        assert_eq!(
+            results.last().unwrap().to_string(),
+            "(#true #true #true #true #true #false #false #false #false)"
+        );
+    }
+
+    // The test body runs in a child process, either because a failure aborts inside a
+    // thread-local destructor or because other tests' collections must not trace its roots.
+    // Returns whether this is the child.
+    fn in_teardown_child(test: &str) -> bool {
+        use std::time::{Duration, Instant};
+
+        const CHILD: &str = "STEEL_TEARDOWN_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return true;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("steel_vm::tests::embedding_regressions::{test}"),
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .spawn()
+            .unwrap();
+        // An abort prints the whole recursive drop stack, which can take minutes.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "{test} child failed: {status}");
+                return false;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("{test} child did not finish");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // Releasing this recursively would overflow the thread's stack.
+    fn deeply_nested_list() -> crate::SteelVal {
+        let mut nested = crate::SteelVal::IntV(1);
+        for _ in 0..100_000 {
+            nested = crate::SteelVal::ListV(vec![nested].into());
+        }
+        nested
+    }
+
+    #[cfg(not(feature = "sync"))]
+    #[test]
+    fn vtable_teardown_releases_nested_lists_without_list_storage() {
+        use crate::{gc::Gc, values::structs::VTable, SteelVal};
+
+        if !in_teardown_child("vtable_teardown_releases_nested_lists_without_list_storage") {
+            return;
+        }
+
+        std::thread::spawn(|| {
+            // Create im-lists' empty-list storage after the table, so it is destroyed first.
+            let descriptor = VTable::new_entry("teardown-order".into(), None, None);
+            drop(crate::values::lists::List::<SteelVal>::new());
+            let mut properties = crate::values::HashMap::default();
+            properties.insert(SteelVal::SymbolV("#:fields".into()), deeply_nested_list());
+            VTable::set_entry(&descriptor, None, Gc::new(properties));
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[cfg(not(feature = "sync"))]
+    #[test]
+    fn root_teardown_releases_nested_lists_without_list_storage() {
+        use crate::{values::lists::List, SteelVal};
+
+        if !in_teardown_child("root_teardown_releases_nested_lists_without_list_storage") {
+            return;
+        }
+
+        std::thread::spawn(|| {
+            // Register the root table before im-lists' empty-list storage, so it is destroyed
+            // later. Leaking the tokens leaves the table the only owner of each value.
+            core::mem::forget(SteelVal::IntV(0).mark_rooted());
+            drop(List::<SteelVal>::new());
+            core::mem::forget(deeply_nested_list().mark_rooted());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn thread_local_engine_teardown_releases_lists_without_list_storage() {
+        use std::cell::RefCell;
+
+        if !in_teardown_child("thread_local_engine_teardown_releases_lists_without_list_storage") {
+            return;
+        }
+
+        thread_local! {
+            static ENGINE: RefCell<Option<Engine>> = const { RefCell::new(None) };
+        }
+
+        std::thread::spawn(|| {
+            #[cfg(all(feature = "sync", feature = "biased"))]
+            steel_rc::register_thread();
+            // Register this slot before the engine creates im-lists' empty-list storage, so the
+            // engine is dropped after that storage is destroyed.
+            ENGINE.with(|_| {});
+            let mut engine = Engine::new_raw_no_kernel();
+            engine.register_value("nested", deeply_nested_list());
+            ENGINE.with(|slot| *slot.borrow_mut() = Some(engine));
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
@@ -1870,7 +2432,7 @@ mod embedding_regressions {
     #[cfg(feature = "sync")]
     #[test]
     fn channel_values_survive_concurrent_receive_and_collection() {
-        use crate::steel_vm::vm::threads::{thread_finished, thread_join};
+        use crate::steel_vm::vm::threads::thread_finished;
         use std::time::{Duration, Instant};
 
         let mut engine = Engine::new();
@@ -1907,7 +2469,7 @@ mod embedding_regressions {
             }
         });
         assert_eq!(
-            thread_join(&worker).unwrap(),
+            join_thread(&worker).unwrap(),
             crate::SteelVal::ListV((0..32).map(crate::SteelVal::IntV).collect())
         );
     }
@@ -1965,55 +2527,393 @@ mod embedding_regressions {
     #[cfg(feature = "sync")]
     #[test]
     fn completed_thread_results_keep_originating_heap_alive() {
-        use crate::steel_vm::vm::threads::{thread_finished, thread_join};
+        use crate::steel_vm::vm::threads::thread_finished;
         use std::{
             sync::Arc,
             time::{Duration, Instant},
         };
 
         let mut collector = Engine::new_raw_no_kernel();
+        crate::steel_vm::primitives::register_builtin_modules(&mut collector, true);
         register_gc(&mut collector);
-        for join in [false, true] {
-            let mut engine = Engine::new_raw_no_kernel();
-            crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
-            let heap = Arc::downgrade(&engine.virtual_machine.heap);
-            let worker = engine
-                .run(
-                    "(require-builtin steel/meta)
-                     (require-builtin steel/threads)
-                     (spawn-native-thread (lambda () (box 42)))",
-                )
-                .unwrap()
-                .pop()
-                .unwrap();
-            engine.enter_safepoint(|| {
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while thread_finished(&worker).unwrap() != crate::SteelVal::BoolV(true) {
-                    assert!(Instant::now() < deadline, "worker did not finish");
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-            });
-            drop(engine);
-            assert_eq!(
-                heap.strong_count(),
-                1,
-                "the pending result must own its heap"
-            );
-            collector.run("(probe-gc) (probe-gc)").unwrap();
+        collector
+            .run("(require-builtin steel/meta) (require-builtin steel/threads)")
+            .unwrap();
+        // The nested box checks that copied cells refer to each other's copies.
+        for (payload, reader) in [
+            ("(box 42)", "(unbox joined)"),
+            ("(box (box 42))", "(unbox (unbox joined))"),
+        ] {
+            for join in [false, true] {
+                let mut engine = Engine::new_raw_no_kernel();
+                crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+                let heap = Arc::downgrade(&engine.virtual_machine.heap);
+                let worker = engine
+                    .run(format!(
+                        "(require-builtin steel/meta)
+                         (require-builtin steel/threads)
+                         (spawn-native-thread (lambda () {payload}))"
+                    ))
+                    .unwrap()
+                    .pop()
+                    .unwrap();
+                engine.enter_safepoint(|| {
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while thread_finished(&worker).unwrap() != crate::SteelVal::BoolV(true) {
+                        assert!(Instant::now() < deadline, "worker did not finish");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                });
+                drop(engine);
+                assert_eq!(
+                    heap.strong_count(),
+                    1,
+                    "the pending result must own its heap"
+                );
+                collector.run("(probe-gc) (probe-gc)").unwrap();
 
-            if join {
-                // Keep the heap alive while inspecting the unrooted join result.
-                let heap = heap.upgrade().unwrap();
-                let joined = thread_join(&worker).unwrap();
-                assert_eq!(joined.as_box_to_inner(), Some(crate::SteelVal::IntV(42)));
-                drop(joined);
-                assert_eq!(Arc::strong_count(&heap), 1);
-                assert!(thread_join(&worker).is_err());
+                if join {
+                    // Joining from another heap copies the result, so its heap is released.
+                    collector.register_value("worker", worker.clone());
+                    collector
+                        .run("(define joined (thread-join! worker))")
+                        .unwrap();
+                    assert!(heap.upgrade().is_none());
+                    assert_eq!(
+                        collector
+                            .run(format!("(probe-gc) {reader}"))
+                            .unwrap()
+                            .last(),
+                        Some(&crate::SteelVal::IntV(42))
+                    );
+                    assert!(collector.run("(thread-join! worker)").is_err());
+                    collector.run("(set! joined #f)").unwrap();
+                }
+                drop(worker);
+                assert!(heap.upgrade().is_none());
+                collector.run("(probe-gc) (probe-gc)").unwrap();
             }
-            drop(worker);
-            assert!(heap.upgrade().is_none());
-            collector.run("(probe-gc) (probe-gc)").unwrap();
         }
+    }
+
+    #[test]
+    fn rooted_closures_keep_only_their_own_engines_shadowed_globals() {
+        use crate::parser::interner::InternedString;
+
+        fn slot(engine: &Engine, name: &str) -> usize {
+            *engine
+                .virtual_machine
+                .compiler
+                .read()
+                .symbol_map
+                .map()
+                .get(&InternedString::from_str(name))
+                .unwrap()
+        }
+
+        let mut other = Engine::new_raw_no_kernel();
+        other.run("(define x 'other) (define (get-x) x)").unwrap();
+        let foreign = other.extract_value("get-x").unwrap().as_rooted();
+
+        let mut engine = Engine::new_raw_no_kernel();
+        engine
+            .run("(define x 'old) (define y 'old) (define (get-y) y)")
+            .unwrap();
+        // The other engine's closure refers to the same slot number as this engine's `x`.
+        let shadowed = slot(&engine, "x");
+        assert_eq!(shadowed, slot(&other, "x"));
+        // Only the root reaches this engine's closure once `get-y` is redefined.
+        let get_y = engine.extract_value("get-y").unwrap().as_rooted();
+        engine.run("(define y 'new) (define (get-y) 'new)").unwrap();
+        // Redefining past the threshold recycles the shadowed slots.
+        for i in 0.. {
+            engine.run(format!("(define x {i})")).unwrap();
+            let compiler = engine.virtual_machine.compiler.read();
+            if compiler.symbol_map.free_list.shadowed_count() == 0 {
+                assert!(compiler.symbol_map.free_list.free_list.contains(&shadowed));
+                break;
+            }
+            assert!(i < 200, "shadowed slots were never recycled");
+        }
+        assert_eq!(
+            engine
+                .call_function_with_args(get_y.value().clone(), Vec::new())
+                .unwrap()
+                .to_string(),
+            "old"
+        );
+        drop((foreign, get_y));
+    }
+
+    // A value in a cell of another heap whose last copy, once a traversal has read and cleared
+    // the cell, records whether `engine`'s heap was locked when it was dropped. Returns the
+    // value to register in `engine` and the (dropped, locked) flags.
+    #[cfg(feature = "sync")]
+    fn foreign_copy_probe(
+        engine: &Engine,
+    ) -> (
+        crate::SteelVal,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use crate::{
+            rvals::{Custom, IntoSteelVal},
+            steel_vm::vm::HeapState,
+            values::closed::{Heap, HeapRef, MarkAndSweepContext},
+            SteelVal,
+        };
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Weak,
+        };
+
+        struct Probe {
+            heap: Weak<HeapState>,
+            dropped: Arc<AtomicBool>,
+            locked: Arc<AtomicBool>,
+        }
+        impl Custom for Probe {}
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let locked = self
+                    .heap
+                    .upgrade()
+                    .is_some_and(|heap| heap.try_lock().is_none());
+                self.locked.store(locked, Ordering::SeqCst);
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        // Clears the cell once a traversal has read it, as its own engine could meanwhile, so
+        // the traversal's copy is the payload's last reference.
+        struct Clearer(HeapRef<SteelVal>, #[allow(dead_code)] Heap);
+        impl Custom for Clearer {
+            fn gc_visit_children(&self, context: &mut MarkAndSweepContext) {
+                if let Some(cell) = self.0.inner.upgrade() {
+                    context.mark_heap_reference(&cell);
+                }
+                self.0.set_and_return(SteelVal::Void);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let locked = Arc::new(AtomicBool::new(false));
+        let probe = Probe {
+            heap: Arc::downgrade(&engine.virtual_machine.heap),
+            dropped: dropped.clone(),
+            locked: locked.clone(),
+        };
+        let mut foreign = Heap::new();
+        let cell = foreign.allocate_without_collection(probe.into_steelval().unwrap());
+        let clearer = Clearer(cell, foreign).into_steelval().unwrap();
+        (clearer, dropped, locked)
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn collections_release_copies_of_foreign_values_after_unlocking() {
+        use std::sync::atomic::Ordering;
+
+        let mut engine = Engine::new();
+        register_gc(&mut engine);
+        let (clearer, dropped, locked) = foreign_copy_probe(&engine);
+        engine.register_value("clearer", clearer);
+        engine.run("(probe-gc)").unwrap();
+        assert!(dropped.load(Ordering::SeqCst), "the copy was not released");
+        assert!(
+            !locked.load(Ordering::SeqCst),
+            "the copy was released under the heap lock"
+        );
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn recycling_releases_copies_of_foreign_values_after_unlocking() {
+        use std::sync::atomic::Ordering;
+
+        let mut engine = Engine::new_raw_no_kernel();
+        let (clearer, dropped, locked) = foreign_copy_probe(&engine);
+        engine.register_value("clearer", clearer);
+        // Redefining past the threshold recycles the shadowed slots.
+        for i in 0.. {
+            engine.run(format!("(define x {i})")).unwrap();
+            if dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            assert!(i < 200, "the copy was not released");
+        }
+        assert_eq!(
+            engine
+                .virtual_machine
+                .compiler
+                .read()
+                .symbol_map
+                .free_list
+                .shadowed_count(),
+            0,
+            "recycling released the copy"
+        );
+        assert!(
+            !locked.load(Ordering::SeqCst),
+            "the copy was released under the heap lock"
+        );
+    }
+
+    // `(build leaf n)` nests `n` levels of `(list acc acc)` around `leaf`, so a walk that
+    // visits each path separately takes 2^n steps. `(leaf v n)` reads the leaf back. Live
+    // collection still walks each path, so tests rooting these run in a child process.
+    const SHARED_DEPTH: usize = 40;
+    const SHARED_SUBLISTS: &str = "
+        (define (build acc n) (if (= n 0) acc (build (list acc acc) (- n 1))))
+        (define (leaf v n) (if (= n 0) v (leaf (car v) (- n 1))))";
+
+    fn shared_sublist_engine() -> Engine {
+        let mut engine = Engine::new_raw_no_kernel();
+        crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+        engine
+            .run(format!(
+                "(require-builtin steel/base) (require-builtin steel/meta) (require-builtin steel/threads)
+                 {SHARED_SUBLISTS}"
+            ))
+            .unwrap();
+        engine
+    }
+
+    #[test]
+    fn teardown_traces_shared_sublists_once() {
+        if !in_teardown_child("teardown_traces_shared_sublists_once") {
+            return;
+        }
+
+        let mut engine = shared_sublist_engine();
+        let results = engine
+            .run(format!(
+                "(define slices (let ((l (list (box 1) (box 2)))) (list l (cdr l) l)))
+                 (build (list (box 42)) {SHARED_DEPTH})"
+            ))
+            .unwrap();
+        let rooted = results.last().unwrap().as_rooted();
+        // Either slice can be traced first; each reaches its own cells.
+        let slices = engine.extract_value("slices").unwrap().as_rooted();
+        drop(results);
+        // A remaining handle makes the engine's drop trace the registered roots.
+        let heap = engine.virtual_machine.heap.clone_for_storage();
+        drop(engine);
+
+        let mut value = rooted.value().clone();
+        for _ in 0..SHARED_DEPTH {
+            let crate::SteelVal::ListV(list) = value else {
+                panic!("expected a list");
+            };
+            value = list.car().unwrap();
+        }
+        let crate::SteelVal::ListV(leaf) = value else {
+            panic!("expected the leaf list");
+        };
+        assert_eq!(
+            leaf.car().unwrap().as_box_to_inner(),
+            Some(crate::SteelVal::IntV(42))
+        );
+        let crate::SteelVal::ListV(slices_list) = slices.value().clone() else {
+            panic!("expected a list");
+        };
+        let boxes: Vec<_> = slices_list
+            .iter()
+            .flat_map(|slice| match slice {
+                crate::SteelVal::ListV(slice) => slice.iter().cloned().collect::<Vec<_>>(),
+                _ => panic!("expected a slice"),
+            })
+            .map(|cell| cell.as_box_to_inner())
+            .collect();
+        let [a, b, c, d, e] = [1, 2, 2, 1, 2].map(|x| Some(crate::SteelVal::IntV(x)));
+        assert_eq!(boxes, [a, b, c, d, e]);
+        drop((rooted, slices, heap));
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn joining_a_result_with_shared_sublists_from_another_heap() {
+        use crate::steel_vm::vm::threads::thread_finished;
+        use std::time::{Duration, Instant};
+
+        if !in_teardown_child("joining_a_result_with_shared_sublists_from_another_heap") {
+            return;
+        }
+
+        let mut collector = shared_sublist_engine();
+        let mut engine = shared_sublist_engine();
+        let worker = engine
+            .run(format!(
+                "(spawn-native-thread (lambda () (build (list (box 42)) {SHARED_DEPTH})))"
+            ))
+            .unwrap()
+            .pop()
+            .unwrap();
+        engine.enter_safepoint(|| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while thread_finished(&worker).unwrap() != crate::SteelVal::BoolV(true) {
+                assert!(Instant::now() < deadline, "worker did not finish");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        drop(engine);
+        collector.register_value("worker", worker);
+        assert_eq!(
+            collector
+                .run(format!(
+                    "(define joined (thread-join! worker))
+                     (unbox (car (leaf joined {SHARED_DEPTH})))"
+                ))
+                .unwrap()
+                .last(),
+            Some(&crate::SteelVal::IntV(42))
+        );
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn rooted_values_survive_teardown_while_a_thread_result_is_pending() {
+        use crate::steel_vm::vm::threads::thread_finished;
+        use std::{
+            sync::Arc,
+            time::{Duration, Instant},
+        };
+
+        let mut engine = Engine::new_raw_no_kernel();
+        crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+        let heap = Arc::downgrade(&engine.virtual_machine.heap);
+        let results = engine
+            .run(
+                "(require-builtin steel/meta)
+                 (require-builtin steel/threads)
+                 (define worker (spawn-native-thread (lambda () 0)))
+                 (box 42)",
+            )
+            .unwrap();
+        // A collection keeps a value held outside the heap only through a root, and so does
+        // teardown.
+        let rooted = results.last().unwrap().as_rooted();
+        drop(results);
+        let worker = engine.extract_value("worker").unwrap();
+        engine.enter_safepoint(|| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while thread_finished(&worker).unwrap() != crate::SteelVal::BoolV(true) {
+                assert!(Instant::now() < deadline, "worker did not finish");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        drop(engine);
+        assert!(
+            heap.upgrade().is_some(),
+            "the pending result keeps the heap"
+        );
+        assert_eq!(
+            rooted.value().as_box_to_inner(),
+            Some(crate::SteelVal::IntV(42))
+        );
+        drop(rooted);
+        drop(worker);
+        assert!(heap.upgrade().is_none());
     }
 
     #[cfg(feature = "sync")]
@@ -2187,7 +3087,8 @@ mod embedding_regressions {
             assert_eq!(Arc::strong_count(&count), 12);
             drop(workers);
             engine.run("(probe-gc)").unwrap();
-            // Other collectors can briefly retain a snapshot of these results.
+            // Collectors in concurrently running tests trace every registered root, including
+            // these pending results, and hold copies until their own pass ends.
             let deadline = Instant::now() + Duration::from_secs(10);
             while Arc::strong_count(&count) != 2 {
                 assert!(
@@ -2530,7 +3431,7 @@ mod embedding_regressions {
 
     #[cfg(feature = "sync")]
     fn check_other_thread_allocations(constructor: &str, reader: &str, recycle: bool) {
-        use crate::steel_vm::{register_fn::RegisterFn, vm::threads::thread_join};
+        use crate::steel_vm::register_fn::RegisterFn;
         use std::{
             panic::{catch_unwind, AssertUnwindSafe},
             time::Duration,
@@ -2584,7 +3485,7 @@ mod embedding_regressions {
         engine.virtual_machine.synchronizer.resume_threads();
         let retained = engine
             .virtual_machine
-            .enter_safepoint(|_| thread_join(&worker));
+            .enter_safepoint(|_| join_thread(&worker));
 
         assert_eq!(
             allocation.unwrap().last(),
@@ -2615,7 +3516,7 @@ mod embedding_regressions {
     #[cfg(feature = "sync")]
     #[test]
     fn other_thread_finalizers_record_eligibility_before_retention() {
-        use crate::steel_vm::{register_fn::RegisterFn, vm::threads::thread_join};
+        use crate::steel_vm::register_fn::RegisterFn;
         use std::{
             panic::{catch_unwind, AssertUnwindSafe},
             time::Duration,
@@ -2670,7 +3571,7 @@ mod embedding_regressions {
             .enter_safepoint(|_| result_rx.recv_timeout(Duration::from_secs(10)));
         let joined = engine
             .virtual_machine
-            .enter_safepoint(|_| thread_join(&worker));
+            .enter_safepoint(|_| join_thread(&worker));
 
         collection.unwrap();
         assert_eq!(result.unwrap(), 42);

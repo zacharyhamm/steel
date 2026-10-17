@@ -142,6 +142,16 @@ impl Custom for BuiltInModule {
             self.name().as_ref().to_owned(),
         ))
     }
+
+    // Exports stay callable before they are imported. An exported struct constructor,
+    // predicate, or accessor keeps its type's properties reachable.
+    fn gc_visit_children(&self, context: &mut crate::values::closed::MarkAndSweepContext) {
+        use crate::rvals::cycles::BreadthFirstSearchSteelValVisitor;
+
+        for value in self.module.read().values.values() {
+            context.push_back(value.clone());
+        }
+    }
 }
 
 impl RegisterValue for BuiltInModule {

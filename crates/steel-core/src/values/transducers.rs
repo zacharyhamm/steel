@@ -54,6 +54,45 @@ pub enum Transducers {
     MapPair(SteelVal),
 }
 
+impl Transducers {
+    // The function, count, or collection this operation holds.
+    pub(crate) fn value(&self) -> Option<&SteelVal> {
+        match self {
+            Transducers::Map(value)
+            | Transducers::Filter(value)
+            | Transducers::Take(value)
+            | Transducers::Drop(value)
+            | Transducers::FlatMap(value)
+            | Transducers::Window(value)
+            | Transducers::TakeWhile(value)
+            | Transducers::DropWhile(value)
+            | Transducers::Extend(value)
+            | Transducers::Zipping(value)
+            | Transducers::Interleaving(value)
+            | Transducers::MapPair(value) => Some(value),
+            Transducers::Flatten | Transducers::Cycle | Transducers::Enumerating => None,
+        }
+    }
+
+    pub(crate) fn value_mut(&mut self) -> Option<&mut SteelVal> {
+        match self {
+            Transducers::Map(value)
+            | Transducers::Filter(value)
+            | Transducers::Take(value)
+            | Transducers::Drop(value)
+            | Transducers::FlatMap(value)
+            | Transducers::Window(value)
+            | Transducers::TakeWhile(value)
+            | Transducers::DropWhile(value)
+            | Transducers::Extend(value)
+            | Transducers::Zipping(value)
+            | Transducers::Interleaving(value)
+            | Transducers::MapPair(value) => Some(value),
+            Transducers::Flatten | Transducers::Cycle | Transducers::Enumerating => None,
+        }
+    }
+}
+
 // This should just describe how a sequence of values can be reduced
 // assert that the function passed in has an arity of 2
 // and the initival

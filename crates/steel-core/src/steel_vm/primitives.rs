@@ -1467,9 +1467,18 @@ pub fn equalp(left: &SteelVal, right: &SteelVal) -> Result<SteelVal> {
     Ok(SteelVal::BoolV(left == right))
 }
 
+/// Checks two values for equivalence. Numbers are compared by value and exactness, and
+/// other values as with `eq?`.
+///
+/// # Examples
+/// ```scheme
+/// (eqv? (expt 10 30) (expt 10 30)) ;; => #t
+/// (eqv? 1/2 0.5) ;; => #f
+/// (eqv? (list 10) (list 10)) ;; => #f
+/// ```
 #[steel_derive::function(name = "eqv?")]
 pub fn eqv(left: &SteelVal, right: &SteelVal) -> Result<SteelVal> {
-    Ok(SteelVal::BoolV(left.ptr_eq(&right)))
+    Ok(SteelVal::BoolV(left.eqv(right)))
 }
 
 fn equality_module() -> BuiltInModule {

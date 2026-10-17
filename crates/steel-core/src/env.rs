@@ -147,6 +147,15 @@ impl Env {
     pub fn roots(&self) -> &Vec<SteelVal> {
         &self.bindings_vec
     }
+
+    pub(crate) fn roots_mut(&mut self) -> &mut [SteelVal] {
+        &mut self.bindings_vec
+    }
+
+    // Cloning already copies the bindings.
+    pub fn deep_clone(&self) -> Self {
+        self.clone()
+    }
 }
 
 #[cfg(feature = "sync")]
@@ -224,6 +233,11 @@ impl Env {
     #[cfg(feature = "sync")]
     pub fn roots(&self) -> &[SteelVal] {
         self.bindings.0.as_slice()
+    }
+
+    // Copies a shared buffer before handing out mutable access.
+    pub(crate) fn roots_mut(&mut self) -> &mut [SteelVal] {
+        self.bindings.0.as_mut_slice()
     }
 
     #[cfg(not(feature = "sync"))]

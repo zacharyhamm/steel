@@ -63,3 +63,88 @@ regressions.
 - `src/rvals.rs`: expose a read-only `SteelByteVector::with_bytes` borrowing method.
   The host bridge can decode and transmit binary values without expanding each byte into
   a Scheme integer or JSON number. The callback cannot retain the borrowed slice.
+
+- `src/steel_vm/engine.rs`, `src/steel_vm/vm.rs`, and `src/values/closed.rs`: give
+  `Engine::deep_clone` an isolated heap. The copied cells were unreferenced while the
+  clone's globals kept pointing into the template heap, so every kernel clone shared
+  template boxes and lost them when the template's heap was torn down. The copy now
+  rewrites references reachable from the clone's globals, cells, closures, boxes,
+  streams, transducers, and reducers into its own cells. Continuations and iterators over
+  collections are copied like boxes; an iterator's remaining items are taken once, and the
+  template's iterator yields the same items afterward. Custom values and opaque iterators
+  stay shared, so `#%global-will-executor` is shared while `#%will-executor-running` is per
+  clone. The copy roots each shared value that still reaches a template cell and keeps
+  the template's heap, so those values stay valid after the template drops and keep
+  sharing its state. Lists are matched by their whole node,
+  including the tail, because appending shares the prefix's storage and offset. A list's
+  suffixes become views of the rebuilt longest list that contains them, in whichever
+  order they are reached, so a retained `cdr` stays `eq?` to the copy's `cdr`. Two lists
+  that share a tail only through a linked node are rebuilt separately, because im-lists
+  cannot link a new node to an existing view. A closure's contract can refer back to the
+  closure, so it is remapped after the rest of the graph and attached to the closure's
+  copy. Kernel struct property maps still refer to the template heap.
+
+- `src/values/structs.rs`, `src/values/closed.rs`, and `src/steel_vm/builtin.rs`: trace
+  a struct type's properties only when a collection reaches one of its instances, its
+  descriptor, its constructor, predicate, or accessors, or a `serialize-value` result
+  that refers to it. A registered builtin module traces its values, so a struct function
+  exported before it is imported keeps its type's properties. Rooting every vtable entry
+  pinned the properties of each evaluated local `struct`
+  form forever and grew every collection's root set. Same-named types sent to another
+  thread resolve to their own descriptor, then to the newest match. Deserialization
+  reuses the matched type's current properties, so bytes from `serialized->bytes` alone
+  do not keep them; Yinz does not use these functions.
+
+- `src/rvals.rs`: `eq?` and `eqv?` compare boxes, structs, syntax objects, iterators,
+  references, big rationals, and complex numbers by identity, and small rationals by
+  value, which constant interning also relies on. They previously returned `#f` even
+  for the same object.
+
+- `src/rvals.rs` and `src/steel_vm/primitives.rs`: `eqv?` compares big integers, big
+  rationals, and complex numbers by value and exactness, as R7RS requires. Comparing them
+  by identity missed equal numbers, so `memv` and `assv` did not find matching keys. `eq?`
+  and constant interning still compare them by identity.
+
+- `src/values/lists.rs`, `src/rvals/cycles.rs`, and `src/values/closed.rs`: drop lists
+  without im-lists' thread-local empty list once that storage is destroyed. Rust does not
+  specify thread-local destructor order, so a thread-local that still owns lists, such as
+  the vtable, the root table, or an engine stored by the host, can be destroyed after it;
+  draining then aborted the thread. A probe list kept in that storage records when it is
+  destroyed. From then on, each list's elements are cloned out before its nodes are
+  released, so nested lists are still released iteratively. Other drops keep draining,
+  which stops at shared nodes. A root released after the root table is ignored.
+
+- `src/steel_vm/vm/threads.rs` and `src/values/closed.rs`: `thread-join!` copies a result
+  from another heap into the joining thread's heap. A pending result's heap is freed once
+  its handle is released, so the joined value pointed into a freed heap. Shared values that
+  still reach the result's heap keep it, as in deep clones. A join on the same heap is
+  unchanged. A closure keeps its engine's global slots, so calling one in an unrelated
+  engine is still unsupported. The copy traces each value once, as teardown does.
+
+- `src/steel_vm/vm.rs` and `src/values/closed.rs`: a closed heap keeps what the registered
+  roots reach, the same values a live collection keeps for holders outside the heap. A
+  value held by another engine or the host stays valid only while its heap is alive and a
+  root reaches it; values meant to outlive their engine are rooted, joined, or deep cloned.
+  Teardown traces each value once, and a list by its whole node, since two slices can
+  share an address; walking each path through lists that share sublists took time
+  exponential in their depth. Live collection and global-slot recycling still walk a list
+  once per path.
+
+- `src/compiler/compiler.rs`, `src/values/closed.rs`, and `src/steel_vm/engine.rs`: a
+  closure reached only through a registered root keeps its global slots from recycling
+  only if its compiler generated it. The compiler records the ids of the functions it
+  generates, and of deserialized ones. Roots are process-wide in sync builds and
+  per-thread otherwise, so other engines' rooted closures kept this engine's shadowed slots
+  with the same numbers. Engines deep cloned from one template still share the ids
+  generated before the clone. Closures reached from the globals keep their slots as before.
+
+- `src/values/closed.rs` and `src/steel_vm/vm.rs`: a collection releases the copies it
+  makes of values it does not own once the heap is unlocked, and global-slot recycling once
+  the heap and environment are unlocked. Another engine or thread can replace the original
+  while the copy is held, so dropping the copy can run that value's destructor, which
+  could deadlock if it reentered this heap. Collections in sync builds still trace every
+  registered root, so they briefly hold copies of other engines' values.
+
+- `src/rvals/cycles.rs`: a pair whose fields cannot recurse skips the drop buffer. Car
+  is released before cdr is classified, so a child held by both fields still drains
+  iteratively when its last reference goes.

@@ -237,7 +237,7 @@ impl core::fmt::Display for UserDefinedStruct {
 }
 
 impl UserDefinedStruct {
-    fn new(type_descriptor: StructTypeDescriptor, raw_fields: &[SteelVal]) -> Self {
+    pub(crate) fn new(type_descriptor: StructTypeDescriptor, raw_fields: &[SteelVal]) -> Self {
         // let mut fields: Recycle<Vec<_>> = Recycle::new();
         let mut fields: Recycle<SmallVec<[SteelVal; 4]>> = Recycle::new();
         // fields.extend_from_slice(raw_fields);
@@ -604,7 +604,7 @@ pub(crate) fn make_immutable_struct_type(args: &[SteelVal]) -> Result<SteelVal> 
     }
     let count = *count as usize;
     let (descriptor, _, _, _, _) = make_struct_type_inner(name.as_str(), count, None);
-    Ok(SteelVal::BoxedFunction(Gc::new(BoxedDynFunction::new(
+    let binding = SteelVal::BoxedFunction(Gc::new(BoxedDynFunction::new(
         Arc::new(move |args| {
             let [SteelVal::IntV(index)] = args else {
                 stop!(TypeMismatch => "immutable struct binding expects one index")
@@ -621,7 +621,9 @@ pub(crate) fn make_immutable_struct_type(args: &[SteelVal]) -> Result<SteelVal> 
         }),
         Some("immutable-struct-binding"),
         Some(1),
-    ))))
+    )));
+    register_struct_functions(descriptor, [&binding]);
+    Ok(binding)
 }
 
 pub fn make_struct_type(args: &[SteelVal]) -> Result<SteelVal> {
@@ -683,6 +685,54 @@ struct SteelStructTypePayload {
 #[cfg(feature = "sync")]
 static STRUCT_MAP: Lazy<Mutex<FxHashMap<StructTypeDescriptor, SteelStructTypePayload>>> =
     Lazy::new(|| Mutex::new(Default::default()));
+
+// Struct functions capture their descriptor in an opaque closure, so collection finds the
+// type through the function's address. Owning each function keeps that address unique.
+#[cfg(feature = "sync")]
+static STRUCT_FUNCTIONS: Lazy<Mutex<FxHashMap<usize, (StructTypeDescriptor, SteelVal)>>> =
+    Lazy::new(|| Mutex::new(Default::default()));
+
+thread_local! {
+    #[cfg(not(feature = "sync"))]
+    static STRUCT_FUNCTIONS: RefCell<FxHashMap<usize, (StructTypeDescriptor, SteelVal)>> =
+        RefCell::new(Default::default());
+}
+
+fn register_struct_functions<'a>(
+    descriptor: StructTypeDescriptor,
+    functions: impl IntoIterator<Item = &'a SteelVal>,
+) {
+    let entries = functions.into_iter().filter_map(|function| match function {
+        SteelVal::BoxedFunction(f) => Some((f.as_ptr() as usize, (descriptor, function.clone()))),
+        _ => None,
+    });
+
+    #[cfg(feature = "sync")]
+    STRUCT_FUNCTIONS.lock().extend(entries);
+
+    #[cfg(not(feature = "sync"))]
+    STRUCT_FUNCTIONS.with_borrow_mut(|map| map.extend(entries));
+}
+
+pub(crate) fn struct_function_descriptor(
+    function: &Gc<BoxedDynFunction>,
+) -> Option<StructTypeDescriptor> {
+    let address = function.as_ptr() as usize;
+
+    #[cfg(feature = "sync")]
+    {
+        STRUCT_FUNCTIONS.lock().get(&address).map(|(d, _)| *d)
+    }
+
+    // Collection can run while thread-local storage is being torn down.
+    #[cfg(not(feature = "sync"))]
+    {
+        STRUCT_FUNCTIONS
+            .try_with(|map| map.try_borrow().ok()?.get(&address).map(|(d, _)| *d))
+            .ok()
+            .flatten()
+    }
+}
 
 #[cfg(feature = "sync")]
 pub fn fetch_from_type_map(
@@ -829,6 +879,13 @@ fn make_struct_type_inner(
         ));
     }
 
+    register_struct_functions(
+        struct_type_descriptor,
+        [&struct_constructor, &struct_predicate, &getter_prototype]
+            .into_iter()
+            .chain(&getter_prototypes),
+    );
+
     // Just find all the structs that we need?
     #[cfg(feature = "sync")]
     {
@@ -890,29 +947,34 @@ pub struct VTable {
 }
 
 impl VTable {
-    // Release the table lock before traversing properties, which can refer back to structs.
+    // Callers traverse the returned map after the table lock is released.
     #[cfg(feature = "sync")]
-    pub(crate) fn property_maps_snapshot() -> Vec<Gc<HashMap<SteelVal, SteelVal>>> {
+    pub(crate) fn properties(
+        descriptor: StructTypeDescriptor,
+    ) -> Option<Gc<HashMap<SteelVal, SteelVal>>> {
         STATIC_VTABLE
             .read()
             .entries
-            .iter()
+            .get(descriptor.0)
             .map(|entry| entry.properties.clone())
-            .collect()
     }
 
+    // Collection can run while thread-local storage is being torn down.
     #[cfg(not(feature = "sync"))]
-    pub(crate) fn property_maps_snapshot() -> Vec<Gc<HashMap<SteelVal, SteelVal>>> {
+    pub(crate) fn properties(
+        descriptor: StructTypeDescriptor,
+    ) -> Option<Gc<HashMap<SteelVal, SteelVal>>> {
         VTABLE
             .try_with(|table| {
                 table
-                    .borrow()
+                    .try_borrow()
+                    .ok()?
                     .entries
-                    .iter()
+                    .get(descriptor.0)
                     .map(|entry| entry.properties.clone())
-                    .collect()
             })
-            .unwrap_or_default()
+            .ok()
+            .flatten()
     }
 
     fn insert(name: InternedString, options: Gc<HashMap<SteelVal, SteelVal>>) {
@@ -923,38 +985,32 @@ impl VTable {
         VTABLE.with(|x| x.borrow().map.get(name).cloned())
     }
 
-    #[cfg(feature = "sync")]
-    pub fn get_by_sendable_entry(entry: &SendableVTableEntry) -> Option<StructTypeDescriptor> {
-        let guard = STATIC_VTABLE.read();
-
-        for (idx, existing_entry) in guard.entries.iter().enumerate() {
-            if existing_entry.module.as_ref().map(|x| x.as_str())
+    // Re-evaluated local struct forms share a name, and older types may be unreachable.
+    fn find_sendable_entry(
+        entries: &[VTableEntry],
+        entry: &SendableVTableEntry,
+    ) -> Option<StructTypeDescriptor> {
+        let matches = |existing: &VTableEntry| {
+            existing.module.as_ref().map(|x| x.as_str())
                 == entry.module.as_ref().map(|x| x.as_str())
-                && existing_entry.name == entry.name
-            {
-                return Some(StructTypeDescriptor(idx));
-            }
+                && existing.name == entry.name
+        };
+
+        if entries.get(entry.desc.0).is_some_and(matches) {
+            return Some(entry.desc);
         }
 
-        None
+        entries.iter().rposition(matches).map(StructTypeDescriptor)
+    }
+
+    #[cfg(feature = "sync")]
+    pub fn get_by_sendable_entry(entry: &SendableVTableEntry) -> Option<StructTypeDescriptor> {
+        Self::find_sendable_entry(&STATIC_VTABLE.read().entries, entry)
     }
 
     #[cfg(not(feature = "sync"))]
     pub fn get_by_sendable_entry(entry: &SendableVTableEntry) -> Option<StructTypeDescriptor> {
-        VTABLE.with(|x| {
-            let guard = x.borrow();
-
-            for (idx, existing_entry) in guard.entries.iter().enumerate() {
-                if existing_entry.module.as_ref().map(|x| x.as_str())
-                    == entry.module.as_ref().map(|x| x.as_str())
-                    && existing_entry.name == entry.name
-                {
-                    return Some(StructTypeDescriptor(idx));
-                }
-            }
-
-            None
-        })
+        VTABLE.with(|x| Self::find_sendable_entry(&x.borrow().entries, entry))
     }
 
     #[cfg(feature = "sync")]
@@ -1242,9 +1298,6 @@ thread_local! {
     // The only way that can happen is if a struct is constructed on another thread?
     // The value inside should explicitly be a thread safe value.
     pub static VTABLE: Rc<RefCell<VTable>> = {
-        // Initialize list storage first so it outlives property lists in this table.
-        let _ = List::<SteelVal>::new();
-
         let mut map = rustc_hash::FxHashMap::default();
 
         #[cfg(all(feature = "sync", not(feature = "imbl")))]

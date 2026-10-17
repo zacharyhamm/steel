@@ -55,8 +55,8 @@ use super::{
     functions::BoxedDynFunction,
     lazy_stream::LazyStream,
     port::SteelPort,
-    structs::{UserDefinedStruct, VTable},
-    transducers::{Reducer, Transducer},
+    structs::{struct_function_descriptor, StructTypeDescriptor, UserDefinedStruct, VTable},
+    transducers::{Reducer, ReducerFunc, Transducer, Transducers},
 };
 
 #[cfg(feature = "sync")]
@@ -66,7 +66,7 @@ use super::lists::Pair;
 use super::Vector;
 
 #[derive(Default)]
-pub struct GlobalSlotRecycler {
+pub struct GlobalSlotRecycler<'a> {
     // Use a hashset to check for free slots.
     // The idea here is that a collection will traverse
     // all active values (excluding roots with this index)
@@ -82,34 +82,51 @@ pub struct GlobalSlotRecycler {
 
     queue: Vec<SteelVal>,
     visited: rustc_hash::FxHashSet<usize>,
+    struct_types: ReachedStructTypes,
+
+    // While tracing registered roots, the functions whose closures keep their global slots.
+    // Roots can hold other engines' closures, which refer to their own engines' slots.
+    rooted_functions: Option<&'a rustc_hash::FxHashSet<u32>>,
+
+    // Every traversed value. A copy can outlive its source once another thread replaces
+    // it, so its destructor runs after the heap and environment are unlocked.
+    released: Vec<SteelVal>,
 
     #[cfg(feature = "sync")]
     will_executors: Vec<GcMut<Box<dyn CustomType>>>,
 }
 
-impl GlobalSlotRecycler {
+impl<'a> GlobalSlotRecycler<'a> {
+    /// Returns the traversed values, to drop once the heap and environment are unlocked.
+    #[must_use]
     pub fn free_shadowed_rooted_values(
         roots: &mut [SteelVal],
         symbol_map: &mut SymbolMap,
+        function_ids: &'a rustc_hash::FxHashSet<u32>,
         heap: &mut Heap,
-    ) {
+    ) -> Vec<SteelVal> {
         let mut recycler = GlobalSlotRecycler::default();
 
-        recycler.recycle(roots, symbol_map, heap);
+        recycler.recycle(roots, symbol_map, function_ids, heap)
     }
 
     // TODO:
     // Take the global roots, without the shadowed values, and iterate over them,
     // push the values back, visit, mark visited, move on.
+    /// `function_ids` are the functions generated for these global slots. Returns the traversed
+    /// values, to drop once the heap and environment are unlocked.
+    #[must_use]
     pub fn recycle(
         &mut self,
         roots: &mut [SteelVal],
         symbol_map: &mut SymbolMap,
+        function_ids: &'a rustc_hash::FxHashSet<u32>,
         _heap: &mut Heap,
-    ) {
+    ) -> Vec<SteelVal> {
         self.slots.clear();
         self.queue.clear();
         self.visited.clear();
+        self.struct_types.clear();
         #[cfg(feature = "sync")]
         self.will_executors.clear();
 
@@ -129,23 +146,31 @@ impl GlobalSlotRecycler {
                 self.push_back(root.clone());
             }
         }
+        self.visit();
+
+        // Values reached first through a registered root keep only this compiler's slots.
+        self.rooted_functions = Some(function_ids);
         for root in persistent_roots_snapshot() {
             self.push_back(root);
         }
-
         self.visit();
+        self.rooted_functions = None;
+
         // An early exit must not leave roots or visited cells for the next pass.
-        self.queue.clear();
+        self.released.append(&mut self.queue);
         self.visited.clear();
+        self.struct_types.clear();
         #[cfg(feature = "sync")]
         self.will_executors.clear();
 
         for index in self.slots.drain() {
             if index < roots.len() {
                 symbol_map.free_list.free_list.push(index);
-                roots[index] = SteelVal::Void;
+                self.released
+                    .push(core::mem::replace(&mut roots[index], SteelVal::Void));
             }
         }
+        core::mem::take(&mut self.released)
     }
 }
 
@@ -192,6 +217,7 @@ fn recycling_preserves_heap_state_and_clears_pending_traversal() {
         false,
         Default::default(),
     )));
+    let functions = Default::default();
     let mut recycler = GlobalSlotRecycler::default();
     let mut symbols = SymbolMap::new();
     // No candidates, a complete pass, and a pass that exits with pending roots.
@@ -203,7 +229,7 @@ fn recycling_preserves_heap_state_and_clears_pending_traversal() {
             closure.clone(),
         ];
         symbols.free_list.shadowed_slots.extend(candidate);
-        recycler.recycle(&mut roots, &mut symbols, &mut heap);
+        drop(recycler.recycle(&mut roots, &mut symbols, &functions, &mut heap));
         assert_eq!(roots[0], SteelVal::IntV(1));
         assert_eq!(
             roots[1],
@@ -269,8 +295,10 @@ fn recycling_traces_registered_closures_and_custom_heap_cycles() {
     use crate::core::instructions::DenseInstruction;
 
     let mut heap = Heap::new();
+    // An id no compiled function has, so roots from concurrent tests cannot keep it.
+    let id = u32::MAX;
     let closure = SteelVal::Closure(Gc::new(ByteCodeLambda::new(
-        0,
+        id,
         vec![DenseInstruction::new(
             OpCode::PUSH,
             crate::core::instructions::u24::from_usize(0),
@@ -290,18 +318,63 @@ fn recycling_traces_registered_closures_and_custom_heap_cycles() {
     .unwrap();
     vector.set_interior_mut(vec![custom.clone()]);
     let registered = custom.as_rooted();
+    let functions = [id].into_iter().collect();
     let mut recycler = GlobalSlotRecycler::default();
     let mut symbols = SymbolMap::new();
     let mut roots = [SteelVal::IntV(42), SteelVal::IntV(99)];
     for _ in 0..2 {
         symbols.free_list.shadowed_slots.extend([0, 1]);
-        recycler.recycle(&mut roots, &mut symbols, &mut heap);
+        drop(recycler.recycle(&mut roots, &mut symbols, &functions, &mut heap));
         assert_eq!(roots, [SteelVal::IntV(42), SteelVal::Void]);
         assert!(value.strong_ptr().read().reachable);
         assert!(vector.strong_ptr().read().reachable);
     }
     vector.set_interior_mut(vec![]);
     drop(registered);
+}
+
+#[test]
+fn recycling_keeps_slots_only_for_rooted_closures_of_this_compiler() {
+    use crate::core::instructions::{u24, DenseInstruction};
+
+    // Ids no compiled function has, so roots from concurrent tests cannot keep these slots.
+    const OWNED: u32 = u32::MAX - 1;
+    const FOREIGN: u32 = u32::MAX - 2;
+    let closure = |id, slot| {
+        SteelVal::Closure(Gc::new(ByteCodeLambda::new(
+            id,
+            vec![DenseInstruction::new(OpCode::PUSH, u24::from_usize(slot))].into(),
+            0,
+            false,
+            Default::default(),
+        )))
+    };
+    let rooted = [closure(OWNED, 0), closure(FOREIGN, 1)].map(|closure| closure.as_rooted());
+    let functions = [OWNED].into_iter().collect();
+    let mut heap = Heap::new();
+    let mut symbols = SymbolMap::new();
+    // A global's closure keeps its slot whichever compiler generated it.
+    let mut roots = [
+        SteelVal::IntV(0),
+        SteelVal::IntV(1),
+        SteelVal::IntV(2),
+        closure(FOREIGN, 2),
+    ];
+    symbols.free_list.shadowed_slots.extend([0, 1, 2]);
+    let released = GlobalSlotRecycler::free_shadowed_rooted_values(
+        &mut roots,
+        &mut symbols,
+        &functions,
+        &mut heap,
+    );
+    assert_eq!(
+        roots[..3],
+        [SteelVal::IntV(0), SteelVal::Void, SteelVal::IntV(2)]
+    );
+    assert_eq!(symbols.free_list.free_list, [1]);
+    // The freed slot's value is released with the traversed values.
+    assert!(released.contains(&SteelVal::IntV(1)));
+    drop(rooted);
 }
 
 #[test]
@@ -329,6 +402,7 @@ fn global_slot_recycling_traces_receiver_cycles_once_per_pass() {
     channel_send(&channels.sender(), receiver.clone()).unwrap();
     channel_send(&channels.sender(), payload.clone()).unwrap();
 
+    let functions = Default::default();
     let mut recycler = GlobalSlotRecycler::default();
     let mut symbol_map = SymbolMap::new();
     let mut heap = Heap::new();
@@ -336,7 +410,7 @@ fn global_slot_recycling_traces_receiver_cycles_once_per_pass() {
     for pass in 1..=2 {
         roots[1] = SteelVal::IntV(42);
         symbol_map.free_list.shadowed_slots.push(1);
-        recycler.recycle(&mut roots, &mut symbol_map, &mut heap);
+        drop(recycler.recycle(&mut roots, &mut symbol_map, &functions, &mut heap));
         assert_eq!(roots[1], SteelVal::Void);
         assert_eq!(symbol_map.free_list.free_list.pop(), Some(1));
         assert_eq!(count.load(Ordering::SeqCst), pass);
@@ -358,7 +432,7 @@ fn global_slot_recycling_traces_receiver_cycles_once_per_pass() {
     }
 }
 
-impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
+impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler<'_> {
     type Output = ();
 
     fn default_output(&mut self) -> Self::Output {}
@@ -371,6 +445,7 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
         use SteelVal::*;
 
         while let Some(value) = self.pop_front() {
+            self.released.push(value.clone());
             if self.slots.is_empty() {
                 return;
             }
@@ -420,6 +495,14 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
     fn push_back(&mut self, value: SteelVal) {
         // TODO: Determine if all numbers should push back.
         match &value {
+            SteelVal::BoxedFunction(function) => {
+                if let Some(properties) = self.struct_types.function_properties(function) {
+                    self.push_back(properties);
+                }
+                // Native functions and futures can run arbitrary code when dropped.
+                self.released.push(value);
+            }
+            SteelVal::FutureFunc(_) | SteelVal::FutureV(_) => self.released.push(value),
             SteelVal::BoolV(_)
             | SteelVal::NumV(_)
             | SteelVal::IntV(_)
@@ -428,9 +511,6 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
             | SteelVal::StringV(_)
             | SteelVal::FuncV(_)
             | SteelVal::SymbolV(_)
-            | SteelVal::FutureFunc(_)
-            | SteelVal::FutureV(_)
-            | SteelVal::BoxedFunction(_)
             | SteelVal::MutFunc(_)
             | SteelVal::BuiltIn(_)
             | SteelVal::ByteVector(_)
@@ -481,7 +561,12 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
                 | OpCode::CALLGLOBALTAIL
                 | OpCode::CALLGLOBALNOARITY
                 | OpCode::CALLGLOBALTAILNOARITY => {
-                    self.slots.remove(&(instruction.payload_size.to_usize()));
+                    if self
+                        .rooted_functions
+                        .is_none_or(|functions| functions.contains(&closure.id))
+                    {
+                        self.slots.remove(&(instruction.payload_size.to_usize()));
+                    }
                 }
                 _ => {}
             }
@@ -534,10 +619,18 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
             return;
         }
 
+        let Some(custom) = read_custom_type(&custom_type) else {
+            return;
+        };
+        let properties = self
+            .struct_types
+            .descriptor_properties(custom.as_ref());
+        if let Some(properties) = properties {
+            self.push_back(properties);
+        }
+
         #[cfg(feature = "sync")]
-        if read_custom_type(&custom_type)
-            .is_some_and(|custom| custom.as_any_ref().is::<WillExecutor>())
-        {
+        if custom.as_any_ref().is::<WillExecutor>() {
             self.will_executors.push(custom_type.clone());
         }
 
@@ -546,11 +639,14 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
             stats: MarkAndSweepStats::default(),
             visited: core::mem::take(&mut self.visited),
             owned: None,
-            teardown: false,
+            trace_once: false,
+            visited_lists: Default::default(),
+            struct_types: core::mem::take(&mut self.struct_types),
         };
 
-        visit_custom_children(&custom_type, &mut queue);
+        custom.visit_children(&mut queue);
         self.visited = queue.visited;
+        self.struct_types = queue.struct_types;
     }
 
     fn visit_float(&mut self, _float: f64) -> Self::Output {}
@@ -629,6 +725,9 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler {
     fn visit_reference_value(&mut self, _reference: Gc<OpaqueReference<'static>>) -> Self::Output {}
 
     fn visit_steel_struct(&mut self, steel_struct: Gc<UserDefinedStruct>) -> Self::Output {
+        if let Some(properties) = self.struct_types.properties(steel_struct.type_descriptor) {
+            self.push_back(properties);
+        }
         for field in steel_struct.fields.iter() {
             self.push_back(field.clone());
         }
@@ -695,10 +794,10 @@ thread_local! {
 #[cfg(feature = "sync")]
 static GLOBAL_ROOTS: Lazy<Mutex<Roots>> = Lazy::new(|| Mutex::new(Roots::default()));
 
-// Snapshot both registries before traversing values that can reenter them.
+// Snapshot the registry before traversing values that can reenter it.
 fn persistent_roots_snapshot() -> Vec<SteelVal> {
     #[cfg(feature = "sync")]
-    let mut roots: Vec<_> = GLOBAL_ROOTS
+    let roots = GLOBAL_ROOTS
         .lock()
         .unwrap()
         .roots
@@ -706,15 +805,37 @@ fn persistent_roots_snapshot() -> Vec<SteelVal> {
         .cloned()
         .collect();
     #[cfg(not(feature = "sync"))]
-    let mut roots: Vec<_> = ROOTS
+    let roots = ROOTS
         .try_with(|roots| roots.borrow().roots.values().cloned().collect())
         .unwrap_or_default();
-    roots.extend(
-        VTable::property_maps_snapshot()
-            .into_iter()
-            .map(|map| SteelVal::HashMapV(map.into())),
-    );
     roots
+}
+
+// A struct type's properties are reachable only through its instances, its descriptor
+// value, its constructor, predicate, and accessors, and values serialized from them.
+#[derive(Default)]
+pub(crate) struct ReachedStructTypes(rustc_hash::FxHashSet<StructTypeDescriptor>);
+
+impl ReachedStructTypes {
+    // Returns the property map the first time a traversal reaches the type.
+    fn properties(&mut self, descriptor: StructTypeDescriptor) -> Option<SteelVal> {
+        if !self.0.insert(descriptor) {
+            return None;
+        }
+        VTable::properties(descriptor).map(|map| SteelVal::HashMapV(map.into()))
+    }
+
+    fn function_properties(&mut self, function: &Gc<BoxedDynFunction>) -> Option<SteelVal> {
+        self.properties(struct_function_descriptor(function)?)
+    }
+
+    fn descriptor_properties(&mut self, custom_type: &dyn CustomType) -> Option<SteelVal> {
+        self.properties(*custom_type.as_any_ref().downcast_ref()?)
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
 }
 
 #[derive(Default)]
@@ -732,8 +853,9 @@ pub struct RootToken {
 
 impl Drop for RootToken {
     fn drop(&mut self) {
+        // A root can be released by another thread-local's destructor after the table's.
         #[cfg(not(feature = "sync"))]
-        let value = ROOTS.with(|x| x.borrow_mut().free(self));
+        let value = ROOTS.try_with(|x| x.borrow_mut().free(self)).ok().flatten();
 
         #[cfg(feature = "sync")]
         let value = GLOBAL_ROOTS.lock().unwrap().free(self);
@@ -1124,7 +1246,7 @@ mod will_tests {
     }
 
     #[test]
-    fn struct_properties_remain_ordinary_will_roots() {
+    fn struct_properties_follow_type_reachability() {
         let mut engine = engine_with_gc();
         engine
             .run(
@@ -1136,10 +1258,6 @@ mod will_tests {
                      (holder)))",
             )
             .unwrap();
-        let descriptor = match engine.extract_value("owner").unwrap() {
-            SteelVal::CustomStruct(owner) => owner.type_descriptor,
-            _ => panic!("expected a struct"),
-        };
         for _ in 0..3 {
             engine.run("(probe-gc)").unwrap();
             assert_eq!(readiness(&engine, "executor"), [false]);
@@ -1151,14 +1269,6 @@ mod will_tests {
             );
         }
         engine.run("(set! owner #f)").unwrap();
-        engine.run("(probe-gc) (probe-gc)").unwrap();
-        assert_eq!(readiness(&engine, "executor"), [false]);
-
-        crate::values::structs::VTable::set_entry(
-            &descriptor,
-            None,
-            Gc::new(crate::values::HashMap::new()),
-        );
         engine.run("(probe-gc) (probe-gc)").unwrap();
         assert_eq!(readiness(&engine, "executor"), [true]);
         assert_eq!(
@@ -1501,6 +1611,7 @@ fn mark_test_roots(heap: &Heap, roots: &[SteelVal], _borrowed: bool) -> MarkAndS
             will_executors: Vec::new(),
             reachable: Default::default(),
             owned: &owned,
+            struct_types: Default::default(),
         };
         for root in roots {
             marker.push_back(root);
@@ -1514,7 +1625,9 @@ fn mark_test_roots(heap: &Heap, roots: &[SteelVal], _borrowed: bool) -> MarkAndS
         stats: MarkAndSweepStats::default(),
         visited: Default::default(),
         owned: Some(&owned),
-        teardown: false,
+        trace_once: false,
+        visited_lists: Default::default(),
+        struct_types: Default::default(),
     };
     for root in roots {
         marker.push_back(root.clone());
@@ -1596,6 +1709,7 @@ fn concurrent_collectors_do_not_share_foreign_marks() {
             will_executors: Vec::new(),
             reachable: Default::default(),
             owned: &owned,
+            struct_types: Default::default(),
         };
         marker.visit_mutable_vector(foreign_parent);
         ready_tx.send(()).unwrap();
@@ -1651,7 +1765,9 @@ fn teardown_traces_descendants_without_changing_foreign_marks() {
             stats: MarkAndSweepStats::default(),
             visited: rustc_hash::FxHashSet::default(),
             owned: None,
-            teardown: true,
+            trace_once: true,
+            visited_lists: Default::default(),
+            struct_types: Default::default(),
         };
         context.push_back(SteelVal::MutableVector(parent.clone()));
         context.visit();
@@ -1790,6 +1906,7 @@ fn borrowed_heap_traversal_keeps_children_after_heap_teardown() {
                     will_executors: Vec::new(),
                     reachable: rustc_hash::FxHashSet::default(),
                     owned: &owned,
+                    struct_types: Default::default(),
                 };
                 match &root {
                     SteelVal::HeapAllocated(value) => marker.visit_heap_allocated(value.clone()),
@@ -1865,6 +1982,7 @@ fn parallel_mark_counts_each_slot_exactly_once() {
                     will_executors: Vec::new(),
                     reachable: rustc_hash::FxHashSet::default(),
                     owned: &owned,
+                    struct_types: Default::default(),
                 };
 
                 barrier.wait();
@@ -2455,7 +2573,6 @@ fn spawn_background_dropper<T: HeapAble + Sync + Send + 'static>(
 /// allocating simply pushes and allocates a value at the end. When we do a collection,
 /// we attempt to do a small collection by just dropping any values with no weak counts
 /// pointing to it.
-#[derive(Clone)]
 pub struct Heap {
     count: usize,
     mark_and_sweep_queue: Vec<SteelVal>,
@@ -2465,12 +2582,769 @@ pub struct Heap {
     skip_minor_collection: bool,
     memory_free_list: FreeList<SteelVal>,
     vector_free_list: FreeList<Vec<SteelVal>>,
+
+    // Copies a collection made of values it does not own. Their destructors can reenter this
+    // heap, so `SteelThread::with_heap` drops them once the heap is unlocked.
+    pub(crate) released: Vec<SteelVal>,
 }
 
 #[cfg(feature = "sync")]
 unsafe impl Send for Heap {}
 #[cfg(feature = "sync")]
 unsafe impl Sync for Heap {}
+
+// `FreeList::clone` keeps cell order, so the copies line up with the originals.
+fn copied_cells<T: HeapAble>(
+    original: &FreeList<T>,
+    copy: &FreeList<T>,
+) -> rustc_hash::FxHashMap<usize, HeapRef<T>> {
+    debug_assert_eq!(original.elements.len(), copy.elements.len());
+    original
+        .elements
+        .iter()
+        .zip(&copy.elements)
+        .map(|(original, copy)| {
+            let copy = HeapRef {
+                inner: StandardShared::downgrade(copy),
+            };
+            (StandardShared::as_ptr(original) as usize, copy)
+        })
+        .collect()
+}
+
+// Identities of the cells, among other values, that a collection traces from `value`,
+// including custom values' children, and the traced values, which the caller releases
+// outside any heap lock.
+fn traced_identities(value: &SteelVal) -> (rustc_hash::FxHashSet<usize>, Vec<SteelVal>) {
+    let mut queue = Vec::new();
+    let mut context = MarkAndSweepContext {
+        queue: &mut queue,
+        stats: MarkAndSweepStats::default(),
+        visited: rustc_hash::FxHashSet::default(),
+        owned: None,
+        trace_once: true,
+        visited_lists: Default::default(),
+        struct_types: Default::default(),
+    };
+    context.push_back(value.clone());
+    context.visit();
+    (context.visited, context.stats.keep_alive)
+}
+
+/// A heap's cells that a value reaches.
+pub(crate) struct ReachedCells {
+    values: Vec<HeapValue>,
+    vectors: Vec<HeapVector>,
+    // The traced values, released once the copy is rewritten.
+    traced: Vec<SteelVal>,
+}
+
+/// Cells copied from another heap, and the remapper pointing at the copies.
+pub(crate) struct AdoptedCells {
+    values: Vec<HeapValue>,
+    vectors: Vec<HeapVector>,
+    remapper: HeapRemapper,
+    // Dropped after `rewrite`, outside the heap locks.
+    _traced: Vec<SteelVal>,
+}
+
+impl AdoptedCells {
+    /// Point the copies and `value` at the copies. Returns the shared values that still reach
+    /// the other heap.
+    pub(crate) fn rewrite(self, value: &mut SteelVal) -> Vec<SteelVal> {
+        self.remapper
+            .rewrite_cells(&self.values, &self.vectors, [value])
+    }
+}
+
+enum Remapped {
+    // Contracts are remapped after the rest of the graph, so nothing else cycles back to a
+    // value in progress. Reaching one anyway keeps the original.
+    Pending,
+    // None keeps the original value.
+    Done(Option<SteelVal>),
+}
+
+enum RemapWork {
+    Enter(SteelVal),
+    // A suffix whose longest list was just remapped, which recorded the suffix's view.
+    View(SteelVal),
+    // The container and the length of the results stack before its children.
+    Exit(SteelVal, usize),
+}
+
+// List nodes can share storage and an offset with different tails, so a list's key
+// includes the next node. Other values use their address.
+type RemapKey = (usize, usize, usize);
+
+fn list_key(list: &List<SteelVal>) -> RemapKey {
+    let (storage, offset) = list.identity_tuple();
+    (storage, offset, list.next_ptr_as_usize().unwrap_or(0))
+}
+
+/// Rewrites references to a heap's cells into copies of those cells.
+///
+/// Containers are rebuilt only when a descendant changes, so untouched values keep their
+/// identity. Boxes, continuations, and iterators over collections are copied like cells.
+/// Custom values, opaque iterators, futures, ports, references, and native functions stay
+/// shared; those reaching an original cell are retained, so the caller can keep them alive.
+///
+/// A list's suffixes become views of the rebuilt longest list that contains them, so a
+/// retained `cdr` stays `eq?` to the copy's `cdr`. Two lists that share a tail only through
+/// a linked node are rebuilt separately, because im-lists cannot link a new node to an
+/// existing view.
+pub(crate) struct HeapRemapper {
+    values: rustc_hash::FxHashMap<usize, HeapRef<SteelVal>>,
+    vectors: rustc_hash::FxHashMap<usize, HeapRef<Vec<SteelVal>>>,
+    memo: rustc_hash::FxHashMap<RemapKey, Remapped>,
+    boxes: Vec<GcMut<SteelVal>>,
+    // Copies whose marks are remapped after the rest of the graph.
+    continuations: Vec<Continuation>,
+    // Copies whose root and remaining items are remapped after the rest of the graph.
+    iterators: Vec<(GcMut<OpaqueIterator>, SteelVal, Vec<SteelVal>)>,
+    // Closure copies whose contracts are remapped after the rest of the graph.
+    contracts: Vec<(Gc<ByteCodeLambda>, SteelVal)>,
+    // Each list reached as a proper suffix of a longer list, and that list.
+    suffix_of: rustc_hash::FxHashMap<RemapKey, List<SteelVal>>,
+    // Shared values that still reach an original cell.
+    retained: Vec<SteelVal>,
+}
+
+impl HeapRemapper {
+    fn new(
+        values: rustc_hash::FxHashMap<usize, HeapRef<SteelVal>>,
+        vectors: rustc_hash::FxHashMap<usize, HeapRef<Vec<SteelVal>>>,
+    ) -> Self {
+        HeapRemapper {
+            values,
+            vectors,
+            memo: Default::default(),
+            boxes: Vec::new(),
+            continuations: Vec::new(),
+            iterators: Vec::new(),
+            contracts: Vec::new(),
+            suffix_of: Default::default(),
+            retained: Vec::new(),
+        }
+    }
+
+    /// Rewrite the copied heap and the roots that refer to the original heap. Returns the shared
+    /// values that still reach the original heap.
+    pub(crate) fn rewrite<'a>(
+        self,
+        copy: &Heap,
+        roots: impl IntoIterator<Item = &'a mut SteelVal>,
+    ) -> Vec<SteelVal> {
+        self.rewrite_cells(
+            &copy.memory_free_list.elements,
+            &copy.vector_free_list.elements,
+            roots,
+        )
+    }
+
+    fn rewrite_cells<'a>(
+        mut self,
+        copied_values: &[HeapValue],
+        copied_vectors: &[HeapVector],
+        roots: impl IntoIterator<Item = &'a mut SteelVal>,
+    ) -> Vec<SteelVal> {
+        let mut roots: Vec<_> = roots.into_iter().collect();
+        // Release each cell guard before remapping, since hashing keys reads cells.
+        let cells: Vec<_> = copied_values
+            .iter()
+            .map(|cell| cell.read().value.clone())
+            .collect();
+        let vectors: Vec<_> = copied_vectors
+            .iter()
+            .map(|cell| cell.read().value.clone())
+            .collect();
+        self.index_lists(
+            cells
+                .iter()
+                .chain(vectors.iter().flatten())
+                .chain(roots.iter().map(|root| &**root))
+                .cloned(),
+        );
+
+        for (cell, value) in copied_values.iter().zip(cells) {
+            if let Some(value) = self.remap(&value) {
+                cell.write().value = value;
+            }
+        }
+
+        for (cell, values) in copied_vectors.iter().zip(vectors) {
+            let remapped: Vec<_> = values.iter().map(|value| self.remap(value)).collect();
+            if remapped.iter().any(Option::is_some) {
+                cell.write().value = values
+                    .into_iter()
+                    .zip(remapped)
+                    .map(|(value, remapped)| remapped.unwrap_or(value))
+                    .collect();
+            }
+        }
+
+        for root in roots.iter_mut() {
+            if let Some(value) = self.remap(root) {
+                **root = value;
+            }
+        }
+
+        // Copied contents and contracts can each reach more copies and contracts.
+        loop {
+            if let Some(copy) = self.boxes.pop() {
+                let value = copy.read().clone();
+                if let Some(value) = self.remap(&value) {
+                    *copy.write() = value;
+                }
+            } else if let Some(copy) = self.continuations.pop() {
+                let mut mark = copy.inner.read().clone();
+                self.remap_continuation(&mut mark);
+                *copy.inner.write() = mark;
+            } else if let Some((copy, root, items)) = self.iterators.pop() {
+                let root = self.remap(&root).unwrap_or(root);
+                let items = items
+                    .into_iter()
+                    .map(|item| self.remap(&item).unwrap_or(item))
+                    .collect();
+                *copy.write() = OpaqueIterator::from_items(root, items);
+            } else if let Some((copy, contract)) = self.contracts.pop() {
+                let SteelVal::CustomStruct(contract) = self.remap(&contract).unwrap_or(contract)
+                else {
+                    unreachable!()
+                };
+                copy.attach_contract_information(contract);
+            } else {
+                break;
+            }
+        }
+
+        self.retained
+    }
+
+    // A continuation's stack values, frame functions, and handlers.
+    fn remap_continuation(&mut self, mark: &mut ContinuationMark) {
+        let (values, frames): (_, Vec<_>) = match mark {
+            ContinuationMark::Closed(closed) => (
+                &mut closed.stack,
+                core::iter::once(&mut closed.current_frame)
+                    .chain(&mut closed.stack_frames)
+                    .collect(),
+            ),
+            ContinuationMark::Open(open) => (
+                &mut open.current_stack_values,
+                vec![&mut open.current_frame],
+            ),
+        };
+        for value in values.iter_mut() {
+            if let Some(remapped) = self.remap(value) {
+                *value = remapped;
+            }
+        }
+        for frame in frames {
+            if let Some(SteelVal::Closure(function)) =
+                self.remap(&SteelVal::Closure(frame.function.clone()))
+            {
+                frame.function = function;
+            }
+            if let Some(handler) = frame
+                .attachments
+                .as_mut()
+                .and_then(|attachments| attachments.handler.as_mut())
+            {
+                if let Some(remapped) = self.remap(handler) {
+                    *handler = remapped;
+                }
+            }
+        }
+    }
+
+    // The values a continuation holds, as `remap_continuation` reaches them.
+    fn continuation_children(continuation: &Continuation) -> Vec<SteelVal> {
+        let mark = continuation.inner.read();
+        let (values, frames): (_, Vec<_>) = match &*mark {
+            ContinuationMark::Closed(closed) => (
+                &closed.stack,
+                core::iter::once(&closed.current_frame)
+                    .chain(&closed.stack_frames)
+                    .collect(),
+            ),
+            ContinuationMark::Open(open) => (&open.current_stack_values, vec![&open.current_frame]),
+        };
+        values
+            .iter()
+            .cloned()
+            .chain(frames.into_iter().flat_map(|frame| {
+                core::iter::once(SteelVal::Closure(frame.function.clone())).chain(
+                    frame
+                        .attachments
+                        .as_ref()
+                        .and_then(|attachments| attachments.handler.clone()),
+                )
+            }))
+            .collect()
+    }
+
+    // Shared values keep referring to the original cells, so the copy retains those that
+    // reach one.
+    fn retain_if_reaching(&mut self, value: &SteelVal) {
+        let (identities, _traced) = traced_identities(value);
+        if identities
+            .iter()
+            .any(|cell| self.values.contains_key(cell) || self.vectors.contains_key(cell))
+        {
+            self.retained.push(value.clone());
+        }
+    }
+
+    /// Record which reachable lists are proper suffixes of longer ones. Remapping a suffix
+    /// then remaps its longest list and takes the suffix as a view of the copy, whichever of
+    /// the two is reached first.
+    fn index_lists(&mut self, roots: impl IntoIterator<Item = SteelVal>) {
+        let mut work: Vec<SteelVal> = roots.into_iter().collect();
+        let mut visited = rustc_hash::FxHashSet::default();
+        // Lists whose suffixes are recorded. A longer list's walk stops at one of these.
+        let mut walked = rustc_hash::FxHashSet::default();
+
+        while let Some(value) = work.pop() {
+            match &value {
+                // Cells are roots of this walk already.
+                SteelVal::HeapAllocated(_) | SteelVal::MutableVector(_) => {}
+                SteelVal::Boxed(boxed) => {
+                    if visited.insert(Self::key(&value)) {
+                        work.push(boxed.read().clone());
+                    }
+                }
+                SteelVal::ContinuationFunction(continuation) => {
+                    if visited.insert(Self::key(&value)) {
+                        work.extend(Self::continuation_children(continuation));
+                    }
+                }
+                // Draining the remaining items waits for remapping; they are usually the root's.
+                SteelVal::BoxedIterator(iterator) => {
+                    if visited.insert(Self::key(&value)) {
+                        work.push(iterator.read().root.clone());
+                    }
+                }
+                SteelVal::ListV(list) => {
+                    let key = list_key(list);
+                    if list.is_empty() || !visited.insert(key) {
+                        continue;
+                    }
+                    // A list of atoms never changes, so its suffixes keep their identity.
+                    if !list.iter().any(Self::may_change) {
+                        continue;
+                    }
+                    walked.insert(key);
+                    let mut suffix = list.rest();
+                    while let Some(view) = suffix.take().filter(|view| !view.is_empty()) {
+                        let key = list_key(&view);
+                        // A tail shared with another list through a node link keeps the
+                        // first list that reached it.
+                        if self.suffix_of.contains_key(&key) {
+                            break;
+                        }
+                        self.suffix_of.insert(key, list.clone());
+                        if walked.contains(&key) {
+                            break;
+                        }
+                        visited.insert(key);
+                        suffix = view.rest();
+                    }
+                    work.extend(list.iter().cloned());
+                }
+                value if Self::is_container(value) && visited.insert(Self::key(value)) => {
+                    work.extend(Self::graph_children(value));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // The longest list that contains this suffix.
+    fn owner(&self, key: &RemapKey) -> Option<List<SteelVal>> {
+        let mut head = self.suffix_of.get(key)?;
+        while let Some(longer) = self.suffix_of.get(&list_key(head)) {
+            head = longer;
+        }
+        Some(head.clone())
+    }
+
+    fn remap(&mut self, value: &SteelVal) -> Option<SteelVal> {
+        let mut work = vec![RemapWork::Enter(value.clone())];
+        let mut results: Vec<Option<SteelVal>> = Vec::new();
+
+        while let Some(item) = work.pop() {
+            match item {
+                RemapWork::Enter(value) => {
+                    if let Some(result) = self.leaf(&value) {
+                        results.push(result);
+                        continue;
+                    }
+
+                    let key = Self::key(&value);
+                    match self.memo.get(&key) {
+                        Some(Remapped::Done(result)) => results.push(result.clone()),
+                        Some(Remapped::Pending) => results.push(None),
+                        None => {
+                            if let Some(head) = self.owner(&key) {
+                                work.push(RemapWork::View(value));
+                                work.push(RemapWork::Enter(SteelVal::ListV(head)));
+                                continue;
+                            }
+                            self.memo.insert(key, Remapped::Pending);
+                            let children = Self::children(&value);
+                            work.push(RemapWork::Exit(value, results.len()));
+                            work.extend(children.into_iter().rev().map(RemapWork::Enter));
+                        }
+                    }
+                }
+                RemapWork::View(value) => {
+                    results.pop();
+                    let key = Self::key(&value);
+                    // An unchanged longest list leaves its suffixes unchanged.
+                    let result = match self.memo.get(&key) {
+                        Some(Remapped::Done(result)) => result.clone(),
+                        _ => None,
+                    };
+                    self.memo.insert(key, Remapped::Done(result.clone()));
+                    results.push(result);
+                }
+                RemapWork::Exit(value, start) => {
+                    let remapped = results.split_off(start);
+                    let contract = match &value {
+                        SteelVal::Closure(closure) => closure.get_contract_information(),
+                        _ => None,
+                    };
+                    let changed = remapped.iter().any(Option::is_some)
+                        || contract
+                            .as_ref()
+                            .is_some_and(|contract| self.reaches_copy(contract));
+                    let result = changed.then(|| {
+                        let children = Self::children(&value)
+                            .into_iter()
+                            .zip(remapped)
+                            .map(|(child, remapped)| remapped.unwrap_or(child))
+                            .collect();
+                        Self::rebuild(&value, children)
+                    });
+                    match (&value, &result) {
+                        (SteelVal::ListV(original), Some(SteelVal::ListV(copy))) => {
+                            self.record_views(original, copy);
+                        }
+                        _ => {
+                            if let (Some(SteelVal::Closure(copy)), Some(contract)) =
+                                (&result, contract)
+                            {
+                                self.contracts.push((copy.clone(), contract));
+                            }
+                            self.memo
+                                .insert(Self::key(&value), Remapped::Done(result.clone()));
+                        }
+                    }
+                    results.push(result);
+                }
+            }
+        }
+
+        results.pop().unwrap()
+    }
+
+    // The copy's suffixes stand in for the original's, so retained suffixes stay its views.
+    fn record_views(&mut self, original: &List<SteelVal>, copy: &List<SteelVal>) {
+        let mut views = Some((original.clone(), copy.clone()));
+        while let Some((original, copy)) = views.take() {
+            if original.is_empty() {
+                break;
+            }
+            let key = list_key(&original);
+            if !matches!(self.memo.get(&key), Some(Remapped::Done(_))) {
+                self.memo
+                    .insert(key, Remapped::Done(Some(SteelVal::ListV(copy.clone()))));
+            }
+            views = original.rest().zip(copy.rest());
+        }
+    }
+
+    // Whether remapping would change this value. This walks the graph instead of remapping
+    // it, because a contract can refer back to the closure being remapped.
+    fn reaches_copy(&self, value: &SteelVal) -> bool {
+        let mut work = vec![value.clone()];
+        let mut visited = rustc_hash::FxHashSet::default();
+
+        while let Some(value) = work.pop() {
+            match &value {
+                SteelVal::HeapAllocated(cell) => {
+                    if self.values.contains_key(&cell.as_ptr_usize()) {
+                        return true;
+                    }
+                }
+                SteelVal::MutableVector(cell) => {
+                    if self.vectors.contains_key(&cell.as_ptr_usize()) {
+                        return true;
+                    }
+                }
+                // Copied whether or not their contents change.
+                SteelVal::Boxed(_)
+                | SteelVal::ContinuationFunction(_)
+                | SteelVal::BoxedIterator(_) => return true,
+                SteelVal::ListV(list) if list.is_empty() => {}
+                value if Self::is_container(value) => {
+                    let key = Self::key(value);
+                    match self.memo.get(&key) {
+                        Some(Remapped::Done(Some(_))) => return true,
+                        Some(Remapped::Done(None)) => {}
+                        _ => {
+                            if visited.insert(key) {
+                                work.extend(Self::graph_children(value));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        false
+    }
+
+    // Some(result) for values without traversed children.
+    fn leaf(&mut self, value: &SteelVal) -> Option<Option<SteelVal>> {
+        match value {
+            SteelVal::HeapAllocated(cell) => Some(
+                self.values
+                    .get(&cell.as_ptr_usize())
+                    .map(|copy| SteelVal::HeapAllocated(copy.clone())),
+            ),
+            SteelVal::MutableVector(cell) => Some(
+                self.vectors
+                    .get(&cell.as_ptr_usize())
+                    .map(|copy| SteelVal::MutableVector(copy.clone())),
+            ),
+            SteelVal::Boxed(boxed) => {
+                let key = Self::key(value);
+                if let Some(Remapped::Done(copy)) = self.memo.get(&key) {
+                    return Some(copy.clone());
+                }
+                // The contents are remapped after the rest of the graph.
+                let copy = Gc::new_mut(boxed.read().clone());
+                self.boxes.push(copy.clone());
+                let copy = Some(SteelVal::Boxed(copy));
+                self.memo.insert(key, Remapped::Done(copy.clone()));
+                Some(copy)
+            }
+            SteelVal::ContinuationFunction(continuation) => {
+                let key = Self::key(value);
+                if let Some(Remapped::Done(copy)) = self.memo.get(&key) {
+                    return Some(copy.clone());
+                }
+                // The marks are remapped after the rest of the graph.
+                let copy = Continuation {
+                    inner: StandardShared::new(MutContainer::new(
+                        continuation.inner.read().clone(),
+                    )),
+                };
+                self.continuations.push(copy.clone());
+                let copy = Some(SteelVal::ContinuationFunction(copy));
+                self.memo.insert(key, Remapped::Done(copy.clone()));
+                Some(copy)
+            }
+            SteelVal::BoxedIterator(iterator) => {
+                let key = Self::key(value);
+                if let Some(Remapped::Done(copy)) = self.memo.get(&key) {
+                    return Some(copy.clone());
+                }
+                let mut original = iterator.write();
+                let copy = match original.remaining_items() {
+                    // The root and items are remapped after the rest of the graph.
+                    Some(items) => {
+                        let root = original.root.clone();
+                        let copy =
+                            Gc::new_mut(OpaqueIterator::from_items(root.clone(), items.clone()));
+                        self.iterators.push((copy.clone(), root, items));
+                        Some(SteelVal::BoxedIterator(copy))
+                    }
+                    None => {
+                        drop(original);
+                        self.retain_if_reaching(value);
+                        None
+                    }
+                };
+                self.memo.insert(key, Remapped::Done(copy.clone()));
+                Some(copy)
+            }
+            SteelVal::Custom(_) => {
+                let key = Self::key(value);
+                if !self.memo.contains_key(&key) {
+                    self.retain_if_reaching(value);
+                    self.memo.insert(key, Remapped::Done(None));
+                }
+                Some(None)
+            }
+            SteelVal::ListV(list) if list.is_empty() => Some(None),
+            value if Self::is_container(value) => None,
+            _ => Some(None),
+        }
+    }
+
+    fn is_container(value: &SteelVal) -> bool {
+        matches!(
+            value,
+            SteelVal::ListV(_)
+                | SteelVal::VectorV(_)
+                | SteelVal::Pair(_)
+                | SteelVal::HashMapV(_)
+                | SteelVal::HashSetV(_)
+                | SteelVal::CustomStruct(_)
+                | SteelVal::Closure(_)
+                | SteelVal::SyntaxObject(_)
+                | SteelVal::StreamV(_)
+                | SteelVal::IterV(_)
+                | SteelVal::ReducerV(_)
+        )
+    }
+
+    // Values whose remapped form can differ from the original.
+    fn may_change(value: &SteelVal) -> bool {
+        matches!(
+            value,
+            SteelVal::HeapAllocated(_)
+                | SteelVal::MutableVector(_)
+                | SteelVal::Boxed(_)
+                | SteelVal::ContinuationFunction(_)
+                | SteelVal::BoxedIterator(_)
+        ) || Self::is_container(value)
+    }
+
+    fn key(value: &SteelVal) -> RemapKey {
+        match value {
+            SteelVal::ListV(list) => list_key(list),
+            value => (traced_identity(value).unwrap(), 0, 0),
+        }
+    }
+
+    // A closure's contract is left out: it can refer back to the closure, so it is remapped
+    // after the rest of the graph and attached to the copy.
+    fn children(value: &SteelVal) -> Vec<SteelVal> {
+        match value {
+            SteelVal::ListV(list) => list.iter().cloned().collect(),
+            SteelVal::VectorV(vector) => vector.iter().cloned().collect(),
+            SteelVal::Pair(pair) => vec![pair.car(), pair.cdr()],
+            SteelVal::HashMapV(map) => map
+                .iter()
+                .flat_map(|(key, value)| [key.clone(), value.clone()])
+                .collect(),
+            SteelVal::HashSetV(set) => set.iter().cloned().collect(),
+            SteelVal::CustomStruct(steel_struct) => steel_struct.fields.iter().cloned().collect(),
+            SteelVal::Closure(closure) => closure.captures().to_vec(),
+            SteelVal::SyntaxObject(syntax) => syntax
+                .raw
+                .iter()
+                .cloned()
+                .chain([syntax.syntax.clone()])
+                .collect(),
+            SteelVal::StreamV(stream) => {
+                vec![stream.initial_value.clone(), stream.stream_thunk.clone()]
+            }
+            SteelVal::IterV(transducer) => transducer
+                .ops
+                .iter()
+                .filter_map(Transducers::value)
+                .cloned()
+                .collect(),
+            SteelVal::ReducerV(reducer) => match &**reducer {
+                Reducer::ForEach(function) => vec![function.clone()],
+                Reducer::Generic(generic) => {
+                    vec![generic.initial_value.clone(), generic.function.clone()]
+                }
+                _ => Vec::new(),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    // Every value reachable in one step, including a closure's contract.
+    fn graph_children(value: &SteelVal) -> Vec<SteelVal> {
+        let mut children = Self::children(value);
+        if let SteelVal::Closure(closure) = value {
+            children.extend(closure.get_contract_information());
+        }
+        children
+    }
+
+    fn rebuild(value: &SteelVal, mut children: Vec<SteelVal>) -> SteelVal {
+        match value {
+            SteelVal::ListV(_) => SteelVal::ListV(children.into_iter().collect()),
+            SteelVal::VectorV(_) => SteelVal::VectorV(children.into_iter().collect()),
+            SteelVal::Pair(_) => {
+                let cdr = children.pop().unwrap();
+                let car = children.pop().unwrap();
+                super::lists::Pair::cons(car, cdr).into()
+            }
+            SteelVal::HashMapV(_) => {
+                let mut map = super::HashMap::new();
+                let mut children = children.into_iter();
+                while let (Some(key), Some(value)) = (children.next(), children.next()) {
+                    map.insert(key, value);
+                }
+                SteelVal::HashMapV(Gc::new(map).into())
+            }
+            SteelVal::HashSetV(_) => {
+                let set: super::HashSet<_> = children.into_iter().collect();
+                SteelVal::HashSetV(Gc::new(set).into())
+            }
+            SteelVal::CustomStruct(steel_struct) => SteelVal::CustomStruct(Gc::new(
+                UserDefinedStruct::new(steel_struct.type_descriptor, &children),
+            )),
+            // The contract is attached once it is remapped.
+            SteelVal::Closure(closure) => SteelVal::Closure(Gc::new(
+                closure.with_captures(children.into_iter().collect(), None),
+            )),
+            SteelVal::SyntaxObject(syntax) => {
+                let mut copy = (**syntax).clone();
+                copy.syntax = children.pop().unwrap();
+                if copy.raw.is_some() {
+                    copy.raw = children.pop();
+                }
+                SteelVal::SyntaxObject(Gc::new(copy))
+            }
+            SteelVal::StreamV(stream) => {
+                let stream_thunk = children.pop().unwrap();
+                let initial_value = children.pop().unwrap();
+                SteelVal::StreamV(Gc::new(LazyStream {
+                    initial_value,
+                    stream_thunk,
+                    empty_stream: stream.empty_stream,
+                }))
+            }
+            SteelVal::IterV(transducer) => {
+                let mut copy = (**transducer).clone();
+                for (slot, child) in copy
+                    .ops
+                    .iter_mut()
+                    .filter_map(Transducers::value_mut)
+                    .zip(children)
+                {
+                    *slot = child;
+                }
+                SteelVal::IterV(Gc::new(copy))
+            }
+            // Only reducers that hold values have children to change.
+            SteelVal::ReducerV(reducer) => SteelVal::ReducerV(Gc::new(match &**reducer {
+                Reducer::ForEach(_) => Reducer::ForEach(children.pop().unwrap()),
+                Reducer::Generic(_) => {
+                    let function = children.pop().unwrap();
+                    let initial_value = children.pop().unwrap();
+                    Reducer::Generic(ReducerFunc {
+                        initial_value,
+                        function,
+                    })
+                }
+                _ => unreachable!(),
+            })),
+            _ => unreachable!(),
+        }
+    }
+}
 
 // Contiguous... no good? Perhaps a free list is actually better here?
 // Can reuse the allocations more effectively, and can compact where needed.
@@ -2496,6 +3370,10 @@ impl Heap {
             .collect()
     }
 
+    // A closed heap keeps what the registered roots reach. A live collection keeps the same
+    // values for holders outside the heap, so a value held elsewhere stays valid only while
+    // its heap is alive and reaches it from its own roots or a registered root. Values meant to
+    // outlive their engine are rooted, joined into another heap, or deep cloned.
     pub(crate) fn trace_teardown_roots() -> (rustc_hash::FxHashSet<usize>, Vec<SteelVal>) {
         let mut queue = Vec::new();
         let mut context = MarkAndSweepContext {
@@ -2503,7 +3381,9 @@ impl Heap {
             stats: MarkAndSweepStats::default(),
             visited: rustc_hash::FxHashSet::default(),
             owned: None,
-            teardown: true,
+            trace_once: true,
+            visited_lists: Default::default(),
+            struct_types: Default::default(),
         };
         for root in persistent_roots_snapshot() {
             context.push_back(root);
@@ -2536,6 +3416,77 @@ impl Heap {
         detached
     }
 
+    /// Copy every cell. The remapper then points copied values at the copies.
+    pub(crate) fn copy_cells(&self) -> (Heap, HeapRemapper) {
+        let copy = Heap {
+            count: self.count,
+            mark_and_sweep_queue: Vec::with_capacity(256),
+            maybe_memory_size: self.maybe_memory_size,
+            skip_minor_collection: self.skip_minor_collection,
+            memory_free_list: self.memory_free_list.clone(),
+            vector_free_list: self.vector_free_list.clone(),
+            released: Vec::new(),
+        };
+        let remapper = HeapRemapper::new(
+            copied_cells(&self.memory_free_list, &copy.memory_free_list),
+            copied_cells(&self.vector_free_list, &copy.vector_free_list),
+        );
+        (copy, remapper)
+    }
+
+    /// This heap's cells that `value` reaches.
+    pub(crate) fn reached_cells(&self, value: &SteelVal) -> ReachedCells {
+        fn reached<T: HeapAble>(
+            cells: &FreeList<T>,
+            reached: &rustc_hash::FxHashSet<usize>,
+        ) -> Vec<HeapElement<T>> {
+            cells
+                .elements
+                .iter()
+                .filter(|cell| reached.contains(&(StandardShared::as_ptr(cell) as usize)))
+                .cloned()
+                .collect()
+        }
+
+        let (identities, traced) = traced_identities(value);
+        ReachedCells {
+            values: reached(&self.memory_free_list, &identities),
+            vectors: reached(&self.vector_free_list, &identities),
+            traced,
+        }
+    }
+
+    /// Copy another heap's cells into this one. Their values still refer to the originals
+    /// until the result rewrites them.
+    pub(crate) fn adopt(&mut self, cells: ReachedCells) -> AdoptedCells {
+        let mut values = rustc_hash::FxHashMap::default();
+        let copied_values = cells
+            .values
+            .iter()
+            .map(|cell| {
+                let copy = self.allocate_without_collection(cell.read().value.clone());
+                values.insert(StandardShared::as_ptr(cell) as usize, copy.clone());
+                copy.strong_ptr()
+            })
+            .collect();
+        let mut vectors = rustc_hash::FxHashMap::default();
+        let copied_vectors = cells
+            .vectors
+            .iter()
+            .map(|cell| {
+                let copy = self.allocate_vec_without_collection(cell.read().value.clone());
+                vectors.insert(StandardShared::as_ptr(cell) as usize, copy.clone());
+                copy.strong_ptr()
+            })
+            .collect();
+        AdoptedCells {
+            values: copied_values,
+            vectors: copied_vectors,
+            remapper: HeapRemapper::new(values, vectors),
+            _traced: cells.traced,
+        }
+    }
+
     pub fn new() -> Self {
         Heap {
             count: 0,
@@ -2548,6 +3499,7 @@ impl Heap {
 
             memory_free_list: FreeList::new(),
             vector_free_list: FreeList::new(),
+            released: Vec::new(),
         }
     }
 
@@ -2559,6 +3511,7 @@ impl Heap {
             skip_minor_collection: false,
             memory_free_list: FreeList::new(),
             vector_free_list: FreeList::new(),
+            released: Vec::new(),
         }
     }
 
@@ -2885,7 +3838,7 @@ impl Heap {
         tls: &'a [SteelVal],
         synchronizer: &mut Synchronizer,
     ) -> MarkAndSweepStats {
-        let stats = self.mark(
+        let mut stats = self.mark(
             root_value,
             root_vector,
             roots,
@@ -2895,6 +3848,7 @@ impl Heap {
             tls,
             synchronizer,
         );
+        self.released.append(&mut stats.keep_alive);
 
         #[cfg(feature = "profiling")]
         let now = crate::time::Instant::now();
@@ -2942,7 +3896,9 @@ impl Heap {
             stats: MarkAndSweepStats::default(),
             visited: rustc_hash::FxHashSet::default(),
             owned: Some(&owned),
-            teardown: false,
+            trace_once: false,
+            visited_lists: Default::default(),
+            struct_types: Default::default(),
         };
 
         // Pause all threads
@@ -3002,13 +3958,15 @@ impl Heap {
                 will_executors: Vec::new(),
                 reachable,
                 owned: &owned,
+                struct_types: core::mem::take(&mut context.struct_types),
             };
             for value in context.queue.iter() {
                 marker.push_back(value);
             }
             marker.visit();
             marker.retain_wills();
-            context.queue.clear();
+            // A root snapshot can hold the last reference to a root released meanwhile.
+            self.released.append(context.queue);
             marker.stats
         };
         #[cfg(not(feature = "sync"))]
@@ -3168,10 +4126,21 @@ pub struct MarkAndSweepContext<'a> {
     visited: rustc_hash::FxHashSet<usize>,
     // None means traversal only; foreign cells never share collection marks.
     owned: Option<&'a rustc_hash::FxHashSet<usize>>,
-    teardown: bool,
+    // Teardown and copy scans trace each value once, deduplicating as values are pushed.
+    trace_once: bool,
+    // Lists traced once, by their whole node.
+    visited_lists: rustc_hash::FxHashSet<RemapKey>,
+    struct_types: ReachedStructTypes,
 }
 
 impl<'a> MarkAndSweepContext<'a> {
+    // Values that can recreate a struct type's instances keep its properties reachable.
+    pub(crate) fn visit_struct_type(&mut self, descriptor: StructTypeDescriptor) {
+        if let Some(properties) = self.struct_types.properties(descriptor) {
+            self.push_back(properties);
+        }
+    }
+
     pub(crate) fn mark_heap_reference(
         &mut self,
         heap_ref: &StandardSharedMut<HeapAllocated<SteelVal>>,
@@ -3184,7 +4153,7 @@ impl<'a> MarkAndSweepContext<'a> {
             }
             guard.mark_reachable();
             self.stats.memory_reached_count += 1;
-        } else if !self.teardown && !self.visited.insert(identity) {
+        } else if !self.trace_once && !self.visited.insert(identity) {
             return;
         }
 
@@ -3204,7 +4173,7 @@ impl<'a> MarkAndSweepContext<'a> {
             }
             guard.mark_reachable();
             self.stats.vector_reached_count += 1;
-        } else if !self.teardown && !self.visited.insert(identity) {
+        } else if !self.trace_once && !self.visited.insert(identity) {
             return;
         }
 
@@ -3244,6 +4213,7 @@ pub struct MarkAndSweepContextRefQueue<'a> {
     will_executors: Vec<&'a MutContainer<Box<dyn CustomType>>>,
     reachable: rustc_hash::FxHashSet<usize>,
     owned: &'a rustc_hash::FxHashSet<usize>,
+    struct_types: ReachedStructTypes,
 }
 
 #[cfg(feature = "sync")]
@@ -3283,11 +4253,14 @@ impl<'a> MarkAndSweepContextRefQueue<'a> {
             stats: MarkAndSweepStats::default(),
             visited: core::mem::take(&mut self.visited),
             owned: Some(self.owned),
-            teardown: false,
+            trace_once: false,
+            visited_lists: Default::default(),
+            struct_types: core::mem::take(&mut self.struct_types),
         };
 
         visit_custom_children(custom_type, &mut temporary_queue);
         self.visited = temporary_queue.visited;
+        self.struct_types = temporary_queue.struct_types;
 
         self.stats.memory_reached_count += temporary_queue.stats.memory_reached_count;
         self.stats.object_count += temporary_queue.stats.object_count;
@@ -3492,21 +4465,29 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
     }
 
     fn push_back(&mut self, value: SteelVal) {
-        if self.teardown {
-            // List slices can share an address while exposing different elements.
-            if !matches!(value, SteelVal::ListV(_)) {
-                if let Some(identity) = traced_identity(&value) {
-                    if !self.visited.insert(identity) {
-                        return;
-                    }
-                    self.stats.keep_alive.push(value.clone());
-                }
+        if self.trace_once {
+            // List slices can share an address while exposing different elements, so a list
+            // is identified by its whole node.
+            let first = match &value {
+                SteelVal::ListV(list) => Some(self.visited_lists.insert(list_key(list))),
+                value => traced_identity(value).map(|identity| self.visited.insert(identity)),
+            };
+            match first {
+                Some(false) => return,
+                // A traced value's address must not be reused during the pass.
+                Some(true) => self.stats.keep_alive.push(value.clone()),
+                None => {}
             }
         }
         self.stats.object_count += 1;
 
         // TODO: Determine if all numbers should push back.
         match &value {
+            SteelVal::BoxedFunction(function) => {
+                if let Some(properties) = self.struct_types.function_properties(function) {
+                    self.push_back(properties);
+                }
+            }
             SteelVal::BoolV(_)
             | SteelVal::NumV(_)
             | SteelVal::IntV(_)
@@ -3517,7 +4498,6 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
             | SteelVal::SymbolV(_)
             | SteelVal::FutureFunc(_)
             | SteelVal::FutureV(_)
-            | SteelVal::BoxedFunction(_)
             | SteelVal::MutFunc(_)
             | SteelVal::BuiltIn(_)
             | SteelVal::ByteVector(_)
@@ -3603,10 +4583,19 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
     }
     // TODO: Come back to this
     fn visit_custom_type(&mut self, custom_type: GcMut<Box<dyn CustomType>>) -> Self::Output {
-        if !self.teardown && !self.visited.insert(custom_type.as_ptr() as usize) {
+        if !self.trace_once && !self.visited.insert(custom_type.as_ptr() as usize) {
             return;
         }
-        visit_custom_children(&custom_type, self);
+        let Some(custom_type) = read_custom_type(&custom_type) else {
+            return;
+        };
+        if let Some(properties) = self
+            .struct_types
+            .descriptor_properties(custom_type.as_ref())
+        {
+            self.push_back(properties);
+        }
+        custom_type.visit_children(self);
     }
 
     fn visit_float(&mut self, _float: f64) -> Self::Output {}
@@ -3618,7 +4607,7 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
     fn visit_future_function(&mut self, _function: BoxedAsyncFunctionSignature) -> Self::Output {}
 
     fn visit_hash_map(&mut self, hashmap: SteelHashMap) -> Self::Output {
-        if !self.teardown && !self.visited.insert(hashmap.0.as_ptr() as usize) {
+        if !self.trace_once && !self.visited.insert(hashmap.0.as_ptr() as usize) {
             return;
         }
         for (key, value) in hashmap.iter() {
@@ -3679,6 +4668,9 @@ impl<'a> BreadthFirstSearchSteelValVisitor for MarkAndSweepContext<'a> {
     fn visit_reference_value(&mut self, _reference: Gc<OpaqueReference<'static>>) -> Self::Output {}
 
     fn visit_steel_struct(&mut self, steel_struct: Gc<UserDefinedStruct>) -> Self::Output {
+        if let Some(properties) = self.struct_types.properties(steel_struct.type_descriptor) {
+            self.push_back(properties);
+        }
         for field in steel_struct.fields.iter() {
             self.push_back(field.clone());
         }
@@ -3749,6 +4741,12 @@ impl<'a> BreadthFirstSearchSteelValReferenceVisitor2<'a> for MarkAndSweepContext
         }
 
         match value {
+            SteelVal::BoxedFunction(function) => {
+                if let Some(properties) = self.struct_types.function_properties(function) {
+                    self.push_back(&properties);
+                    self.save(properties);
+                }
+            }
             SteelVal::BoolV(_)
             | SteelVal::NumV(_)
             | SteelVal::IntV(_)
@@ -3759,7 +4757,6 @@ impl<'a> BreadthFirstSearchSteelValReferenceVisitor2<'a> for MarkAndSweepContext
             | SteelVal::SymbolV(_)
             | SteelVal::FutureFunc(_)
             | SteelVal::FutureV(_)
-            | SteelVal::BoxedFunction(_)
             | SteelVal::MutFunc(_)
             | SteelVal::BuiltIn(_)
             | SteelVal::ByteVector(_)
@@ -3858,11 +4855,18 @@ impl<'a> BreadthFirstSearchSteelValReferenceVisitor2<'a> for MarkAndSweepContext
         if !self.visited.insert(custom_type as *const _ as usize) {
             return;
         }
-        let Some(is_executor) =
-            read_custom_type(custom_type).map(|custom| custom.as_any_ref().is::<WillExecutor>())
-        else {
+        let Some(custom) = read_custom_type(custom_type) else {
             return;
         };
+        let properties = self
+            .struct_types
+            .descriptor_properties(custom.as_ref());
+        if let Some(properties) = properties {
+            self.push_back(&properties);
+            self.save(properties);
+        }
+        let is_executor = custom.as_any_ref().is::<WillExecutor>();
+        drop(custom);
         if is_executor {
             self.will_executors.push(custom_type);
         } else {
@@ -3934,6 +4938,10 @@ impl<'a> BreadthFirstSearchSteelValReferenceVisitor2<'a> for MarkAndSweepContext
     }
 
     fn visit_steel_struct(&mut self, steel_struct: &UserDefinedStruct) -> Self::Output {
+        if let Some(properties) = self.struct_types.properties(steel_struct.type_descriptor) {
+            self.push_back(&properties);
+            self.save(properties);
+        }
         for field in steel_struct.fields.iter() {
             self.push_back(field);
         }

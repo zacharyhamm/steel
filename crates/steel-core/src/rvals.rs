@@ -2226,6 +2226,29 @@ impl Custom for OpaqueIterator {
     }
 }
 
+impl OpaqueIterator {
+    // An iterator over `items`, in order.
+    pub(crate) fn from_items(root: SteelVal, items: Vec<SteelVal>) -> Self {
+        OpaqueIterator {
+            root,
+            iterator: BuiltInDataStructureIterator::List(
+                items.into_iter().collect::<List<_>>().into_iter(),
+            ),
+        }
+    }
+
+    /// The items this iterator has left, leaving it to yield the same items. None for an opaque
+    /// iterator, which can be infinite.
+    pub(crate) fn remaining_items(&mut self) -> Option<Vec<SteelVal>> {
+        if matches!(self.iterator, BuiltInDataStructureIterator::Opaque(_)) {
+            return None;
+        }
+        let items: Vec<_> = self.iterator.by_ref().collect();
+        *self = Self::from_items(self.root.clone(), items.clone());
+        Some(items)
+    }
+}
+
 // TODO: Convert this to just a generic custom type. This does not have to be
 // a special enum variant.
 pub enum BuiltInDataStructureIterator {
@@ -2321,6 +2344,7 @@ impl SteelVal {
         match (self, other) {
             // Integers are a special case of ptr eq -> if integers are equal? they are also eq?
             (IntV(l), IntV(r)) => l == r,
+            (Rational(l), Rational(r)) => l == r,
             (NumV(l), NumV(r)) => l == r,
             (BoolV(l), BoolV(r)) => l == r,
             (CharV(l), CharV(r)) => l == r,
@@ -2348,7 +2372,15 @@ impl SteelVal {
             (MutFunc(l), MutFunc(r)) => *l as usize == *r as usize,
             (BuiltIn(l), BuiltIn(r)) => *l as usize == *r as usize,
             (MutableVector(l), MutableVector(r)) => HeapRef::ptr_eq(l, r),
+            (HeapAllocated(l), HeapAllocated(r)) => HeapRef::ptr_eq(l, r),
+            (CustomStruct(l), CustomStruct(r)) => Gc::ptr_eq(l, r),
+            (SyntaxObject(l), SyntaxObject(r)) => Gc::ptr_eq(l, r),
+            (BoxedIterator(l), BoxedIterator(r)) => Gc::ptr_eq(l, r),
+            (Boxed(l), Boxed(r)) => Gc::ptr_eq(l, r),
+            (Reference(l), Reference(r)) => Gc::ptr_eq(l, r),
             (BigNum(l), BigNum(r)) => Gc::ptr_eq(l, r),
+            (BigRational(l), BigRational(r)) => Gc::ptr_eq(l, r),
+            (Complex(l), Complex(r)) => Gc::ptr_eq(l, r),
             (ByteVector(l), ByteVector(r)) => Gc::ptr_eq(&l.vec, &r.vec),
             (Pair(l), Pair(r)) => Gc::ptr_eq(l, r),
             (CustomStruct(l), CustomStruct(r)) => Gc::ptr_eq(l, r),
@@ -2356,6 +2388,16 @@ impl SteelVal {
                 // dbg!(pointers);
                 false
             }
+        }
+    }
+
+    /// `eqv?` compares numbers by value, keeping exactness, and everything else like `eq?`.
+    pub(crate) fn eqv(&self, other: &SteelVal) -> bool {
+        match (self, other) {
+            (BigNum(l), BigNum(r)) => l == r,
+            (BigRational(l), BigRational(r)) => l == r,
+            (Complex(l), Complex(r)) => l == r,
+            _ => self.ptr_eq(other),
         }
     }
 }

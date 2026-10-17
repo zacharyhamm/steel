@@ -108,21 +108,40 @@ pub fn mutex_unlock(mutex: &SteelVal) -> Result<SteelVal> {
 }
 
 /// Block until this thread finishes.
-#[steel_derive::function(name = "thread-join!")]
-pub fn thread_join(handle: &SteelVal) -> Result<SteelVal> {
-    ThreadHandle::as_ref(handle).and_then(|mut x| thread_join_impl(&mut x))
+#[steel_derive::context(name = "thread-join!", arity = "Exact(1)")]
+pub(crate) fn thread_join(ctx: &mut VmCore, args: &[SteelVal]) -> Option<Result<SteelVal>> {
+    // The worker can need every thread to reach a safepoint before it finishes.
+    let joined = ctx.thread.enter_safepoint(|_| {
+        ThreadHandle::as_ref(&args[0]).and_then(|handle| thread_join_impl(&handle))
+    });
+    Some(joined.map(|(result, heap)| adopt_thread_result(ctx.thread, result, heap)))
 }
 
-pub(crate) fn thread_join_impl(handle: &ThreadHandle) -> Result<SteelVal> {
+// The result's heap can be freed once its pending handle is released, so a result from
+// another heap is copied into the joining thread's heap.
+fn adopt_thread_result(
+    thread: &mut SteelThread,
+    result: RootedSteelVal,
+    heap: HeapHandle,
+) -> SteelVal {
+    let mut value = result.value().clone();
+    if !Arc::ptr_eq(&*heap, &*thread.heap) {
+        let cells = heap.lock().reached_cells(&value);
+        let adopted = thread.with_heap(|_, target| target.adopt(cells));
+        let retained = adopted.rewrite(&mut value);
+        thread.heap.retain(retained, &heap);
+    }
+    // The root and the handle kept the result's cells while it still referred to them.
+    drop(result);
+    drop(heap);
+    value
+}
+
+pub(crate) fn thread_join_impl(handle: &ThreadHandle) -> Result<(RootedSteelVal, HeapHandle)> {
     if let Some(handle) = handle.handle.lock().unwrap().take() {
         handle
             .join()
             .map_err(|_| SteelErr::new(ErrorKind::Generic, "thread panicked!".to_string()))?
-            .map(|(result, heap)| {
-                // Keep the joined value rooted while releasing its pending heap handle.
-                drop(heap);
-                result.value().clone()
-            })
             .map_err(|x| SteelErr::new(ErrorKind::Generic, x.to_string()))
     } else {
         stop!(ContractViolation => "thread handle has already been joined!");
@@ -331,7 +350,14 @@ struct SerializedValue {
     serialized_vec_heap: FxHashMap<usize, Vec<SerializableSteelVal>>,
 }
 
-impl Custom for SerializedValue {}
+impl Custom for SerializedValue {
+    // Deserialization reuses these types' current properties.
+    fn gc_visit_children(&self, context: &mut MarkAndSweepContext) {
+        for entry in &self.vtable_entries {
+            context.visit_struct_type(entry.desc);
+        }
+    }
+}
 
 fn deserialize_individual_value_impl(ctx: &mut VmCore, args: &[SteelVal]) -> Result<SteelVal> {
     let value = args[0].clone();

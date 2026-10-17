@@ -33,6 +33,7 @@ use crate::steel_vm::primitives::steel_unbox_mutable;
 use crate::steel_vm::primitives::{gt_primitive, gte_primitive, lt_primitive, steel_not};
 use crate::values::closed::Heap;
 use crate::values::closed::MarkAndSweepContext;
+use crate::values::closed::RootedSteelVal;
 use crate::values::functions::CaptureVec;
 use crate::values::functions::RootedInstructions;
 use crate::values::functions::SerializedLambda;
@@ -435,6 +436,26 @@ pub(crate) struct HeapState {
     execution_owners: std::sync::atomic::AtomicUsize,
     // 0: idle, 1: tracing, 2: tracing with another release to process.
     teardown: std::sync::atomic::AtomicU8,
+    retained: parking_lot::Mutex<Vec<RetainedHeap>>,
+}
+
+// Values this heap shares with another heap that still reach that heap's cells. Rooting them
+// keeps those cells through the other heap's teardown, and the handle keeps its storage. The
+// roots are released before the handle.
+struct RetainedHeap {
+    _values: Vec<RootedSteelVal>,
+    _heap: HeapHandle,
+}
+
+impl HeapState {
+    pub(crate) fn retain(&self, values: Vec<SteelVal>, heap: &HeapHandle) {
+        if !values.is_empty() {
+            self.retained.lock().push(RetainedHeap {
+                _values: values.iter().map(SteelVal::as_rooted).collect(),
+                _heap: heap.clone_for_storage(),
+            });
+        }
+    }
 }
 
 impl core::ops::Deref for HeapState {
@@ -457,6 +478,7 @@ impl HeapHandle {
                 heap: parking_lot::Mutex::new(heap),
                 execution_owners: std::sync::atomic::AtomicUsize::new(1),
                 teardown: std::sync::atomic::AtomicU8::new(0),
+                retained: parking_lot::Mutex::new(Vec::new()),
             }),
             execution_owner: true,
         }
@@ -1010,8 +1032,20 @@ impl SteelThread {
         }
     }
 
-    pub(crate) fn replace_heap(&mut self, heap: Heap) {
-        self.heap = HeapHandle::new(heap);
+    /// Give this idle thread its own copy of the heap and of every value reaching it.
+    pub(crate) fn isolate_heap(&mut self) {
+        debug_assert!(self.stack.is_empty() && self.stack_frames.is_empty());
+        let (copy, remapper) = self.heap.lock().copy_cells();
+        let roots = self
+            .global_env
+            .roots_mut()
+            .iter_mut()
+            .chain(self.thread_local_storage.iter_mut());
+        let retained = remapper.rewrite(&copy, roots);
+        let copy = HeapHandle::new(copy);
+        copy.retain(retained, &self.heap);
+        // Dropping the old handle releases this thread's execution ownership of the original.
+        self.heap = copy;
     }
 
     #[inline(always)]
@@ -1062,7 +1096,11 @@ impl SteelThread {
     pub(crate) fn with_heap<T>(&mut self, thunk: impl FnOnce(&mut Self, &mut Heap) -> T) -> T {
         let heap = self.heap.clone_for_storage();
         let mut guard = self.enter_safepoint(|_| heap.lock());
-        thunk(self, &mut guard)
+        let result = thunk(self, &mut guard);
+        let released = core::mem::take(&mut guard.released);
+        drop(guard);
+        drop(released);
+        result
     }
 
     // Allow this thread to be available for garbage collection
@@ -6055,6 +6093,11 @@ fn eval_program(program: crate::compiler::program::Executable, ctx: &mut VmCore)
     }
 
     let function_id = crate::compiler::code_gen::fresh_function_id();
+    ctx.thread
+        .compiler
+        .write()
+        .function_ids
+        .insert(function_id as _);
     let function = Gc::new(ByteCodeLambda::new(
         function_id as _,
         StandardShared::from(bytecode),

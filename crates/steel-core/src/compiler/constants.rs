@@ -68,24 +68,21 @@ enum ConstantWork {
     Vector(crate::rvals::SteelVector),
 }
 
-fn same_constant(left: &SteelVal, right: &SteelVal) -> bool {
-    use crate::gc::Gc;
-    match (left, right) {
-        (SteelVal::HeapAllocated(left), SteelVal::HeapAllocated(right)) => left.ptr_eq(right),
-        (SteelVal::CustomStruct(left), SteelVal::CustomStruct(right)) => Gc::ptr_eq(left, right),
-        (SteelVal::SyntaxObject(left), SteelVal::SyntaxObject(right)) => Gc::ptr_eq(left, right),
-        (SteelVal::BoxedIterator(left), SteelVal::BoxedIterator(right)) => Gc::ptr_eq(left, right),
-        (SteelVal::Boxed(left), SteelVal::Boxed(right)) => Gc::ptr_eq(left, right),
-        (SteelVal::Reference(left), SteelVal::Reference(right)) => Gc::ptr_eq(left, right),
-        (SteelVal::BigRational(left), SteelVal::BigRational(right)) => Gc::ptr_eq(left, right),
-        (SteelVal::Complex(left), SteelVal::Complex(right)) => Gc::ptr_eq(left, right),
-        (SteelVal::Rational(left), SteelVal::Rational(right)) => left == right,
-        _ => left.ptr_eq(right),
-    }
-}
-
 impl ConstantIndex {
     fn intern(&mut self, value: SteelVal, mut values: Option<&mut Vec<SteelVal>>) -> usize {
+        // Atoms need no traversal, which keeps runtime symbol interning to one lookup.
+        if !matches!(
+            value,
+            SteelVal::Pair(_) | SteelVal::ListV(_) | SteelVal::VectorV(_)
+        ) {
+            let key = ConstantKey::Atom(value.clone());
+            let id = match self.keys.get(&key) {
+                Some(&id) => id,
+                None => self.insert_node(key, value),
+            };
+            self.publish(id, values);
+            return id;
+        }
         let mut work = vec![ConstantWork::Visit(value)];
         let mut children = Vec::new();
         while let Some(item) = work.pop() {
@@ -145,8 +142,7 @@ impl ConstantIndex {
                         let SteelVal::Pair(pair) = original.unwrap() else {
                             unreachable!()
                         };
-                        if same_constant(pair.car_ref(), car) && same_constant(pair.cdr_ref(), cdr)
-                        {
+                        if pair.car_ref().ptr_eq(car) && pair.cdr_ref().ptr_eq(cdr) {
                             SteelVal::Pair(pair)
                         } else {
                             crate::values::lists::Pair::cons(car.clone(), cdr.clone()).into()
@@ -159,7 +155,7 @@ impl ConstantIndex {
                         if list
                             .iter()
                             .zip(ids)
-                            .all(|(value, id)| same_constant(value, &self.nodes[*id].value))
+                            .all(|(value, id)| value.ptr_eq(&self.nodes[*id].value))
                         {
                             SteelVal::ListV(list)
                         } else {
@@ -175,7 +171,7 @@ impl ConstantIndex {
                         if vector
                             .iter()
                             .zip(ids)
-                            .all(|(value, id)| same_constant(value, &self.nodes[*id].value))
+                            .all(|(value, id)| value.ptr_eq(&self.nodes[*id].value))
                         {
                             SteelVal::VectorV(vector)
                         } else {
@@ -185,21 +181,25 @@ impl ConstantIndex {
                         }
                     }
                 };
-                let id = self.nodes.len();
-                if let SteelVal::Pair(pair) = &value {
-                    self.pairs.insert(pair.as_ptr() as usize, id);
-                }
-                self.nodes.push(CanonicalConstant {
-                    value,
-                    constant_index: None,
-                });
-                self.keys.insert(key, id);
-                id
+                self.insert_node(key, value)
             };
             self.publish(id, values.as_deref_mut());
             children.push(id);
         }
         children.pop().unwrap()
+    }
+
+    fn insert_node(&mut self, key: ConstantKey, value: SteelVal) -> usize {
+        let id = self.nodes.len();
+        if let SteelVal::Pair(pair) = &value {
+            self.pairs.insert(pair.as_ptr() as usize, id);
+        }
+        self.nodes.push(CanonicalConstant {
+            value,
+            constant_index: None,
+        });
+        self.keys.insert(key, id);
+        id
     }
 
     fn publish(&mut self, id: usize, values: Option<&mut Vec<SteelVal>>) {

@@ -342,9 +342,14 @@ impl ByteCodeLambda {
             new_body.push(instr);
         }
 
+        // The body now refers to the receiving thread's global slots.
+        let mut compiler = heap.thread.compiler.write();
+        compiler.function_ids.insert(value.id);
         for (idx, id) in closures_to_rewrite {
             new_body[idx].payload_size = u24::from_u32(id);
+            compiler.function_ids.insert(id);
         }
+        drop(compiler);
 
         Ok(ByteCodeLambda::new(
             value.id,
@@ -381,6 +386,28 @@ impl ByteCodeLambda {
 
     pub fn set_captures(&mut self, captures: CaptureVec) {
         self.captures = captures;
+    }
+
+    // A derived clone would share the contract slot in sync builds.
+    pub(crate) fn with_captures(
+        &self,
+        captures: CaptureVec,
+        contract: Option<Gc<UserDefinedStruct>>,
+    ) -> ByteCodeLambda {
+        let mut copy = self.clone();
+        copy.captures = captures;
+
+        #[cfg(feature = "sync")]
+        {
+            copy.contract = SharedMut::new(MutContainer::new(contract));
+        }
+
+        #[cfg(not(feature = "sync"))]
+        {
+            copy.contract = MutContainer::new(contract);
+        }
+
+        copy
     }
 
     // TODO: The lifecycle of `RootedInstructions` should not be

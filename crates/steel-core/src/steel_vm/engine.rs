@@ -530,30 +530,6 @@ impl Engine {
         self.virtual_machine.id
     }
 
-    #[cfg(not(feature = "sync"))]
-    pub(crate) fn deep_clone(&self) -> Self {
-        let mut engine = self.clone();
-
-        engine.modules = self.modules.deep_clone();
-
-        let mut compiler_copy = engine.virtual_machine.compiler.read().clone();
-        compiler_copy.builtin_modules = engine.modules.clone();
-        engine.virtual_machine.compiler = Arc::new(RwLock::new(compiler_copy));
-
-        let constant_map = engine
-            .virtual_machine
-            .compiler
-            .read()
-            .constant_map
-            .deep_clone();
-        engine.virtual_machine.compiler.write().constant_map = constant_map;
-
-        let heap_copy = engine.virtual_machine.heap.lock().clone();
-        engine.virtual_machine.replace_heap(heap_copy);
-        engine
-    }
-
-    #[cfg(feature = "sync")]
     pub(crate) fn deep_clone(&self) -> Self {
         let mut engine = self.clone();
         engine.virtual_machine.global_env = engine.virtual_machine.global_env.deep_clone();
@@ -565,6 +541,7 @@ impl Engine {
 
         engine.virtual_machine.compiler = Arc::new(RwLock::new(compiler_copy));
 
+        // Constants are literals, and their index hashes them, so they are not remapped.
         let constant_map = engine
             .virtual_machine
             .compiler
@@ -573,9 +550,7 @@ impl Engine {
             .deep_clone();
         engine.virtual_machine.compiler.write().constant_map = constant_map;
 
-        let heap_copy = engine.virtual_machine.heap.lock().clone();
-
-        engine.virtual_machine.replace_heap(heap_copy);
+        engine.virtual_machine.isolate_heap();
         engine
     }
 
@@ -1973,25 +1948,20 @@ impl Engine {
             self.virtual_machine.with_heap(|thread, heap| {
                 #[cfg(feature = "sync")]
                 thread.with_locked_env(|ctx, env| {
-                    #[cfg(feature = "sync")]
-                    {
+                    let released = {
+                        let mut compiler = ctx.compiler.write();
+                        let compiler = &mut *compiler;
                         GlobalSlotRecycler::free_shadowed_rooted_values(
                             // &mut self.virtual_machine.global_env.bindings_vec.write(),
                             env.0.as_mut_slice(),
                             // .unwrap(),
-                            &mut ctx.compiler.write().symbol_map,
+                            &mut compiler.symbol_map,
+                            &compiler.function_ids,
                             heap,
-                        );
-                    }
-
-                    #[cfg(not(feature = "sync"))]
-                    {
-                        GlobalSlotRecycler::free_shadowed_rooted_values(
-                            &mut ctx.global_env.bindings_vec,
-                            &mut ctx.compiler.write().symbol_map,
-                            heap,
-                        );
-                    }
+                        )
+                    };
+                    // Released by `with_heap` once the heap and environment are unlocked.
+                    heap.released.extend(released);
 
                     // Drop the pure functions which have been lifted.
                     ctx.function_interner
@@ -2014,25 +1984,18 @@ impl Engine {
 
                 #[cfg(not(feature = "sync"))]
                 thread.with_locked_env(|ctx| {
-                    #[cfg(feature = "sync")]
-                    {
-                        GlobalSlotRecycler::free_shadowed_rooted_values(
-                            &mut ctx.virtual_machine.global_env.bindings_vec.write(),
-                            // &mut env.0.as_mut_slice(),
-                            // .unwrap(),
-                            &mut ctx.compiler.write().symbol_map,
-                            heap,
-                        );
-                    }
-
-                    #[cfg(not(feature = "sync"))]
-                    {
+                    let released = {
+                        let mut compiler = ctx.compiler.write();
+                        let compiler = &mut *compiler;
                         GlobalSlotRecycler::free_shadowed_rooted_values(
                             &mut ctx.global_env.bindings_vec,
-                            &mut ctx.compiler.write().symbol_map,
+                            &mut compiler.symbol_map,
+                            &compiler.function_ids,
                             heap,
-                        );
-                    }
+                        )
+                    };
+                    // Released by `with_heap` once the heap is unlocked.
+                    heap.released.extend(released);
 
                     // Drop the pure functions which have been lifted.
                     ctx.function_interner

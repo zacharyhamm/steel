@@ -727,10 +727,39 @@ pub(crate) mod drop_impls {
         pub static FORMAT_BUFFER: RefCell<VecDeque<SteelVal>> = RefCell::new(VecDeque::with_capacity(128));
     }
 
+    /// Values whose drop cannot recurse into an owned container.
+    pub(crate) fn drops_shallowly(value: &SteelVal) -> bool {
+        match value {
+            SteelVal::BoolV(_)
+            | SteelVal::NumV(_)
+            | SteelVal::IntV(_)
+            | SteelVal::CharV(_)
+            | SteelVal::Void
+            | SteelVal::StringV(_)
+            | SteelVal::FuncV(_)
+            | SteelVal::SymbolV(_)
+            | SteelVal::FutureFunc(_)
+            | SteelVal::FutureV(_)
+            | SteelVal::BoxedFunction(_)
+            | SteelVal::MutFunc(_)
+            | SteelVal::BuiltIn(_)
+            | SteelVal::BigNum(_)
+            | SteelVal::MutableVector(_) => true,
+            SteelVal::ListV(list) => list.strong_count() > 1,
+            SteelVal::Pair(pair) => Gc::strong_count(pair) > 1,
+            _ => false,
+        }
+    }
+
     impl Drop for Pair {
         fn drop(&mut self) {
-            if matches!(self.car, SteelVal::Void) && matches!(self.cdr, SteelVal::Void) {
-                return;
+            // Release car before classifying cdr, so a child held by both fields is counted
+            // once and its last reference still drains iteratively.
+            if drops_shallowly(&self.car) {
+                drop(self.car.make_void());
+                if drops_shallowly(&self.cdr) {
+                    return;
+                }
             }
             let drained = DROP_BUFFER.try_with(|buffer| {
                 let Ok(mut buffer) = buffer.try_borrow_mut() else {
@@ -1073,7 +1102,16 @@ impl<'a> BreadthFirstSearchSteelValVisitor for IterativeDropHandler<'a> {
         // println!("VISITING LIST: {}", list.strong_count());
         // println!("list: {:?}", list);
 
-        if list.strong_count() == 1 {
+        if list.strong_count() != 1 {
+            return;
+        }
+
+        if crate::values::lists::list_storage_destroyed() {
+            let mut list = list;
+            for value in crate::values::lists::copy_out(&mut list) {
+                self.push_back(value);
+            }
+        } else {
             for value in list.draining_iterator() {
                 // println!(
                 // "PUSHING BACK VALUE - queue size: {}",

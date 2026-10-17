@@ -416,6 +416,10 @@ pub(crate) struct KernelDefMacroSpec {
 #[derive(Clone)]
 pub struct Compiler {
     pub(crate) symbol_map: SymbolMap,
+    // Ids of the functions generated against `symbol_map`'s global slots. A closure that only
+    // a registered root reaches keeps its global slots only if its id is here, since roots can
+    // hold other engines' closures.
+    pub(crate) function_ids: FxHashSet<u32>,
     pub(crate) constant_map: ConstantMap,
     pub(crate) macro_env: FxHashMap<InternedString, SteelMacro>,
     pub(crate) module_manager: ModuleManager,
@@ -616,6 +620,7 @@ impl Compiler {
 
         Compiler {
             symbol_map,
+            function_ids: FxHashSet::default(),
             constant_map,
             macro_env,
             module_manager,
@@ -646,6 +651,7 @@ impl Compiler {
 
         Compiler {
             symbol_map,
+            function_ids: FxHashSet::default(),
             constant_map,
             macro_env,
             module_manager,
@@ -913,6 +919,13 @@ impl Compiler {
             let instructions =
                 super::code_gen::CodeGenerator::new(&mut self.constant_map, &analysis)
                     .top_level_compile(&expr)?;
+
+            // A function's id follows its opcode and arity flag, where the VM reads it.
+            for window in instructions.windows(3) {
+                if matches!(window[0].op_code, OpCode::NEWSCLOSURE | OpCode::PUREFUNC) {
+                    self.function_ids.insert(window[2].payload_size.to_u32());
+                }
+            }
 
             results.push(instructions);
         }
