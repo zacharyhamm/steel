@@ -1468,6 +1468,68 @@ mod embedding_regressions {
     }
 
     #[test]
+    fn deep_clone_hash_key_cells_reaching_their_table_stay_isolated() {
+        for first in ["j", "k"] {
+            let second = if first == "j" { "k" } else { "j" };
+            let mut template = Engine::new();
+            register_gc(&mut template);
+            template
+                .run(format!(
+                    "(define {first} (box #f))
+                     (define {second} (box #f))
+                     (define m (hash k 1))
+                     (define f (let ((captured m)) (lambda () captured)))
+                     (set-box! k f)
+                     (set-box! j m)"
+                ))
+                .unwrap();
+            let mut copy = template.deep_clone();
+            drop(template);
+            let result = copy
+                .run(
+                    "(probe-gc) (probe-gc)
+                     (list (eq? (unbox k) f) (eq? ((unbox k)) (unbox j))
+                           (eq? (car (hash-keys->list ((unbox k)))) k)
+                           (hash-ref (unbox j) k))",
+                )
+                .unwrap();
+            assert_eq!(
+                result.last().unwrap().to_string(),
+                "(#true #true #true 1)",
+                "allocation order {first} first"
+            );
+        }
+    }
+
+    #[test]
+    fn deep_clone_hash_keys_survive_template_collection() {
+        let mut template = Engine::new();
+        register_gc(&mut template);
+        template
+            .run(
+                "(define key (box (value->iterator (list 1 2))))
+             (define nested-key (list key))
+             (define table (hash key 42 nested-key 43))
+             (define members (hashset key nested-key))",
+            )
+            .unwrap();
+        let mut copy = template.deep_clone();
+        drop(template);
+        let result = copy
+            .run(
+                "(probe-gc) (probe-gc)
+             (list (hash-ref table key) (hash-ref table nested-key)
+                   (hash-contains? table key) (hashset-contains? members key)
+                   (hashset-contains? members nested-key))",
+            )
+            .unwrap();
+        assert_eq!(
+            result.last().unwrap().to_string(),
+            "(42 43 #true #true #true)"
+        );
+    }
+
+    #[test]
     fn deep_clones_remap_streams_transducers_reducers_and_iterators() {
         for drop_template_first in [true, false] {
             let mut template = Engine::new();

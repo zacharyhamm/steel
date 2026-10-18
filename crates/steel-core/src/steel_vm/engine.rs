@@ -3,7 +3,7 @@
 use super::{
     builtin::{BuiltInModule, FunctionSignatureMetadata},
     primitives::{register_builtin_modules, CONSTANTS},
-    vm::{threads::ThreadHandle, SteelThread, Synchronizer, ThreadStateController},
+    vm::{SteelThread, Synchronizer, ThreadStateController},
 };
 
 #[cfg(feature = "dylibs")]
@@ -270,32 +270,7 @@ impl Clone for Engine {
     fn clone(&self) -> Self {
         let mut virtual_machine = self.virtual_machine.clone();
 
-        // Set up child
-        virtual_machine.synchronizer = Synchronizer::new();
-
-        let weak_ctx = Arc::downgrade(&virtual_machine.synchronizer.ctx);
-
-        // Get a handle to the current thread?
-        let handle = ThreadHandle {
-            handle: Mutex::new(None),
-            thread: std::thread::current(),
-            thread_state_manager: virtual_machine.synchronizer.state.clone(),
-            forked_thread_handle: None,
-        }
-        .into_steelval()
-        .unwrap();
-
-        // TODO: Entering safepoint should happen often
-        // for the main thread?
-        virtual_machine
-            .synchronizer
-            .threads
-            .lock()
-            .unwrap()
-            .push(super::vm::ThreadContext {
-                ctx: weak_ctx,
-                handle,
-            });
+        virtual_machine.synchronizer = Synchronizer::for_current_thread();
 
         let compiler = Arc::new(RwLock::new(self.virtual_machine.compiler.write().clone()));
 

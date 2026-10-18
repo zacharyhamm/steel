@@ -575,6 +575,69 @@ mod heap_handle_tests {
     };
 
     #[test]
+    fn isolated_threads_have_independent_synchronizers() {
+        use super::{ThreadContext, ThreadState};
+        use crate::{steel_vm::engine::Engine, SteelVal};
+
+        let template = Engine::new_raw_no_kernel();
+        let mut first = template.virtual_machine.clone();
+        first.global_env = first.global_env.deep_clone();
+        first.isolate_heap();
+        let second = template.deep_clone();
+        let ordinary = template.virtual_machine.clone();
+        let original = &template.virtual_machine.synchronizer;
+        assert!(Arc::ptr_eq(
+            &original.threads,
+            &ordinary.synchronizer.threads
+        ));
+        assert!(Arc::ptr_eq(&original.ctx, &ordinary.synchronizer.ctx));
+        assert!(Arc::ptr_eq(
+            &original.state.paused,
+            &ordinary.synchronizer.state.paused
+        ));
+        let coordinators = [
+            original,
+            &first.synchronizer,
+            &second.virtual_machine.synchronizer,
+        ];
+        for (index, coordinator) in coordinators.iter().enumerate() {
+            let threads = coordinator.threads.lock().unwrap();
+            assert_eq!(threads.len(), 1);
+            assert!(Arc::ptr_eq(
+                &threads[0].ctx.upgrade().unwrap(),
+                &coordinator.ctx
+            ));
+            assert!(coordinator.ctx.load().is_none());
+            assert!(!coordinator.spawned_via_make_thread);
+            for other in &coordinators[index + 1..] {
+                assert!(!Arc::ptr_eq(&coordinator.threads, &other.threads));
+                assert!(!Arc::ptr_eq(&coordinator.ctx, &other.ctx));
+                assert!(!Arc::ptr_eq(&coordinator.state.paused, &other.state.paused));
+                assert!(!Arc::ptr_eq(&coordinator.state.state, &other.state.state));
+            }
+        }
+        original.state.pause_for_safepoint();
+        original.threads.lock().unwrap().push(ThreadContext {
+            ctx: Arc::downgrade(&ordinary.synchronizer.ctx),
+            handle: SteelVal::Void,
+        });
+        for coordinator in &coordinators[1..] {
+            assert!(!coordinator.state.paused.load(Ordering::Relaxed));
+            assert!(matches!(
+                coordinator.state.state.load(),
+                ThreadState::Running
+            ));
+            let threads = coordinator.threads.lock().unwrap();
+            assert_eq!(threads.len(), 1);
+            assert!(Arc::ptr_eq(
+                &threads[0].ctx.upgrade().unwrap(),
+                &coordinator.ctx
+            ));
+        }
+        original.state.resume();
+    }
+
+    #[test]
     fn closed_heap_acquisition_does_not_leave_an_execution_owner() {
         let owner = HeapHandle::new(Heap::new());
         let survivor = owner.clone();
@@ -787,6 +850,29 @@ impl Synchronizer {
             ctx: Arc::new(AtomicCell::new(None)),
             spawned_via_make_thread: false,
         }
+    }
+
+    pub(crate) fn for_current_thread() -> Self {
+        let synchronizer = Self::new();
+        let weak_ctx = Arc::downgrade(&synchronizer.ctx);
+
+        // Get a handle to the current thread?
+        let handle = ThreadHandle {
+            handle: Mutex::new(None),
+            thread: std::thread::current(),
+            thread_state_manager: synchronizer.state.clone(),
+            forked_thread_handle: None,
+        }
+        .into_steelval()
+        .unwrap();
+
+        // TODO: Entering safepoint should happen often
+        // for the main thread?
+        synchronizer.threads.lock().unwrap().push(ThreadContext {
+            ctx: weak_ctx,
+            handle,
+        });
+        synchronizer
     }
 
     pub(crate) unsafe fn maybe_call_per_ctx(
@@ -1003,25 +1089,7 @@ impl Synchronizer {
 
 impl SteelThread {
     pub fn new(compiler: alloc::sync::Arc<RwLock<Compiler>>) -> SteelThread {
-        let synchronizer = Synchronizer::new();
-        let weak_ctx = Arc::downgrade(&synchronizer.ctx);
-
-        // Get a handle to the current thread?
-        let handle = ThreadHandle {
-            handle: Mutex::new(None),
-            thread: std::thread::current(),
-            thread_state_manager: synchronizer.state.clone(),
-            forked_thread_handle: None,
-        }
-        .into_steelval()
-        .unwrap();
-
-        // TODO: Entering safepoint should happen often
-        // for the main thread?
-        synchronizer.threads.lock().unwrap().push(ThreadContext {
-            ctx: weak_ctx,
-            handle,
-        });
+        let synchronizer = Synchronizer::for_current_thread();
 
         let heap = HeapHandle::new(Heap::new());
 
@@ -1105,6 +1173,7 @@ impl SteelThread {
         copy.retain(retained, &self.heap);
         // Dropping the old handle releases this thread's execution ownership of the original.
         self.heap = copy;
+        self.synchronizer = Synchronizer::for_current_thread();
     }
 
     #[inline(always)]

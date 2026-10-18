@@ -2859,6 +2859,107 @@ fn list_key(list: &List<SteelVal>) -> RemapKey {
     (storage, offset, list.next_ptr_as_usize().unwrap_or(0))
 }
 
+#[test]
+fn remapped_hash_keys_use_final_cell_contents() {
+    fn check(value: &SteelVal) {
+        let SteelVal::HeapAllocated(cell) = value else {
+            panic!("expected cell")
+        };
+        let SteelVal::ListV(entries) = cell.get() else {
+            panic!("expected entries")
+        };
+        for entry in entries {
+            let SteelVal::VectorV(entry) = entry else {
+                panic!("expected entry")
+            };
+            let (SteelVal::HashMapV(map), SteelVal::HashSetV(set)) = (&entry[0], &entry[1]) else {
+                panic!("expected map and set")
+            };
+            assert_eq!(map.get(&entry[2]), Some(&SteelVal::IntV(42)));
+            assert!(set.contains(&entry[2]));
+        }
+    }
+
+    for isolate in [true, false] {
+        for iterator in [true, false] {
+            let mut source = Heap::new();
+            // Visit the tables before the cells used by their keys.
+            let entries = source.allocate_without_collection(SteelVal::Void);
+            let payload =
+                SteelVal::HeapAllocated(source.allocate_without_collection(SteelVal::IntV(7)));
+            let value = if iterator {
+                SteelVal::BoxedIterator(Gc::new_mut(OpaqueIterator::from_items(
+                    payload.clone(),
+                    vec![payload],
+                )))
+            } else {
+                SteelVal::StreamV(Gc::new(LazyStream {
+                    initial_value: payload,
+                    stream_thunk: SteelVal::Void,
+                    empty_stream: false,
+                }))
+            };
+            let cell = SteelVal::HeapAllocated(source.allocate_without_collection(value.clone()));
+            let boxed = SteelVal::Boxed(Gc::new_mut(value.clone()));
+            let vector =
+                SteelVal::MutableVector(source.allocate_vec_without_collection(vec![value]));
+            let nested_map = SteelVal::HashMapV(
+                Gc::new(
+                    [(SteelVal::IntV(1), cell.clone())]
+                        .into_iter()
+                        .collect::<super::HashMap<_, _>>(),
+                )
+                .into(),
+            );
+            let nested_set = SteelVal::HashSetV(
+                Gc::new([cell.clone()].into_iter().collect::<super::HashSet<_>>()).into(),
+            );
+            let keys = vec![
+                cell.clone(),
+                boxed.clone(),
+                vector,
+                SteelVal::ListV([cell].into_iter().collect()),
+                SteelVal::ListV([boxed].into_iter().collect()),
+                nested_map,
+                nested_set,
+            ];
+            entries.set_interior_mut(SteelVal::ListV(
+                keys.into_iter()
+                    .map(|key| {
+                        let map = SteelVal::HashMapV(
+                            Gc::new(
+                                [(key.clone(), SteelVal::IntV(42))]
+                                    .into_iter()
+                                    .collect::<super::HashMap<_, _>>(),
+                            )
+                            .into(),
+                        );
+                        let set = SteelVal::HashSetV(
+                            Gc::new([key.clone()].into_iter().collect::<super::HashSet<_>>())
+                                .into(),
+                        );
+                        SteelVal::VectorV([map, set, key].into_iter().collect())
+                    })
+                    .collect(),
+            ));
+            let original = SteelVal::HeapAllocated(entries);
+            check(&original);
+            let mut root = original.clone();
+            let (_destination, _retained) = if isolate {
+                let (copy, remapper) = source.copy_cells();
+                let retained = remapper.rewrite(&copy, [&mut root]);
+                (copy, retained)
+            } else {
+                let mut copy = Heap::new();
+                let retained = copy.adopt(source.reached_cells(&root)).rewrite(&mut root);
+                (copy, retained)
+            };
+            check(&root);
+            check(&original);
+        }
+    }
+}
+
 /// Rewrites references to a heap's cells into copies of those cells.
 ///
 /// Containers are rebuilt only when a descendant changes, so untouched values keep their
@@ -2877,6 +2978,8 @@ pub(crate) struct HeapRemapper {
     values: rustc_hash::FxHashMap<usize, HeapRef<SteelVal>>,
     vectors: rustc_hash::FxHashMap<usize, HeapRef<Vec<SteelVal>>>,
     memo: rustc_hash::FxHashMap<RemapKey, Remapped>,
+    // Copied cells whose contents still need rewriting, indexed by the copy's identity.
+    pending_cells: rustc_hash::FxHashMap<usize, SteelVal>,
     boxes: Vec<GcMut<SteelVal>>,
     // Copies whose marks are remapped after the rest of the graph.
     continuations: Vec<Continuation>,
@@ -2901,10 +3004,20 @@ impl HeapRemapper {
         vectors: rustc_hash::FxHashMap<usize, HeapRef<Vec<SteelVal>>>,
         copy_shared_state: bool,
     ) -> Self {
+        let pending_cells = values
+            .values()
+            .map(|cell| (cell.as_ptr_usize(), SteelVal::HeapAllocated(cell.clone())))
+            .chain(
+                vectors
+                    .values()
+                    .map(|cell| (cell.as_ptr_usize(), SteelVal::MutableVector(cell.clone()))),
+            )
+            .collect();
         HeapRemapper {
             values,
             vectors,
             memo: Default::default(),
+            pending_cells,
             boxes: Vec::new(),
             continuations: Vec::new(),
             iterators: Vec::new(),
@@ -2954,21 +3067,12 @@ impl HeapRemapper {
                 .cloned(),
         );
 
-        for (cell, value) in copied_values.iter().zip(cells) {
-            if let Some(value) = self.remap(&value) {
-                cell.write().value = value;
-            }
+        for cell in copied_values {
+            self.rewrite_cell(StandardShared::as_ptr(cell) as usize, false);
         }
 
-        for (cell, values) in copied_vectors.iter().zip(vectors) {
-            let remapped: Vec<_> = values.iter().map(|value| self.remap(value)).collect();
-            if remapped.iter().any(Option::is_some) {
-                cell.write().value = values
-                    .into_iter()
-                    .zip(remapped)
-                    .map(|(value, remapped)| remapped.unwrap_or(value))
-                    .collect();
-            }
+        for cell in copied_vectors {
+            self.rewrite_cell(StandardShared::as_ptr(cell) as usize, false);
         }
 
         for root in roots.iter_mut() {
@@ -2980,10 +3084,7 @@ impl HeapRemapper {
         // Copied contents and contracts can each reach more copies and contracts.
         loop {
             if let Some(copy) = self.boxes.pop() {
-                let value = copy.read().clone();
-                if let Some(value) = self.remap(&value) {
-                    *copy.write() = value;
-                }
+                self.rewrite_cell(Gc::as_ptr(&copy) as usize, false);
             } else if let Some(copy) = self.continuations.pop() {
                 let mut mark = copy.inner.read().clone();
                 self.remap_continuation(&mut mark);
@@ -3007,6 +3108,89 @@ impl HeapRemapper {
         }
 
         self.retained
+    }
+
+    // A nested rewrite, made while another remap is in progress, is deferred to the cell's
+    // own turn when its contents reach a value that remap has not finished.
+    fn rewrite_cell(&mut self, identity: usize, nested: bool) {
+        // Remove before traversing: ordinary cycles refer to the already allocated copy.
+        let Some(pending) = self.pending_cells.remove(&identity) else {
+            return;
+        };
+        let mut deferred = false;
+        match &pending {
+            SteelVal::HeapAllocated(cell) => {
+                let (remapped, incomplete) = self.remap_tracked(&cell.get());
+                deferred = nested && incomplete;
+                if let Some(value) = remapped.filter(|_| !deferred) {
+                    cell.set_interior_mut(value);
+                }
+            }
+            SteelVal::Boxed(cell) => {
+                let value = cell.read().clone();
+                let (remapped, incomplete) = self.remap_tracked(&value);
+                deferred = nested && incomplete;
+                if let Some(value) = remapped.filter(|_| !deferred) {
+                    *cell.write() = value;
+                }
+            }
+            SteelVal::MutableVector(cell) => {
+                let values = cell.get();
+                let mut remapped = Vec::with_capacity(values.len());
+                for value in &values {
+                    let (value, incomplete) = self.remap_tracked(value);
+                    deferred |= nested && incomplete;
+                    remapped.push(value);
+                }
+                if !deferred && remapped.iter().any(Option::is_some) {
+                    cell.set_interior_mut(
+                        values
+                            .into_iter()
+                            .zip(remapped)
+                            .map(|(value, remapped)| remapped.unwrap_or(value))
+                            .collect(),
+                    );
+                }
+            }
+            _ => unreachable!(),
+        }
+        if deferred {
+            self.pending_cells.insert(identity, pending);
+        }
+    }
+
+    // Hashing reads mutable contents, so finalize those dependencies before insertion.
+    fn prepare_hash_key(&mut self, value: &SteelVal) {
+        // Most keys are atoms, which have no contents to finalize.
+        if !Self::may_change(value) {
+            return;
+        }
+        let mut work = vec![value.clone()];
+        let mut visited = rustc_hash::FxHashSet::default();
+        while let Some(value) = work.pop() {
+            if traced_identity(&value).is_some() && !visited.insert(Self::key(&value)) {
+                continue;
+            }
+            match &value {
+                SteelVal::HeapAllocated(cell) => {
+                    self.rewrite_cell(cell.as_ptr_usize(), true);
+                    work.push(cell.get());
+                }
+                SteelVal::MutableVector(cell) => {
+                    self.rewrite_cell(cell.as_ptr_usize(), true);
+                    work.extend(cell.get());
+                }
+                SteelVal::Boxed(cell) => {
+                    self.rewrite_cell(Gc::as_ptr(cell) as usize, true);
+                    work.push(cell.read().clone());
+                }
+                // These hashes do not traverse the contents remapping visits.
+                SteelVal::Closure(_) | SteelVal::StreamV(_) => {}
+                SteelVal::SyntaxObject(syntax) => work.extend(syntax.raw.iter().cloned()),
+                value if Self::is_container(value) => work.extend(Self::children(value)),
+                _ => {}
+            }
+        }
     }
 
     // A continuation's stack values, frame functions, and handlers.
@@ -3176,21 +3360,28 @@ impl HeapRemapper {
     }
 
     fn remap(&mut self, value: &SteelVal) -> Option<SteelVal> {
+        self.remap_tracked(value).0
+    }
+
+    // Also whether the result depends on a value whose remapping is still in progress. Only a
+    // remap nested in another, to finalize a hash key, reaches one, and such results are not
+    // memoized, since they keep that value's original.
+    fn remap_tracked(&mut self, value: &SteelVal) -> (Option<SteelVal>, bool) {
         let mut work = vec![RemapWork::Enter(value.clone())];
-        let mut results: Vec<Option<SteelVal>> = Vec::new();
+        let mut results: Vec<(Option<SteelVal>, bool)> = Vec::new();
 
         while let Some(item) = work.pop() {
             match item {
                 RemapWork::Enter(value) => {
                     if let Some(result) = self.leaf(&value) {
-                        results.push(result);
+                        results.push((result, false));
                         continue;
                     }
 
                     let key = Self::key(&value);
                     match self.memo.get(&key) {
-                        Some(Remapped::Done(result)) => results.push(result.clone()),
-                        Some(Remapped::Pending) => results.push(None),
+                        Some(Remapped::Done(result)) => results.push((result.clone(), false)),
+                        Some(Remapped::Pending) => results.push((None, true)),
                         None => {
                             // A suffix reached from inside its longest list's own elements
                             // is rebuilt on its own: that list's copy does not exist yet.
@@ -3209,7 +3400,10 @@ impl HeapRemapper {
                     }
                 }
                 RemapWork::View(value) => {
-                    results.pop();
+                    if let Some((_, true)) = results.pop() {
+                        results.push((None, true));
+                        continue;
+                    }
                     let key = Self::key(&value);
                     // An unchanged longest list leaves its suffixes unchanged.
                     let result = match self.memo.get(&key) {
@@ -3217,10 +3411,12 @@ impl HeapRemapper {
                         _ => None,
                     };
                     self.memo.insert(key, Remapped::Done(result.clone()));
-                    results.push(result);
+                    results.push((result, false));
                 }
                 RemapWork::Exit(value, start) => {
-                    let remapped = results.split_off(start);
+                    let (remapped, incomplete): (Vec<_>, Vec<_>) =
+                        results.split_off(start).into_iter().unzip();
+                    let incomplete = incomplete.into_iter().any(|incomplete| incomplete);
                     let contract = match &value {
                         SteelVal::Closure(closure) => closure.get_contract_information(),
                         _ => None,
@@ -3235,23 +3431,25 @@ impl HeapRemapper {
                             .zip(remapped)
                             .map(|(child, remapped)| remapped.unwrap_or(child))
                             .collect();
-                        Self::rebuild(&value, children)
+                        self.rebuild(&value, children)
                     });
+                    if let (Some(SteelVal::Closure(copy)), Some(contract)) = (&result, contract) {
+                        self.contracts.push((copy.clone(), contract));
+                    }
                     match (&value, &result) {
+                        // A later visit remaps it again, once that value is done.
+                        _ if incomplete => {
+                            self.memo.remove(&Self::key(&value));
+                        }
                         (SteelVal::ListV(original), Some(SteelVal::ListV(copy))) => {
                             self.record_views(original, copy);
                         }
                         _ => {
-                            if let (Some(SteelVal::Closure(copy)), Some(contract)) =
-                                (&result, contract)
-                            {
-                                self.contracts.push((copy.clone(), contract));
-                            }
                             self.memo
                                 .insert(Self::key(&value), Remapped::Done(result.clone()));
                         }
                     }
-                    results.push(result);
+                    results.push((result, incomplete));
                 }
             }
         }
@@ -3346,6 +3544,8 @@ impl HeapRemapper {
                 // The contents are remapped after the rest of the graph.
                 let copy = Gc::new_mut(boxed.read().clone());
                 self.boxes.push(copy.clone());
+                self.pending_cells
+                    .insert(Gc::as_ptr(&copy) as usize, SteelVal::Boxed(copy.clone()));
                 let copy = Some(SteelVal::Boxed(copy));
                 self.memo.insert(key, Remapped::Done(copy.clone()));
                 Some(copy)
@@ -3492,7 +3692,7 @@ impl HeapRemapper {
         children
     }
 
-    fn rebuild(value: &SteelVal, mut children: Vec<SteelVal>) -> SteelVal {
+    fn rebuild(&mut self, value: &SteelVal, mut children: Vec<SteelVal>) -> SteelVal {
         match value {
             SteelVal::ListV(_) => SteelVal::ListV(children.into_iter().collect()),
             SteelVal::VectorV(_) => SteelVal::VectorV(children.into_iter().collect()),
@@ -3505,11 +3705,15 @@ impl HeapRemapper {
                 let mut map = super::HashMap::new();
                 let mut children = children.into_iter();
                 while let (Some(key), Some(value)) = (children.next(), children.next()) {
+                    self.prepare_hash_key(&key);
                     map.insert(key, value);
                 }
                 SteelVal::HashMapV(Gc::new(map).into())
             }
             SteelVal::HashSetV(_) => {
+                for key in &children {
+                    self.prepare_hash_key(key);
+                }
                 let set: super::HashSet<_> = children.into_iter().collect();
                 SteelVal::HashSetV(Gc::new(set).into())
             }
