@@ -2123,7 +2123,7 @@ impl Engine {
     pub fn update_value(&mut self, name: &str, value: SteelVal) -> Option<&mut Self> {
         let idx = self.virtual_machine.compiler.read().get_idx(name)?;
 
-        self.virtual_machine.with_heap(None, |_, _| {});
+        let value = self.virtual_machine.with_heap(None, |_, _| value);
 
         #[cfg(feature = "sync")]
         {

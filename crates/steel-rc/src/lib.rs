@@ -7,12 +7,11 @@ use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ops::Deref;
 use std::pin::Pin;
 use std::ptr::{drop_in_place, NonNull};
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, AtomicUsize};
 use std::sync::LazyLock;
 use std::thread::JoinHandle;
 use std::{cell::Cell, sync::atomic::Ordering};
 
-use core::convert::TryInto;
 use core::num::NonZeroUsize;
 
 use std::{alloc, cmp, fmt, iter, mem, ptr};
@@ -20,64 +19,62 @@ use std::{alloc, cmp, fmt, iter, mem, ptr};
 use std::hash::{Hash, Hasher};
 
 thread_local! {
-    /// Zero-sized thread-local variable to differentiate threads.
-    static THREAD_MARKER: () = ();
+    static OWNER: ThreadOwner = ThreadOwner::new();
+    // No TLS destructor: retired releases must also work after other thread-locals are gone.
+    static RETIRED: Cell<Option<ManuallyDrop<Vec<Wrapper>>>> = const { Cell::new(None) };
 }
 
-const SENTINEL: NonZeroUsize = unsafe { NonZeroUsize::new_unchecked(usize::MAX) };
+static NEXT_THREAD_ID: AtomicUsize = AtomicUsize::new(1);
 
-/// A unique identifier for a running thread.
-///
-/// Uniqueness is guaranteed between running threads. However, the ids of dead
-/// threads may be reused.
-///
-/// There is a chance that this implementation can be replaced by [`std::thread::ThreadId`]
-/// when [`as_u64()`] is stabilized.
-///
-/// **Note:** The current (non platform specific) implementation uses the address of a
-/// thread local static variable for thread identification.
-///
-/// [`as_u64()`]: std::thread::ThreadId::as_u64
-#[derive(Debug, Clone, Copy, Hash, Eq)]
+/// An allocation's owner identity is never reused, even after its thread exits.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 #[repr(transparent)]
-pub(crate) struct ThreadId(pub(crate) NonZeroUsize);
+pub(crate) struct ThreadId(NonZeroUsize);
 
 impl ThreadId {
-    /// Creates a new `ThreadId` for the given raw id.
-    #[inline(always)]
-    pub(crate) const fn new(value: NonZeroUsize) -> Self {
-        Self(value)
-    }
-
-    /// Gets the id for the thread that invokes it.
     #[inline]
-    pub(crate) fn current_thread() -> Self {
-        Self::new(
-            THREAD_MARKER
-                .try_with(|x| x as *const _ as usize)
-                .expect("the thread's local data has already been destroyed")
-                .try_into()
-                .expect("thread id should never be zero"),
-        )
+    fn current_thread() -> Option<Self> {
+        OWNER.try_with(|owner| owner.id).ok()
     }
 }
 
-impl PartialEq for ThreadId {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        match (self.0, other.0) {
-            (SENTINEL, _) | (_, SENTINEL) => false,
-            (a, b) => a == b,
+struct ThreadOwner {
+    id: ThreadId,
+}
+
+impl ThreadOwner {
+    fn new() -> Self {
+        let mut id = NEXT_THREAD_ID.load(Ordering::Relaxed);
+        loop {
+            let next = id.checked_add(1).unwrap_or_else(|| std::process::abort());
+            match NEXT_THREAD_ID.compare_exchange_weak(
+                id,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => id = current,
+            }
         }
+        let id = ThreadId(NonZeroUsize::new(id).unwrap());
+        QUEUE.map.insert(id, Vec::new());
+        Self { id }
     }
 }
 
-// Okay, now that this appears to be working, we
-// need to shrink this down as much as possible.
+impl Drop for ThreadOwner {
+    fn drop(&mut self) {
+        // Removal synchronizes the final local counts with releases after retirement.
+        let pending = QUEUE.map.remove(&self.id);
+        drop(pending);
+    }
+}
+
 #[repr(C)]
 pub struct RcWord {
-    // thread_id: AtomicOptionThreadId,
-    thread_id: Cell<Option<ThreadId>>,
+    // Immutable owner identity; FLAG_MERGED publishes the transition to shared counting.
+    thread_id: AtomicUsize,
     biased_counter: Cell<u32>,
     shared: SharedPacked,
 }
@@ -260,20 +257,16 @@ impl SharedPacked {
         }
     }
 
-    fn new() -> Self {
-        SharedPacked(AtomicU32::new(Packed::new_with(0, false, false).0))
-    }
-
     pub fn is_merged(&self) -> bool {
-        self.0.fetch_and(FLAG_MERGED, Ordering::Relaxed) != 0
+        self.0.load(Ordering::Relaxed) & FLAG_MERGED != 0
     }
 
     pub fn is_queued(&self) -> bool {
-        self.0.fetch_and(FLAG_QUEUED, Ordering::Relaxed) != 0
+        self.0.load(Ordering::Relaxed) & FLAG_QUEUED != 0
     }
 
     pub fn value(&self) -> u32 {
-        self.0.fetch_and(VALUE_MASK, Ordering::Relaxed)
+        self.0.load(Ordering::Relaxed) & VALUE_MASK
     }
 }
 
@@ -285,14 +278,54 @@ pub struct RcBox<T: ?Sized> {
 
 impl RcWord {
     pub fn new() -> Self {
-        let id = ThreadId::current_thread();
-
-        // debug_assert!(QueueHandle::is_thread_registered(id));
-
+        let owner = ThreadId::current_thread();
         Self {
-            thread_id: Cell::new(Some(id)),
-            biased_counter: Cell::new(1),
-            shared: SharedPacked::new(),
+            thread_id: AtomicUsize::new(owner.map_or(0, |id| id.0.get())),
+            biased_counter: Cell::new(u32::from(owner.is_some())),
+            // TLS destructors can allocate after OWNER has already been destroyed.
+            shared: SharedPacked(AtomicU32::new(
+                Packed::new_with(i32::from(owner.is_none()), owner.is_none(), false).0,
+            )),
+        }
+    }
+
+    fn is_owner(&self) -> bool {
+        ThreadId::current_thread()
+            .is_some_and(|id| self.thread_id.load(Ordering::Relaxed) == id.0.get())
+            && !self.shared.load(Ordering::Acquire).is_merged()
+    }
+
+    // Only the owner, or a releaser synchronized with its retirement, may merge.
+    fn merge_counts(&self, release_queue: bool) -> DecrementAction {
+        let mut old = self.shared.load(Ordering::Acquire);
+        let local = if old.is_merged() {
+            0
+        } else {
+            self.biased_counter.get() as i32
+        };
+        loop {
+            let mut new = old;
+            if !old.is_merged() {
+                new.update_counter(|count| count + local);
+                new.set_merged(true);
+            }
+            if release_queue {
+                new.set_queued(false);
+            }
+            match self
+                .shared
+                .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    // Do not touch metadata after publishing: another release can free it.
+                    return if new.get_counter() == 0 && !new.is_queued() {
+                        DecrementAction::Deallocate
+                    } else {
+                        DecrementAction::DoNothing
+                    };
+                }
+                Err(current) => old = Packed(current),
+            }
         }
     }
 }
@@ -305,13 +338,8 @@ pub enum DecrementAction {
 }
 
 impl<T: ?Sized> RcBox<T> {
-    // TODO: Lift this to the Obj struct that eventually gets made
     pub fn increment(&self) {
-        // let owner_tid = self.rcword.thread_id.load(Ordering::Relaxed);
-        let owner_tid = self.rcword.thread_id.get();
-        let my_tid = ThreadId::current_thread();
-
-        if owner_tid == Some(my_tid) {
+        if self.rcword.is_owner() {
             self.fast_increment();
         } else {
             self.slow_increment();
@@ -320,69 +348,31 @@ impl<T: ?Sized> RcBox<T> {
 
     pub fn fast_increment(&self) {
         let counter = self.rcword.biased_counter.get();
-
-        if counter == u32::MAX {
-            panic!("reference counter overflow");
+        if counter >= (1 << 29) - 1 {
+            std::process::abort();
         }
         self.rcword.biased_counter.set(counter + 1);
     }
 
     pub fn slow_increment(&self) {
-        // loop {
-        //     // TODO: Do some reading on the memory implications here
-        //     // Do we have to read the whole thing together?
-        //     let old = self.rcword.shared.load(Ordering::Relaxed);
-        //     let mut new = old;
-        //     new.update_counter(|x| x + 1);
-
-        //     if self
-        //         .rcword
-        //         .shared
-        //         .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
-        //         .is_ok()
-        //     {
-        //         break;
-        //     }
-        // }
-
-        // TODO: Use fetch update instead!
-        // self.rcword
-        //     .shared
-        //     .0
-        //     .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |old| {
-        //         let mut value = Packed(old);
-        //         value.update_counter(|x| x + 1);
-        //         Some(value.0)
-        //     });
-
         let mut old = self.rcword.shared.load(Ordering::Relaxed);
-
         loop {
-            // TODO: Do some reading on the memory implications here
-            // Do we have to read the whole thing together?
-            // let old = self.rcword.shared.load(Ordering::Relaxed);
             let mut new = old;
-            new.update_counter(|x| x + 1);
-
-            match self
-                .rcword
-                .shared
-                .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
-            {
-                Ok(_) => break,
-                Err(e) => {
-                    old = Packed(e);
-                }
+            new.update_counter(|count| count + 1);
+            match self.rcword.shared.compare_exchange(
+                old,
+                new,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(current) => old = Packed(current),
             }
         }
     }
 
     pub fn decrement(&self) -> DecrementAction {
-        // let owner_tid = self.rcword.thread_id.load(Ordering::Relaxed);
-        let owner_tid = self.rcword.thread_id.get();
-        let my_tid = ThreadId::current_thread();
-
-        if owner_tid == Some(my_tid) {
+        if self.rcword.is_owner() {
             self.fast_decrement()
         } else {
             self.slow_decrement()
@@ -390,185 +380,136 @@ impl<T: ?Sized> RcBox<T> {
     }
 
     pub fn fast_decrement(&self) -> DecrementAction {
-        let count = self.rcword.biased_counter.get();
-        self.rcword.biased_counter.set(count - 1);
-
-        if self.rcword.biased_counter.get() > 0 {
-            return DecrementAction::DoNothing;
-        }
-
-        let mut new;
-
-        // loop {
-        //     let old = self.rcword.shared.load(Ordering::Relaxed);
-        //     new = old;
-        //     new.set_merged(true);
-        //     if self
-        //         .rcword
-        //         .shared
-        //         .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
-        //         .is_ok()
-        //     {
-        //         break;
-        //     }
-        // }
-
-        let mut old = self.rcword.shared.load(Ordering::Relaxed);
-
-        loop {
-            new = old;
-            new.set_merged(true);
-            match self
-                .rcword
-                .shared
-                .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
-            {
-                Ok(_) => break,
-                Err(e) => {
-                    old = Packed(e);
-                }
-            }
-        }
-
-        std::sync::atomic::fence(Ordering::Acquire);
-
-        if new.get_counter() == 0 {
-            DecrementAction::Deallocate
-        } else {
-            // self.rcword.thread_id.store(None, Ordering::Relaxed);
-            self.rcword.thread_id.set(None);
-
+        let count = self.rcword.biased_counter.get() - 1;
+        self.rcword.biased_counter.set(count);
+        if count > 0 {
             DecrementAction::DoNothing
+        } else {
+            self.rcword.merge_counts(false)
         }
     }
 
     pub fn slow_decrement(&self) -> DecrementAction {
-        // let mut old;
-        // let mut new;
-        // loop {
-        //     old = self.rcword.shared.load(Ordering::Relaxed);
-        //     new = old;
-
-        //     new.update_counter(|x| x - 1);
-
-        //     if new.get_counter() < 0 {
-        //         new.set_queued(true);
-        //     }
-
-        //     if self
-        //         .rcword
-        //         .shared
-        //         .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
-        //         .is_ok()
-        //     {
-        //         break;
-        //     }
-        // }
-
         let mut old = self.rcword.shared.load(Ordering::Relaxed);
-        let mut new;
         loop {
-            new = old;
-            new.update_counter(|x| x - 1);
-
-            if new.get_counter() < 0 {
+            let mut new = old;
+            new.update_counter(|count| count - 1);
+            if new.get_counter() < 0 && !new.is_merged() {
+                // The queued bit retains the allocation through enqueue and merging.
                 new.set_queued(true);
             }
-
             match self
                 .rcword
                 .shared
                 .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
             {
-                Ok(_) => break,
-                Err(e) => {
-                    old = Packed(e);
+                Ok(_) => {
+                    return if !old.is_queued() && new.is_queued() {
+                        DecrementAction::Queue
+                    } else if new.is_merged() && !new.is_queued() && new.get_counter() == 0 {
+                        DecrementAction::Deallocate
+                    } else {
+                        DecrementAction::DoNothing
+                    };
                 }
+                Err(current) => old = Packed(current),
             }
-        }
-
-        std::sync::atomic::fence(Ordering::Acquire);
-
-        if old.get_queued() != new.get_queued() {
-            DecrementAction::Queue
-        } else if new.get_merged() && new.get_counter() == 0 {
-            DecrementAction::Deallocate
-        } else {
-            DecrementAction::DoNothing
         }
     }
 
     fn has_unique_ref(&self) -> bool {
-        let owner = self.rcword.thread_id.get();
-        match owner {
-            None => {
-                let meta = &self.rcword;
-                let mut new;
-                let mut old;
-
-                // loop {
-                old = meta.shared.load(Ordering::Relaxed);
-                new = old;
-
-                old.set_counter(1);
-                new.set_counter(0);
-
-                std::sync::atomic::fence(Ordering::Acquire);
-
-                if meta
-                    .shared
-                    .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_err()
-                {
-                    false
-                } else {
-                    // let owner = self.rcword.thread_id.get();
-                    // match owner {
-                    //     None => false,
-                    //     Some(tid) if tid == ThreadId::current_thread() => {
-                    //         self.rcword.biased_counter.get() as i32 == 1
-                    //     }
-                    //     Some(_) => false,
-                    // }
-
-                    true
-                }
-            }
-            Some(tid) if tid == ThreadId::current_thread() => {
-                let local_count = self.rcword.biased_counter.get();
-                if local_count == 1 {
-                    let meta = &self.rcword;
-                    let old = meta.shared.load(Ordering::Relaxed);
-                    std::sync::atomic::fence(Ordering::Acquire);
-                    if old.get_counter() != 0 {
-                        false
-                    } else {
-                        true
-                    }
-                } else {
-                    false
-                }
-            }
-
-            Some(_) => false,
+        let meta = &self.rcword;
+        let word = meta.shared.load(Ordering::Acquire);
+        if word.is_queued() {
+            return false;
+        }
+        if word.is_merged() {
+            word.get_counter() == 1
+        } else {
+            meta.is_owner() && meta.biased_counter.get() == 1 && word.get_counter() == 0
         }
     }
 }
 
 pub struct Wrapper(Box<ManuallyDrop<dyn BiasedMerge>>);
 
+// Foreign releases can only originate from values whose payload may cross threads.
 unsafe impl Send for Wrapper {}
 unsafe impl Sync for Wrapper {}
 
-#[derive(Default)]
-pub struct QueueHandle {
-    map: dashmap::DashMap<Option<ThreadId>, Vec<Wrapper>>,
-    unregistered: dashmap::DashMap<Option<ThreadId>, Vec<Wrapper>>,
+impl Drop for Wrapper {
+    fn drop(&mut self) {
+        if self.0.meta_outer().merge_counts(true) == DecrementAction::Deallocate {
+            unsafe { self.0.drop_contents_and_maybe_box_outer() };
+        }
+    }
 }
 
-/// The same as `std::thread::spawn`, however this will run
-/// an explicit merge on that thread when the given function
-/// exits.
+struct RetiredDrain;
+
+impl RetiredDrain {
+    fn enqueue(value: Wrapper) {
+        let active = RETIRED.with(|slot| {
+            let pending = slot.take();
+            let active = pending.is_some();
+            let mut values = pending.map(ManuallyDrop::into_inner).unwrap_or_default();
+            values.push(value);
+            slot.set(Some(ManuallyDrop::new(values)));
+            active
+        });
+        if !active {
+            let guard = Self;
+            guard.drain();
+        }
+    }
+
+    fn drain(&self) {
+        while let Some(value) = RETIRED.with(|slot| {
+            let mut values = ManuallyDrop::into_inner(slot.take()?);
+            let value = values.pop();
+            if value.is_some() {
+                // Keep the drain active while the destructor can enqueue more work.
+                slot.set(Some(ManuallyDrop::new(values)));
+            }
+            value
+        }) {
+            drop(value);
+        }
+    }
+}
+
+impl Drop for RetiredDrain {
+    fn drop(&mut self) {
+        self.drain();
+    }
+}
+
+/// A detached batch must be processed on its owner's thread, outside heap locks.
+#[must_use]
+pub struct PendingMerges {
+    values: Vec<Wrapper>,
+    owner: PhantomData<std::rc::Rc<()>>,
+}
+
+impl PendingMerges {
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    pub fn merge(self) -> usize {
+        let count = self.values.len();
+        drop(self);
+        count
+    }
+}
+
+#[derive(Default)]
+pub struct QueueHandle {
+    map: dashmap::DashMap<ThreadId, Vec<Wrapper>>,
+}
+
+/// Like `std::thread::spawn`, with an explicit merge before returning.
+/// All threads also retire their owners at TLS teardown, including during unwinding.
 pub fn with_explicit_merge<F, T>(f: F) -> JoinHandle<T>
 where
     F: FnOnce() -> T,
@@ -590,52 +531,11 @@ pub trait BiasedMerge {
 }
 
 impl<T: ?Sized> BiasedMerge for BiasedRc<T> {
-    fn merge(mut self) {
-        // let mut old;
-        // let mut new;
-        // loop {
-        //     old = self.meta().shared.load(Ordering::Acquire);
-        //     new = old;
-        //     new.update_counter(|x| x + self.meta().biased_counter.get() as i32);
-        //     new.set_merged(true);
-
-        //     if self
-        //         .meta()
-        //         .shared
-        //         .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
-        //         .is_ok()
-        //     {
-        //         break;
-        //     }
-        // }
-
-        let mut old = self.meta().shared.load(Ordering::Acquire);
-        let mut new;
-        loop {
-            new = old;
-            new.update_counter(|x| x + self.meta().biased_counter.get() as i32);
-            new.set_merged(true);
-
-            match self
-                .meta()
-                .shared
-                .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
-            {
-                Ok(_) => break,
-                Err(e) => {
-                    old = Packed(e);
-                }
-            }
+    fn merge(self) {
+        if self.meta().is_owner() {
+            self.meta().merge_counts(false);
         }
-
-        if new.get_counter() == 0 {
-            unsafe { self.drop_contents_and_maybe_box() };
-        } else {
-            // self.meta().thread_id.store(None, Ordering::Relaxed);
-            self.meta().thread_id.set(None);
-        }
-
-        std::mem::forget(self);
+        drop(self);
     }
 
     fn meta_outer(&self) -> &RcWord {
@@ -647,141 +547,59 @@ impl<T: ?Sized> BiasedMerge for BiasedRc<T> {
     }
 }
 
-pub static QUEUE: LazyLock<QueueHandle> = LazyLock::new(|| QueueHandle::default());
+pub static QUEUE: LazyLock<QueueHandle> = LazyLock::new(QueueHandle::default);
 
-/// Registers the currently running thread with the queue collector.
-/// This isn't explicitly required; however if you do not
+/// Registers this thread. Allocating a biased value also registers it automatically.
 pub fn register_thread() {
     QueueHandle::register_thread();
 }
 
 impl QueueHandle {
     pub fn register_thread() {
-        let key = ThreadId::current_thread();
-
-        if !QUEUE.map.contains_key(&Some(key)) {
-            QUEUE.map.insert(Some(key), Vec::new());
-        }
+        let _ = ThreadId::current_thread();
     }
 
-    pub fn enqueue<T: ?Sized + 'static>(value: &BiasedRc<T>) {
-        // let key = value.meta().thread_id.load(Ordering::Relaxed);
-        let key = value.meta().thread_id.get();
+    fn enqueue<T: ?Sized + 'static>(value: &BiasedRc<T>) {
+        let key =
+            ThreadId(NonZeroUsize::new(value.meta().thread_id.load(Ordering::Relaxed)).unwrap());
+        let pending = Wrapper(Box::new(ManuallyDrop::new(BiasedRc::from_inner(value.ptr))));
+        if let Some(mut queue) = QUEUE.map.get_mut(&key) {
+            queue.push(pending);
+            return;
+        }
+        // The registry lock synchronizes with retirement; no owner can update local counts.
+        RetiredDrain::enqueue(pending);
+    }
 
-        // TODO: The thread ID needs to be registered once its created. Otherwise,
-        // this doesn't really work.
-        if let Some(mut q) = QUEUE.map.get_mut(&key) {
-            q.push(Wrapper(Box::new(ManuallyDrop::new(BiasedRc::from_inner(
-                value.ptr,
-            )))));
-        } else {
-            if let Some(mut q) = QUEUE.unregistered.get_mut(&key) {
-                q.push(Wrapper(Box::new(ManuallyDrop::new(BiasedRc::from_inner(
-                    value.ptr,
-                )))));
-            } else {
-                QUEUE.unregistered.insert(
-                    key,
-                    vec![Wrapper(Box::new(ManuallyDrop::new(BiasedRc::from_inner(
-                        value.ptr,
-                    ))))],
-                );
-            }
-
-            // Fallback thread, for something that is unclaimed
-            // guard.insert_fallback(BiasedRc::from_inner(value.ptr));
+    pub fn take_pending() -> PendingMerges {
+        let values = ThreadId::current_thread()
+            .and_then(|id| {
+                QUEUE
+                    .map
+                    .get_mut(&id)
+                    .map(|mut queue| mem::take(&mut *queue))
+            })
+            .unwrap_or_default();
+        PendingMerges {
+            values,
+            owner: PhantomData,
         }
     }
 
     pub fn run_explicit_merge() -> usize {
-        let current = ThreadId::current_thread();
-
-        // Attempt to coalesce the unregistered queue, if its now registered:
-
-        let unregistered = QUEUE
-            .unregistered
-            .get_mut(&Some(current))
-            .map(|mut x| Self::explicit_merge(&mut x))
-            .unwrap_or_default();
-
-        let registered = QUEUE
-            .map
-            .get_mut(&Some(ThreadId::current_thread()))
-            .map(|mut x| Self::explicit_merge(&mut x))
-            .unwrap_or_default();
-
-        unregistered + registered
-
-        // ret + Self::explicit_merge(&mut guard.inner)
+        Self::take_pending().merge()
     }
 
+    /// Drains pending work without retiring a still-running owner.
     pub fn finish_thread_merge() {
-        let id = ThreadId::current_thread();
-        let q = QUEUE.map.remove(&Some(id));
-        q.map(|mut x| Self::explicit_merge(&mut x.1));
+        Self::run_explicit_merge();
     }
 
     pub fn explicit_merge(values: &mut Vec<Wrapper>) -> usize {
-        // println!(
-        //     "Running explicit merge on thread: {:?} with count: {}",
-        //     std::thread::current().id(),
-        //     values.len()
-        // );
-
-        let ret = values.len();
-
-        for value in values.drain(..) {
-            let mut value = value.0;
-            // let mut old;
-            // let mut new;
-            // loop {
-            //     old = value.meta_outer().shared.load(Ordering::Acquire);
-            //     new = old;
-            //     new.update_counter(|x| x + value.meta_outer().biased_counter.get() as i32);
-            //     new.set_merged(true);
-
-            //     if value
-            //         .meta_outer()
-            //         .shared
-            //         .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
-            //         .is_ok()
-            //     {
-            //         break;
-            //     }
-            // }
-
-            let mut old = value.meta_outer().shared.load(Ordering::Acquire);
-            let mut new;
-            loop {
-                new = old;
-                new.update_counter(|x| x + value.meta_outer().biased_counter.get() as i32);
-                new.set_merged(true);
-
-                match value.meta_outer().shared.compare_exchange(
-                    old,
-                    new,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(e) => {
-                        old = Packed(e);
-                    }
-                }
-            }
-
-            if new.get_counter() == 0 {
-                // println!("invoking the destructor");
-                unsafe { value.drop_contents_and_maybe_box_outer() };
-            } else {
-                // value.meta_outer().thread_id.store(None, Ordering::Relaxed);
-                value.meta_outer().thread_id.set(None);
-            }
-
-            drop(value);
-        }
-
-        ret
+        let values = mem::take(values);
+        let count = values.len();
+        drop(values);
+        count
     }
 }
 
@@ -1116,26 +934,16 @@ impl<T: ?Sized> BiasedRc<T> {
     #[inline]
     pub fn strong_count(this: &Self) -> usize {
         let meta = this.meta();
-
         let word = meta.shared.load(Ordering::Acquire);
-        let mut count = word.get_counter();
-
-        // If the counter is 0, then we have to get the count from somewhere else
-        if word.get_counter() == 0 {
-            // let owner = self.rcword.thread_id.load(Ordering::Relaxed);
-            let owner = meta.thread_id.get();
-            match owner {
-                None => {}
-                Some(tid) if tid == ThreadId::current_thread() => {
-                    count = meta.biased_counter.get() as i32;
-                }
-                Some(_) => {
-                    count = 2;
-                }
-            }
+        if word.is_merged() {
+            word.get_counter() as usize + usize::from(word.is_queued())
+        } else if meta.is_owner() {
+            (meta.biased_counter.get() as i32 + word.get_counter()) as usize
+                + usize::from(word.is_queued())
+        } else {
+            // A foreign thread cannot read the owner's local counter.
+            2
         }
-
-        count as _
     }
 
     /// Gets the approximate number of strong pointers to the pinned inner value.
@@ -1217,76 +1025,13 @@ impl<T> BiasedRc<T> {
     }
 
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
-        // let owner = this.meta().thread_id.load(Ordering::Relaxed);
-        let owner = this.meta().thread_id.get();
-        match owner {
-            None => Self::try_unwrap_internal(this),
-            Some(tid) if tid == ThreadId::current_thread() => {
-                let local_count = this.meta().biased_counter.get();
-
-                if local_count == 1 {
-                    Self::try_unwrap_internal_same_thread(this)
-                } else {
-                    Err(this)
-                }
-            }
-            // Has an owner on a different thread.
-            Some(_) => Err(this),
+        if !this.get_box().has_unique_ref() {
+            return Err(this);
         }
-    }
-
-    fn try_unwrap_internal_same_thread(this: Self) -> Result<T, Self> {
-        let meta = this.meta();
-        let old = meta.shared.load(Ordering::Relaxed);
-
-        std::sync::atomic::fence(Ordering::Acquire);
-
-        if old.get_counter() != 0 {
-            Err(this)
-        } else {
-            // meta.thread_id.store(None, Ordering::Relaxed);
-            let copy = unsafe { ptr::read(Self::as_ptr(&this)) };
-
-            // Deallocate the box?
-            unsafe { RcBox::dealloc(this.ptr) };
-
-            mem::forget(this);
-
-            Ok(copy)
-        }
-    }
-
-    #[inline]
-    fn try_unwrap_internal(this: Self) -> Result<T, Self> {
-        let meta = this.meta();
-        let mut new;
-        let mut old;
-
-        // loop {
-        old = meta.shared.load(Ordering::Relaxed);
-        new = old;
-
-        old.set_counter(1);
-        new.set_counter(0);
-
-        std::sync::atomic::fence(Ordering::Acquire);
-
-        if meta
-            .shared
-            .compare_exchange(old, new, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-        {
-            Err(this)
-        } else {
-            // meta.thread_id.store(None, Ordering::Relaxed);
-            let copy = unsafe { ptr::read(Self::as_ptr(&this)) };
-            // Deallocate the box?
-            unsafe { RcBox::dealloc(this.ptr) };
-
-            mem::forget(this);
-
-            Ok(copy)
-        }
+        let copy = unsafe { ptr::read(Self::as_ptr(&this)) };
+        unsafe { RcBox::dealloc(this.ptr) };
+        mem::forget(this);
+        Ok(copy)
     }
 }
 
@@ -1851,7 +1596,7 @@ fn test_moving_across_threads() {
     // owner thread, but the value has not been enqueued. At this point
     // now it should be clear that the thread is dead, because we've marked it
     // as such?
-    dbg!(value.get_box().rcword.thread_id.get() == Some(ThreadId::current_thread()));
+    dbg!(value.get_box().rcword.is_owner());
 
     drop(value);
 
@@ -1978,3 +1723,6 @@ fn make_mut_test() {
 //     let word = BiasedRc::new(10);
 //     drop(word);
 // }
+
+#[cfg(test)]
+mod lifecycle_tests;

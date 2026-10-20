@@ -27,6 +27,9 @@ fn should_trampoline(ctx: &mut VmCore) -> bool {
 }
 
 pub(crate) fn jit_compile_lambda(ctx: &mut VmCore, mut func: ByteCodeLambda) -> ByteCodeLambda {
+    if func.super_instructions.is_some() {
+        return func;
+    }
     if func
         .body_exp
         .iter()
@@ -70,7 +73,7 @@ pub(crate) fn jit_compile_lambda(ctx: &mut VmCore, mut func: ByteCodeLambda) -> 
 
     // Save the entry instruction in the event we end up serializing this
     // later.
-    func.header = Some(instructions[0].op_code);
+    func.header.get_or_insert(instructions[0].op_code);
 
     instructions[0].op_code = OpCode::DynSuperInstruction;
 
@@ -121,6 +124,7 @@ pub(crate) fn jit_compile_two(ctx: &mut VmCore, args: &[SteelVal]) -> Option<Res
                     func.super_instructions = super_instructions;
 
                     let mut instructions = func.body_exp.iter().copied().collect::<Vec<_>>();
+                    func.header.get_or_insert(instructions[0].op_code);
                     instructions[0].op_code = OpCode::DynSuperInstruction;
 
                     func.body_exp = Arc::from(instructions.into_boxed_slice());
@@ -163,6 +167,9 @@ pub(crate) fn jit_compile(ctx: &mut VmCore, args: &[SteelVal]) -> Option<Result<
     });
 
     if let SteelVal::Closure(func) = function {
+        if func.super_instructions.is_some() {
+            return Some(Ok(function.clone()));
+        }
         let mut func = func.unwrap();
 
         let name = func.id.to_string();
@@ -187,6 +194,7 @@ pub(crate) fn jit_compile(ctx: &mut VmCore, args: &[SteelVal]) -> Option<Result<
         func.super_instructions = super_instructions;
 
         let mut instructions = func.body_exp.iter().copied().collect::<Vec<_>>();
+        func.header.get_or_insert(instructions[0].op_code);
         instructions[0].op_code = OpCode::DynSuperInstruction;
 
         func.body_exp = Arc::from(instructions.into_boxed_slice());

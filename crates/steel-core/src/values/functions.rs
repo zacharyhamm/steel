@@ -237,6 +237,20 @@ impl core::ops::Deref for RootedInstructions {
 }
 
 impl ByteCodeLambda {
+    /// Instructions for dependency scans, before the JIT patched the entry opcode.
+    pub(crate) fn original_instructions(&self) -> impl Iterator<Item = DenseInstruction> + '_ {
+        self.body_exp
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, mut instruction)| {
+                if index == 0 {
+                    instruction.op_code = self.header.unwrap_or(instruction.op_code);
+                }
+                instruction
+            })
+    }
+
     pub fn new(
         id: u32,
         body_exp: StandardShared<[DenseInstruction]>,

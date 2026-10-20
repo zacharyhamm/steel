@@ -1269,6 +1269,8 @@ impl SteelThread {
         let result = thunk(self, &mut guard);
         let released = core::mem::take(&mut guard.released);
         let retained = core::mem::take(&mut guard.released_retained);
+        #[cfg(feature = "biased")]
+        let pending = steel_rc::QueueHandle::take_pending();
         let can_reenter = !retained.is_empty()
             || released.iter().any(|value| {
                 !matches!(
@@ -1284,6 +1286,8 @@ impl SteelThread {
                         | SteelVal::BuiltIn(_)
                 )
             });
+        #[cfg(feature = "biased")]
+        let can_reenter = can_reenter || !pending.is_empty();
         // Destructors can collect through another engine before the result reaches the stack.
         let active_roots = can_reenter.then(|| {
             ActiveHeapRoots::new(self, constants)
@@ -1295,6 +1299,8 @@ impl SteelThread {
         drop(guard);
         drop(released);
         drop(retained);
+        #[cfg(feature = "biased")]
+        pending.merge();
         drop(active_roots);
         drop(result_roots);
         result
@@ -1392,7 +1398,7 @@ impl SteelThread {
     }
 
     pub fn insert_binding(&mut self, idx: usize, value: SteelVal) {
-        self.with_heap(None, |_, _| {});
+        let value = self.with_heap(None, |_, _| value);
 
         #[cfg(feature = "sync")]
         self.with_locked_env(move |_, env| {

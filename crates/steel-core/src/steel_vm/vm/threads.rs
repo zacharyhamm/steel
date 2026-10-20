@@ -208,84 +208,51 @@ pub fn closure_into_serializable(
     c: &ByteCodeLambda,
     ctx: &mut SerializationContext,
 ) -> Result<SerializedLambda> {
-    if let Some(prototype) = CACHED_CLOSURES.with(|x| x.borrow().get(&c.id).cloned()) {
-        let mut prototype = SerializedLambda {
-            id: prototype.id,
-            body_exp: prototype.body_exp,
-            arity: prototype.arity,
-            is_multi_arity: prototype.is_multi_arity,
-            captures: Vec::new(),
-            constants: HashMap::new(),
-        };
-
-        prototype.captures = c
-            .captures
-            .iter()
-            .cloned()
-            .map(|x| into_serializable_value(x, ctx))
-            .collect::<Result<_>>()?;
-
-        Ok(prototype)
-    } else {
-        let mut constants = HashMap::new();
-
-        for instr in c.body_exp.iter() {
-            if instr.op_code == OpCode::PUSHCONST {
-                let index = instr.payload_size.to_usize();
-                let value = ctx.constants.get(index);
-                constants.insert(index, into_serializable_value(value, ctx).unwrap());
-            }
-
-            match instr.op_code {
-                // If this instruction touches this global variable,
-                // then we want to mark it as possibly referenced here.
-                OpCode::CALLGLOBAL
-                | OpCode::CALLPRIMITIVE
-                | OpCode::PUSH
-                | OpCode::CALLGLOBALTAIL
-                | OpCode::CALLGLOBALNOARITY
-                | OpCode::CALLGLOBALTAILNOARITY => {
-                    let idx = instr.payload_size.to_usize();
-                    ctx.reachable_globals.insert(idx);
-                }
-                _ => {}
-            }
-        }
-
-        let mut prototype = SerializedLambdaPrototype {
+    let cached = CACHED_CLOSURES.with(|x| x.borrow().get(&c.id).cloned());
+    let prototype = cached.unwrap_or_else(|| {
+        let prototype = SerializedLambdaPrototype {
             id: c.id,
-
-            body_exp: c.body_exp.iter().cloned().collect(),
-
+            body_exp: c.original_instructions().collect(),
             arity: c.arity as _,
             is_multi_arity: c.is_multi_arity,
-            constants,
+            constants: HashMap::new(),
         };
-
-        if let Some(header) = c.header {
-            prototype.body_exp[0].op_code = header;
-        }
-
         CACHED_CLOSURES.with(|x| x.borrow_mut().insert(c.id, prototype.clone()));
-
-        let mut prototype = SerializedLambda {
-            id: prototype.id,
-            body_exp: prototype.body_exp,
-            arity: prototype.arity,
-            is_multi_arity: prototype.is_multi_arity,
-            captures: Vec::new(),
-            constants: prototype.constants,
-        };
-
-        prototype.captures = c
+        prototype
+    });
+    let mut constants = HashMap::new();
+    // Dependencies belong to this serialization context, including on cache hits.
+    for instr in &prototype.body_exp {
+        match instr.op_code {
+            OpCode::PUSHCONST => {
+                let index = instr.payload_size.to_usize();
+                let value = ctx.constants.get(index);
+                constants.insert(index, into_serializable_value(value, ctx)?);
+            }
+            OpCode::CALLGLOBAL
+            | OpCode::CALLPRIMITIVE
+            | OpCode::PUSH
+            | OpCode::CALLGLOBALTAIL
+            | OpCode::CALLGLOBALNOARITY
+            | OpCode::CALLGLOBALTAILNOARITY => {
+                ctx.reachable_globals.insert(instr.payload_size.to_usize());
+            }
+            _ => {}
+        }
+    }
+    Ok(SerializedLambda {
+        id: prototype.id,
+        body_exp: prototype.body_exp,
+        arity: prototype.arity,
+        is_multi_arity: prototype.is_multi_arity,
+        captures: c
             .captures
             .iter()
             .cloned()
             .map(|x| into_serializable_value(x, ctx))
-            .collect::<Result<_>>()?;
-
-        Ok(prototype)
-    }
+            .collect::<Result<_>>()?,
+        constants,
+    })
 }
 
 #[allow(unused)]
@@ -1435,4 +1402,137 @@ pub fn threading_module() -> BuiltInModule {
             std::thread::available_parallelism().map(|x| x.get()).ok()
         });
     module
+}
+
+#[cfg(test)]
+mod closure_dependency_tests {
+    use super::*;
+    use crate::compiler::code_gen::fresh_function_id;
+    use crate::core::instructions::{u24, DenseInstruction};
+    use crate::steel_vm::engine::Engine;
+
+    #[test]
+    fn entry_dependencies_survive_compilation_and_cached_serialization() {
+        let mut engine = Engine::new();
+        let global = engine.virtual_machine.global_env.len();
+        engine
+            .virtual_machine
+            .insert_binding(global, SteelVal::IntV(42));
+        let constant = engine
+            .virtual_machine
+            .compiler
+            .write()
+            .constant_map
+            .add_or_get(SteelVal::IntV(1000));
+        let constants = engine.virtual_machine.compiler.read().constant_map.clone();
+        constants.flush();
+        engine.virtual_machine.constant_map = constants.clone();
+        for (opcode, index, expected) in [
+            (OpCode::PUSH, global, SteelVal::IntV(42)),
+            (OpCode::PUSHCONST, constant, SteelVal::IntV(1000)),
+        ] {
+            for mode in 0..if cfg!(feature = "jit2") { 4 } else { 1 } {
+                let instructions = vec![
+                    DenseInstruction::new(opcode, u24::from_usize(index)),
+                    DenseInstruction::new(OpCode::POPPURE, u24::from_usize(0)),
+                ];
+                let function = ByteCodeLambda::new(
+                    fresh_function_id() as _,
+                    instructions.clone().into(),
+                    0,
+                    false,
+                    Default::default(),
+                );
+                #[cfg(feature = "jit2")]
+                let function = {
+                    let mut ctx = VmCore {
+                        thread: &mut engine.virtual_machine,
+                        constants: constants.clone(),
+                        instructions: RootedInstructions::new(vec![].into()),
+                        ip: 0,
+                        sp: 0,
+                        pop_count: 1,
+                        depth: 0,
+                        root_spans: &[],
+                        return_value: None,
+                        is_native: false,
+                        result: None,
+                    };
+                    match mode {
+                        0 => function,
+                        1 => {
+                            let function = jit::jit_compile_lambda(&mut ctx, function);
+                            jit::jit_compile_lambda(&mut ctx, function)
+                        }
+                        2 => {
+                            let function = SteelVal::Closure(Gc::new(function));
+                            let compiled =
+                                jit::jit_compile(&mut ctx, &[function]).unwrap().unwrap();
+                            let SteelVal::Closure(function) =
+                                jit::jit_compile(&mut ctx, &[compiled]).unwrap().unwrap()
+                            else {
+                                panic!("expected compiled closure");
+                            };
+                            function.unwrap()
+                        }
+                        _ => {
+                            let slot = ctx.thread.global_env.len();
+                            let function = SteelVal::Closure(Gc::new(function));
+                            ctx.thread.insert_binding(slot, function.clone());
+                            jit::jit_compile_two(&mut ctx, &[function])
+                                .unwrap()
+                                .unwrap();
+                            let function = ctx.thread.global_env.roots()[slot].clone();
+                            jit::jit_compile_two(&mut ctx, &[function.clone()])
+                                .unwrap()
+                                .unwrap();
+                            let SteelVal::Closure(function) = function else {
+                                unreachable!()
+                            };
+                            function.unwrap()
+                        }
+                    }
+                };
+                #[cfg(feature = "jit2")]
+                if mode > 0 {
+                    assert!(function.super_instructions.is_some(), "mode {mode}");
+                    assert_eq!(function.header, Some(opcode), "mode {mode}");
+                    assert_eq!(function.body_exp[0].op_code, OpCode::DynSuperInstruction);
+                }
+                assert_eq!(
+                    function.original_instructions().collect::<Vec<_>>(),
+                    instructions
+                );
+                for _ in 0..2 {
+                    let compiler = engine.virtual_machine.compiler.read();
+                    let mut context = SerializationContext {
+                        builtin_modules: &compiler.builtin_modules,
+                        serialized_heap: &mut FxHashMap::default(),
+                        serialized_heap_vectors: &mut FxHashMap::default(),
+                        visited: &mut FxHashSet::default(),
+                        globals: engine.virtual_machine.global_env.roots(),
+                        symbol_map: &compiler.symbol_map,
+                        constants: &constants,
+                        reachable_globals: FxHashSet::default(),
+                        reachable_structs: FxHashSet::default(),
+                        compiled_modules: &compiler.module_manager,
+                    };
+                    let serialized = closure_into_serializable(&function, &mut context).unwrap();
+                    assert_eq!(serialized.body_exp, instructions, "mode {mode}");
+                    if opcode == OpCode::PUSH {
+                        assert_eq!(context.reachable_globals, [global].into_iter().collect());
+                    } else {
+                        assert!(matches!(
+                            serialized.constants.get(&constant),
+                            Some(SerializableSteelVal::IntV(1000))
+                        ));
+                    }
+                }
+                let result = engine
+                    .call_function_with_args(SteelVal::Closure(Gc::new(function)), vec![])
+                    .unwrap();
+                assert_eq!(result, expected, "mode {mode}");
+            }
+        }
+    }
 }

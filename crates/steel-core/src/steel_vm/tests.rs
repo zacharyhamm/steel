@@ -1675,6 +1675,10 @@ mod embedding_regressions {
             Arc,
         };
 
+        if !in_teardown_child("deep_clones_release_shared_values_individually") {
+            return;
+        }
+
         struct Holder(SteelVal, Arc<AtomicUsize>);
         impl Custom for Holder {
             fn gc_visit_children(&self, context: &mut MarkAndSweepContext) {
@@ -2443,6 +2447,22 @@ mod embedding_regressions {
         nested
     }
 
+    #[cfg(feature = "sync")]
+    #[test]
+    fn retired_worker_releases_deeply_nested_list() {
+        if !in_teardown_child("retired_worker_releases_deeply_nested_list") {
+            return;
+        }
+
+        let value = std::thread::spawn(deeply_nested_list).join().unwrap();
+        std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || drop(value))
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[cfg(not(feature = "sync"))]
     #[test]
     fn vtable_teardown_releases_nested_lists_without_list_storage() {
@@ -2581,6 +2601,10 @@ mod embedding_regressions {
     fn execution_result_roots_are_released_after_success_and_error() {
         use crate::steel_vm::register_fn::RegisterFn;
         use std::sync::Arc;
+
+        if !in_teardown_child("execution_result_roots_are_released_after_success_and_error") {
+            return;
+        }
 
         #[derive(Clone)]
         struct Probe {
@@ -2991,7 +3015,8 @@ mod embedding_regressions {
                 destination.run("(probe-gc)").unwrap();
                 assert!(
                     heap.upgrade().is_some(),
-                    "a live alias lost its source heap"
+                    "alias {alias:?}: a live alias lost its source heap (payload count {})",
+                    Arc::strong_count(&count)
                 );
                 if alias == "receiver" {
                     destination
@@ -3011,15 +3036,20 @@ mod embedding_regressions {
             // Collectors in concurrently running tests trace every registered root, including
             // the pending result, and hold copies of its payload until their own pass ends.
             let deadline = Instant::now() + Duration::from_secs(10);
-            while Arc::strong_count(&count) != 1 {
-                assert!(Instant::now() < deadline, "discarded payload stayed rooted");
+            while Arc::strong_count(&count) != 1 || heap.strong_count() != 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "alias {alias:?}: discarded result stayed rooted (payload count {}, heap count {})",
+                    Arc::strong_count(&count), heap.strong_count()
+                );
                 std::thread::yield_now();
                 destination.run("(probe-gc)").unwrap();
             }
             assert!(
                 heap.upgrade().is_none(),
-                "discarded result retained its heap"
+                "alias {alias:?}: discarded result retained its heap"
             );
+            assert_eq!(Arc::strong_count(&count), 1, "alias {alias:?}");
         }
     }
 
@@ -3596,7 +3626,6 @@ mod embedding_regressions {
         register_gc(&mut engine);
 
         for payload in ["(box payload)", "(vector payload)"] {
-            // shortcut: keep probe owners alive until biased RC can reclaim exited workers' values.
             let workers: Vec<_> = (0..10)
                 .map(|_| {
                     engine
@@ -3740,6 +3769,86 @@ mod embedding_regressions {
         }
     }
 
+    fn check_incoming_binding_survives_collection(update: bool) {
+        use crate::{rvals::IntoSteelVal, SteelVal};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        struct CollectOnDrop {
+            engine: Engine,
+            calls: Arc<AtomicUsize>,
+        }
+        impl crate::rvals::Custom for CollectOnDrop {}
+        impl Drop for CollectOnDrop {
+            fn drop(&mut self) {
+                assert!(self.engine.virtual_machine.heap.try_lock().is_some());
+                self.engine.run("(probe-gc)").unwrap();
+                self.calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for queued in [false, true] {
+            if queued && !cfg!(all(feature = "sync", feature = "biased")) {
+                continue;
+            }
+            let mut engine = Engine::new();
+            register_gc(&mut engine);
+            assert!(engine.update_value("incoming", SteelVal::IntV(0)).is_none());
+            if update {
+                engine.register_value("incoming", SteelVal::IntV(0));
+            }
+            let collector = engine.clone();
+            let incoming = engine.run("(box 42)").unwrap().pop().unwrap();
+            let unrelated = engine
+                .virtual_machine
+                .heap
+                .lock()
+                .allocate_without_collection(SteelVal::IntV(99));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let probe = CollectOnDrop {
+                engine: collector,
+                calls: calls.clone(),
+            }
+            .into_steelval()
+            .unwrap();
+            if queued {
+                #[cfg(all(feature = "sync", feature = "biased"))]
+                std::thread::spawn(move || drop(probe)).join().unwrap();
+            } else {
+                engine.virtual_machine.heap.lock().released.push(probe);
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            if update {
+                assert!(engine.update_value("incoming", incoming).is_some());
+            } else {
+                engine.register_value("incoming", incoming);
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                engine.extract_value("incoming").unwrap().as_box_to_inner(),
+                Some(SteelVal::IntV(42))
+            );
+            assert_eq!(unrelated.get(), SteelVal::Void);
+        }
+    }
+
+    #[test]
+    fn registration_preserves_incoming_binding_during_deferred_destruction() {
+        if in_teardown_child("registration_preserves_incoming_binding_during_deferred_destruction")
+        {
+            check_incoming_binding_survives_collection(false);
+        }
+    }
+
+    #[test]
+    fn update_preserves_incoming_binding_during_deferred_destruction() {
+        if in_teardown_child("update_preserves_incoming_binding_during_deferred_destruction") {
+            check_incoming_binding_survives_collection(true);
+        }
+    }
+
     #[test]
     fn deferred_destruction_preserves_active_roots_and_pending_results() {
         use crate::{
@@ -3775,7 +3884,11 @@ mod embedding_regressions {
             }
         }
 
-        for allocation in 0..10 {
+        for allocation in 0..if cfg!(all(feature = "sync", feature = "biased")) {
+            15
+        } else {
+            10
+        } {
             let mut engine = Engine::new_raw_no_kernel();
             register_gc(&mut engine);
             // The collecting engine shares the heap but has none of the active VM's roots.
@@ -3836,9 +3949,12 @@ mod embedding_regressions {
             .unwrap();
             if allocation < 5 {
                 ctx.thread.heap.lock().released.push(probe);
-            } else {
+            } else if allocation < 10 {
                 let retained = Heap::retain_shared(vec![probe], &ctx.thread.heap);
                 ctx.thread.heap.lock().released_retained.push(retained);
+            } else {
+                #[cfg(all(feature = "sync", feature = "biased"))]
+                std::thread::spawn(move || drop(probe)).join().unwrap();
             }
             let result = match allocation % 5 {
                 #[cfg(feature = "jit2")]
@@ -3894,6 +4010,10 @@ mod embedding_regressions {
     fn garbage_collection_releases_discarded_native_values() {
         use crate::steel_vm::register_fn::RegisterFn;
         use std::sync::Arc;
+        if !in_teardown_child("garbage_collection_releases_discarded_native_values") {
+            return;
+        }
+
         #[derive(Clone)]
         struct Probe {
             _owner: Arc<()>,

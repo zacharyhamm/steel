@@ -433,6 +433,60 @@ fn recycling_keeps_slots_only_for_rooted_closures_of_this_compiler() {
 }
 
 #[test]
+fn recycling_traces_hidden_jit_entry_globals_with_compiler_filtering() {
+    use crate::core::instructions::{u24, DenseInstruction};
+
+    const OWNED: u32 = u32::MAX - 3;
+    const FOREIGN: u32 = u32::MAX - 4;
+    let closure = |id, slot| {
+        let mut lambda = ByteCodeLambda::new(
+            id,
+            vec![DenseInstruction::new(
+                OpCode::DynSuperInstruction,
+                u24::from_usize(slot),
+            )]
+            .into(),
+            0,
+            false,
+            Default::default(),
+        );
+        lambda.header = Some(OpCode::PUSH);
+        SteelVal::Closure(Gc::new(lambda))
+    };
+    let rooted = [closure(OWNED, 0), closure(FOREIGN, 1)].map(|value| value.as_rooted());
+    let mut roots = [
+        SteelVal::IntV(0),
+        SteelVal::IntV(1),
+        SteelVal::IntV(2),
+        SteelVal::IntV(3),
+        closure(FOREIGN, 3),
+    ];
+    let mut symbols = SymbolMap::new();
+    symbols.free_list.shadowed_slots.extend([0, 1, 2, 3]);
+    let released = GlobalSlotRecycler::free_shadowed_rooted_values(
+        &mut roots,
+        &mut symbols,
+        &[OWNED].into_iter().collect(),
+        &mut Heap::new(),
+    );
+    assert_eq!(
+        roots[..4],
+        [
+            SteelVal::IntV(0),
+            SteelVal::Void,
+            SteelVal::Void,
+            SteelVal::IntV(3)
+        ]
+    );
+    assert!(symbols.free_list.free_list.contains(&1));
+    assert!(symbols.free_list.free_list.contains(&2));
+    assert_eq!(symbols.free_list.free_list.len(), 2);
+    assert!(released.contains(&SteelVal::IntV(1)));
+    assert!(released.contains(&SteelVal::IntV(2)));
+    drop(rooted);
+}
+
+#[test]
 fn recycling_revisits_filtered_roots_through_kept_globals() {
     use crate::core::instructions::{u24, DenseInstruction};
 
@@ -669,7 +723,7 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler<'_> {
             self.push_back(contract.clone());
         }
 
-        for instruction in closure.body_exp.iter() {
+        for instruction in closure.original_instructions() {
             match instruction.op_code {
                 // If this instruction touches this global variable,
                 // then we want to mark it as possibly referenced here.
@@ -742,9 +796,7 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler<'_> {
         let Some(custom) = read_custom_type(&custom_type) else {
             return;
         };
-        let properties = self
-            .struct_types
-            .descriptor_properties(custom.as_ref());
+        let properties = self.struct_types.descriptor_properties(custom.as_ref());
         if let Some(properties) = properties {
             self.push_back(properties);
         }
@@ -4339,11 +4391,6 @@ impl Heap {
         synchronizer: &mut Synchronizer,
         force: bool,
     ) {
-        #[cfg(feature = "biased")]
-        {
-            steel_rc::QueueHandle::run_explicit_merge();
-        }
-
         if self.memory_free_list.percent_full() > 0.95 || force {
             // let now = crate::time::Instant::now();
             // Attempt a weak collection
@@ -4438,11 +4485,6 @@ impl Heap {
         synchronizer: &'a mut Synchronizer,
         force: bool,
     ) {
-        #[cfg(feature = "biased")]
-        {
-            steel_rc::QueueHandle::run_explicit_merge();
-        }
-
         if self.vector_free_list.percent_full() > 0.50 && self.vector_free_list.should_run_weak {
             log::debug!(target: "gc", "Running weak collection because the vector free list is 50% full");
             self.vector_free_list
@@ -4518,11 +4560,6 @@ impl Heap {
         tls: &'a [SteelVal],
         synchronizer: &'a mut Synchronizer,
     ) -> HeapRef<Vec<SteelVal>> {
-        #[cfg(feature = "biased")]
-        {
-            steel_rc::QueueHandle::run_explicit_merge();
-        }
-
         if self.vector_free_list.percent_full() > 0.50 && self.vector_free_list.should_run_weak {
             self.vector_free_list
                 .weak_collection(|values| self.released.extend(values));
@@ -5683,9 +5720,7 @@ impl<'a> BreadthFirstSearchSteelValReferenceVisitor2<'a> for MarkAndSweepContext
         let Some(custom) = read_custom_type(custom_type) else {
             return;
         };
-        let properties = self
-            .struct_types
-            .descriptor_properties(custom.as_ref());
+        let properties = self.struct_types.descriptor_properties(custom.as_ref());
         if let Some(properties) = properties {
             self.push_back(&properties);
             self.save(properties);
