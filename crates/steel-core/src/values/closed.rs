@@ -155,8 +155,10 @@ impl<'a> GlobalSlotRecycler<'a> {
         self.visit_kept(roots);
 
         // Values reached first through a registered root keep only this compiler's slots.
-        let visited = core::mem::take(&mut self.visited);
-        let struct_types = core::mem::take(&mut self.struct_types);
+        // Values already traced above kept every slot, so this pass can skip them; the snapshot
+        // lets kept globals revisit, unfiltered, values this pass reaches first.
+        let visited = self.visited.clone();
+        let struct_types = self.struct_types.clone();
         self.rooted_functions = Some(function_ids);
         for root in persistent_roots_snapshot() {
             self.push_back(root);
@@ -1001,7 +1003,7 @@ fn persistent_roots_for(heap: Option<usize>) -> Vec<SteelVal> {
 
 // A struct type's properties are reachable only through its instances, its descriptor
 // value, its constructor, predicate, and accessors, and values serialized from them.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct ReachedStructTypes(rustc_hash::FxHashSet<StructTypeDescriptor>);
 
 impl ReachedStructTypes {

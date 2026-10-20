@@ -3009,6 +3009,7 @@ fn raw_engine_native_forms_respect_lexical_shadowing() {
             format!("((lambda () (define (call x) (define (nested {name}) ({name} x)) (nested (lambda (x) x))) (call 42)))"),
             format!("((lambda () (define (call . {name}) (set! {name} (lambda (x) x)) ({name} 42)) (call)))"),
             format!("((lambda () (define (call x . {name}) (set! {name} (lambda (x) x)) ({name} x)) (call 42)))"),
+            format!("((lambda () (define {name} (lambda (x) x)) ({name} 42)))"),
         ] {
             assert_eq!(
                 engine

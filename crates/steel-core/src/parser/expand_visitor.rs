@@ -1745,6 +1745,12 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
                 syntax.ty = TokenType::Identifier(*DEFINE_SYNTAX);
             }
         }
+        // An internal definition shadows native forms such as `struct` in the rest of its body.
+        if self.in_scope_values.depth() > 1 {
+            if let Some(ident) = define.name.atom_identifier() {
+                self.in_scope_values.define(*ident);
+            }
+        }
         self.define_context = Some(define.name.clone());
         self.visit(&mut define.body)?;
         self.define_context = None;
