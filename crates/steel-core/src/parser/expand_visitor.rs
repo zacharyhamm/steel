@@ -1883,8 +1883,9 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
                     return Ok(());
                 }
                 if self.map.is_none()
-                    && l.first_ident()
-                        .is_some_and(|name| name.resolve() == "define-values")
+                    && l.first_ident().is_some_and(|name| {
+                        name.resolve() == "define-values" && !self.in_scope_values.contains(name)
+                    })
                 {
                     *expr = expand_define_values(l)?;
                     self.changed = true;
@@ -1892,8 +1893,9 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
                 }
 
                 if self.map.is_none()
-                    && l.first_ident()
-                        .is_some_and(|name| name.resolve() == "struct")
+                    && l.first_ident().is_some_and(|name| {
+                        name.resolve() == "struct" && !self.in_scope_values.contains(name)
+                    })
                 {
                     *expr = expand_immutable_struct(l)?;
                     self.changed = true;

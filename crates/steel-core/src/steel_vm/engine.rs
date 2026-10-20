@@ -2995,6 +2995,34 @@ fn engine_bootstrap_preserves_struct_macro() {
 }
 
 #[test]
+fn raw_engine_native_forms_respect_lexical_shadowing() {
+    let mut engine = Engine::new_raw_no_kernel();
+    for name in ["struct", "define-values"] {
+        for source in [
+            format!("((lambda ({name}) ({name} 42)) (lambda (x) x))"),
+            format!("(let (({name} (lambda (x) x))) ({name} 42))"),
+            format!("((lambda ({name}) (let ((x 42)) ({name} x))) (lambda (x) x))"),
+            format!("(let (({name} (lambda (x) x))) ((lambda (x) ({name} x)) 42))"),
+        ] {
+            assert_eq!(
+                engine
+                    .run(format!(
+                        "((lambda ()
+                           (define result {source})
+                           (struct point (value))
+                           (define-values (answer) (point-value (point result)))
+                           answer))"
+                    ))
+                    .unwrap()
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
 fn raw_engine_immutable_structs() {
     let mut engine = Engine::new_raw_no_kernel();
     engine

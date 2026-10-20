@@ -3490,6 +3490,10 @@ mod embedding_regressions {
             time::{Duration, Instant},
         };
 
+        if !in_teardown_child("engine_teardown_releases_heap_stored_thread_handles") {
+            return;
+        }
+
         struct Probe(#[allow(dead_code)] Arc<()>);
         impl crate::rvals::Custom for Probe {}
 
