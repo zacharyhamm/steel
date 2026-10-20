@@ -1739,6 +1739,12 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
     }
 
     fn visit_define(&mut self, define: &mut super::ast::Define) -> Self::Output {
+        // Early lowering bypasses the list-head normalization for this reserved name.
+        if let Some(syntax) = define.name.atom_syntax_object_mut() {
+            if syntax.ty == TokenType::DefineSyntax {
+                syntax.ty = TokenType::Identifier(*DEFINE_SYNTAX);
+            }
+        }
         self.define_context = Some(define.name.clone());
         self.visit(&mut define.body)?;
         self.define_context = None;
@@ -1868,13 +1874,16 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
             ExprKind::Macro(m) => self.visit_macro(m),
             ExprKind::Atom(a) => self.visit_atom(a),
             ExprKind::List(l) => {
-                // Definition signatures are binding data, not executable applications
-                // of the function or macro being defined (for example `struct`).
                 if l.first().is_some_and(|head| {
                     head.atom_syntax_object()
                         .is_some_and(|syntax| matches!(syntax.ty, TokenType::Define))
-                }) || l
-                    .first_ident()
+                }) {
+                    let list = core::mem::replace(l, List::new(ThinVec::new()));
+                    *expr = ExprKind::try_from(list.args_proper(TokenType::Define)?)?;
+                    return self.visit(expr);
+                }
+                // Macro signatures are binding data, not executable applications.
+                if l.first_ident()
                     .is_some_and(|name| name.resolve() == "#%define-syntax")
                 {
                     for body in l.args.iter_mut().skip(2) {
@@ -2234,11 +2243,29 @@ mod expansion_tests {
                 GlobalMap::Set(&FxHashSet::default()),
             )
             .unwrap();
-            let (ExprKind::List(input), ExprKind::List(expanded)) = (input, expanded) else {
-                panic!("expected an unlowered definition: {source}");
+            let ExprKind::List(input) = input else {
+                panic!("expected an unlowered input: {source}");
             };
-            assert_eq!(input.args[..2], expanded.args[..2], "{source}");
-            assert!(matches!(expanded.args[2], ExprKind::Begin(_)), "{source}");
+            if source.starts_with("(define ") {
+                let ExprKind::Define(define) = expanded else {
+                    panic!("expected a lowered definition: {source}");
+                };
+                let ExprKind::List(signature) = &input.args[1] else {
+                    panic!("expected a function signature: {source}");
+                };
+                assert_eq!(define.name, signature.args[0], "{source}");
+                let ExprKind::LambdaFunction(lambda) = define.body else {
+                    panic!("expected a lowered lambda: {source}");
+                };
+                assert_eq!(lambda.args[..], signature.args[1..], "{source}");
+                assert!(matches!(lambda.body, ExprKind::Begin(_)), "{source}");
+            } else {
+                let ExprKind::List(expanded) = expanded else {
+                    panic!("expected an unlowered macro definition: {source}");
+                };
+                assert_eq!(input.args[..2], expanded.args[..2], "{source}");
+                assert!(matches!(expanded.args[2], ExprKind::Begin(_)), "{source}");
+            }
         }
     }
 

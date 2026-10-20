@@ -3678,6 +3678,104 @@ mod embedding_regressions {
         }
     }
 
+    #[cfg(feature = "sync")]
+    #[test]
+    fn completed_thread_cleanup_allows_reentrant_collection() {
+        use crate::{
+            rvals::IntoSteelVal,
+            steel_vm::vm::{threads::thread_finished, Synchronizer},
+            SteelVal,
+        };
+        use std::{
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            },
+            time::{Duration, Instant},
+        };
+
+        if !in_teardown_child("completed_thread_cleanup_allows_reentrant_collection") {
+            return;
+        }
+
+        struct Probe {
+            engine: Engine,
+            synchronizer: Synchronizer,
+            calls: Arc<AtomicUsize>,
+        }
+        impl crate::rvals::Custom for Probe {}
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                assert!(self.engine.virtual_machine.heap.try_lock().is_some());
+                assert!(self.synchronizer.threads.try_lock().is_ok());
+                self.engine.run("(probe-gc)").unwrap();
+                self.calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for update in [false, true] {
+            let mut engine = Engine::new();
+            register_gc(&mut engine);
+            engine
+                .run(
+                    "(define incoming #f)
+                     (define (spawn-probe payload)
+                       (spawn-native-thread (lambda () payload)))
+                     (define (collect-with-live live)
+                       (probe-gc)
+                       (unbox live))",
+                )
+                .unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let probe = Probe {
+                engine: engine.clone(),
+                synchronizer: engine.virtual_machine.synchronizer.clone(),
+                calls: calls.clone(),
+            }
+            .into_steelval()
+            .unwrap();
+            let worker = engine
+                .call_function_by_name_with_args("spawn-probe", vec![probe])
+                .unwrap();
+            engine.enter_safepoint(|| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while thread_finished(&worker).unwrap() != SteelVal::BoolV(true) {
+                    assert!(Instant::now() < deadline, "worker did not finish");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+            drop(worker);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            // Allocate without triggering cleanup before the value reaches the active call.
+            let live = SteelVal::HeapAllocated(
+                engine
+                    .virtual_machine
+                    .heap
+                    .lock()
+                    .allocate_without_collection(SteelVal::IntV(42)),
+            );
+            if update {
+                assert!(engine.update_value("incoming", live).is_some());
+                assert_eq!(
+                    engine.extract_value("incoming").unwrap().as_box_to_inner(),
+                    Some(SteelVal::IntV(42))
+                );
+            } else {
+                assert_eq!(
+                    engine
+                        .call_function_by_name_with_args("collect-with-live", vec![live])
+                        .unwrap(),
+                    SteelVal::IntV(42)
+                );
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            engine.run("(probe-gc)").unwrap();
+            drop(engine);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
     #[test]
     fn garbage_collection_runs_payload_destructors_after_unlocking() {
         use crate::rvals::IntoSteelVal;

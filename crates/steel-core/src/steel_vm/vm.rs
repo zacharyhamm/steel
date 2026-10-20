@@ -1096,9 +1096,7 @@ impl Synchronizer {
     pub fn stop_threads(&mut self) {
         self.state.pause_for_safepoint();
 
-        let mut threads = self.threads.lock().unwrap();
-        // Release completed threads' handles before collection snapshots their result roots.
-        threads.retain(|thread| thread.ctx.strong_count() > 0);
+        let threads = self.threads.lock().unwrap();
 
         // Stop other threads, wait until we've gathered acknowledgements
         threads.iter().for_each(|x| {
@@ -1267,6 +1265,21 @@ impl SteelThread {
         let heap = self.heap.clone_for_storage();
         let mut guard = self.enter_safepoint(|_| heap.lock());
         let result = thunk(self, &mut guard);
+        // Completed results can run destructors that reenter this heap or synchronizer.
+        self.synchronizer
+            .threads
+            .lock()
+            .unwrap()
+            .retain_mut(|thread| {
+                if thread.ctx.strong_count() > 0 {
+                    true
+                } else {
+                    guard
+                        .released
+                        .push(core::mem::replace(&mut thread.handle, SteelVal::Void));
+                    false
+                }
+            });
         let released = core::mem::take(&mut guard.released);
         let retained = core::mem::take(&mut guard.released_retained);
         #[cfg(feature = "biased")]

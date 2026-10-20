@@ -3003,6 +3003,12 @@ fn raw_engine_native_forms_respect_lexical_shadowing() {
             format!("(let (({name} (lambda (x) x))) ({name} 42))"),
             format!("((lambda ({name}) (let ((x 42)) ({name} x))) (lambda (x) x))"),
             format!("(let (({name} (lambda (x) x))) ((lambda (x) ({name} x)) 42))"),
+            format!("((lambda () (define (call {name}) ({name} 42)) (call (lambda (x) x))))"),
+            format!("((lambda () (define (call {name}) ((lambda (x) ({name} x)) 42)) (call (lambda (x) x))))"),
+            format!("((lambda () (define (call {name}) (define (nested x) ({name} x)) (nested 42)) (call (lambda (x) x))))"),
+            format!("((lambda () (define (call x) (define (nested {name}) ({name} x)) (nested (lambda (x) x))) (call 42)))"),
+            format!("((lambda () (define (call . {name}) (set! {name} (lambda (x) x)) ({name} 42)) (call)))"),
+            format!("((lambda () (define (call x . {name}) (set! {name} (lambda (x) x)) ({name} x)) (call 42)))"),
         ] {
             assert_eq!(
                 engine
@@ -3013,12 +3019,20 @@ fn raw_engine_native_forms_respect_lexical_shadowing() {
                            (define-values (answer) (point-value (point result)))
                            answer))"
                     ))
-                    .unwrap()
+                    .unwrap_or_else(|error| panic!("{source}: {error}"))
                     .last(),
                 Some(&SteelVal::IntV(42)),
                 "{source}"
             );
         }
+    }
+}
+
+#[test]
+fn raw_engine_rejects_improper_definitions() {
+    let mut engine = Engine::new_raw_no_kernel();
+    for source in ["(define x . 1)", "(define (f x) . x)"] {
+        assert!(engine.run(source).is_err(), "{source}");
     }
 }
 
