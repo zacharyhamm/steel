@@ -114,13 +114,14 @@ pub(crate) fn thread_join(ctx: &mut VmCore, args: &[SteelVal]) -> Option<Result<
     let joined = ctx.thread.enter_safepoint(|_| {
         ThreadHandle::as_ref(&args[0]).and_then(|handle| thread_join_impl(&handle))
     });
-    Some(joined.map(|(result, heap)| adopt_thread_result(ctx.thread, result, heap)))
+    Some(joined.map(|(result, heap)| adopt_thread_result(ctx.thread, &ctx.constants, result, heap)))
 }
 
 // The result's heap can be freed once its pending handle is released, so a result from
 // another heap is copied into the joining thread's heap.
 fn adopt_thread_result(
     thread: &mut SteelThread,
+    constants: &crate::compiler::constants::ConstantMap,
     result: RootedSteelVal,
     heap: HeapHandle,
 ) -> SteelVal {
@@ -134,7 +135,7 @@ fn adopt_thread_result(
                 source.inherited_retention(Some(&thread.heap)),
             )
         };
-        let adopted = thread.with_heap(|_, target| {
+        let adopted = thread.with_heap(Some(constants), |_, target| {
             for retained in inherited {
                 target.retain_heap(retained);
             }
@@ -146,7 +147,7 @@ fn adopt_thread_result(
             // Waiting for the heap is a safepoint, and only this value reaches the adopted
             // cells until it is returned to the stack.
             let rooted = value.as_rooted();
-            thread.with_heap(|_, target| target.retain_heap(retained));
+            thread.with_heap(Some(constants), |_, target| target.retain_heap(retained));
             drop(rooted);
         }
     }

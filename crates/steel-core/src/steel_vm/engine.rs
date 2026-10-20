@@ -1923,7 +1923,7 @@ impl Engine {
         if guard.symbol_map.free_list.should_collect() {
             drop(guard);
 
-            self.virtual_machine.with_heap(|thread, heap| {
+            self.virtual_machine.with_heap(None, |thread, heap| {
                 #[cfg(feature = "sync")]
                 thread.with_locked_env(|ctx, env| {
                     let released = {
@@ -2123,7 +2123,7 @@ impl Engine {
     pub fn update_value(&mut self, name: &str, value: SteelVal) -> Option<&mut Self> {
         let idx = self.virtual_machine.compiler.read().get_idx(name)?;
 
-        self.virtual_machine.with_heap(|_, _| {});
+        self.virtual_machine.with_heap(None, |_, _| {});
 
         #[cfg(feature = "sync")]
         {

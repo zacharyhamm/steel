@@ -3646,6 +3646,251 @@ mod embedding_regressions {
     }
 
     #[test]
+    fn garbage_collection_runs_payload_destructors_after_unlocking() {
+        use crate::rvals::IntoSteelVal;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        if !in_teardown_child("garbage_collection_runs_payload_destructors_after_unlocking") {
+            return;
+        }
+
+        struct Probe {
+            engine: Engine,
+            callbacks: Arc<AtomicUsize>,
+        }
+        impl crate::rvals::Custom for Probe {}
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                assert!(
+                    self.engine.virtual_machine.heap.try_lock().is_some(),
+                    "payload dropped under the heap lock"
+                );
+                assert_eq!(
+                    self.engine
+                        .run("(probe-gc) (unbox (box 42))")
+                        .unwrap()
+                        .last(),
+                    Some(&crate::SteelVal::IntV(42))
+                );
+                self.callbacks.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for (vector, keep_handle, collect) in [
+            (false, false, "(probe-gc)"),
+            (false, true, "(probe-gc)"),
+            (true, false, "(probe-gc)"),
+            (true, true, "(probe-gc)"),
+            (
+                false,
+                false,
+                "(for-each (lambda (_) (assert! (= (unbox (box 42)) 42))) (range 1000))",
+            ),
+            (
+                true,
+                false,
+                "(for-each (lambda (_) (assert! (= (vector-ref (vector 42) 0) 42))) (range 1000))",
+            ),
+            (
+                true,
+                false,
+                "(for-each (lambda (_) (assert! (= (vector-ref (make-vector 1 42) 0) 42))) (range 1000))",
+            ),
+        ] {
+            let mut engine = Engine::new();
+            register_gc(&mut engine);
+            let callbacks = Arc::new(AtomicUsize::new(0));
+            let payload = Probe {
+                engine: engine.clone(),
+                callbacks: callbacks.clone(),
+            }
+            .into_steelval()
+            .unwrap();
+            let value = if vector {
+                crate::SteelVal::MutableVector(
+                    engine
+                        .virtual_machine
+                        .heap
+                        .lock()
+                        .allocate_vec_without_collection(vec![payload]),
+                )
+            } else {
+                crate::SteelVal::HeapAllocated(
+                    engine
+                        .virtual_machine
+                        .heap
+                        .lock()
+                        .allocate_without_collection(payload),
+                )
+            };
+            // An unrooted handle survives weak collection but not mark-and-sweep.
+            let discarded = keep_handle.then_some(value);
+            engine
+                .run(format!(
+                    "(let ((live (box 7)))
+                       {collect}
+                       (assert! (= (unbox live) 7)))"
+                ))
+                .unwrap();
+            assert_eq!(callbacks.load(Ordering::SeqCst), 1, "{collect}");
+            drop(discarded);
+        }
+    }
+
+    #[test]
+    fn deferred_destruction_preserves_active_roots_and_pending_results() {
+        use crate::{
+            compiler::constants::ConstantMap,
+            gc::Gc,
+            rvals::{Custom, IntoSteelVal},
+            steel_vm::vm::{StackFrame, VmCore},
+            values::{
+                closed::Heap,
+                functions::{ByteCodeLambda, RootedInstructions},
+            },
+            SteelVal,
+        };
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        if !in_teardown_child("deferred_destruction_preserves_active_roots_and_pending_results") {
+            return;
+        }
+
+        struct CollectOnDrop {
+            engine: Engine,
+            calls: Arc<AtomicUsize>,
+        }
+        impl Custom for CollectOnDrop {}
+        impl Drop for CollectOnDrop {
+            fn drop(&mut self) {
+                assert!(self.engine.virtual_machine.heap.try_lock().is_some());
+                self.engine.run("(probe-gc)").unwrap();
+                self.calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for allocation in 0..10 {
+            let mut engine = Engine::new_raw_no_kernel();
+            register_gc(&mut engine);
+            // The collecting engine shares the heap but has none of the active VM's roots.
+            let collector = engine.clone();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let thread = &mut engine.virtual_machine;
+            let values: Vec<_> = (0..9)
+                .map(|i| {
+                    SteelVal::HeapAllocated(
+                        thread
+                            .heap
+                            .lock()
+                            .allocate_without_collection(SteelVal::IntV(42 + i)),
+                    )
+                })
+                .collect();
+            let unrelated = thread
+                .heap
+                .lock()
+                .allocate_without_collection(SteelVal::IntV(99));
+            let frame = |capture: SteelVal, handler: SteelVal| {
+                let mut frame = StackFrame::main().with_handler(handler);
+                frame.set_function(Gc::new(ByteCodeLambda::new(
+                    0,
+                    vec![].into(),
+                    0,
+                    false,
+                    vec![capture].into_iter().collect(),
+                )));
+                frame
+            };
+            thread.stack.push(values[0].clone());
+            thread.thread_local_storage.push(values[1].clone());
+            thread.current_frame = frame(values[2].clone(), values[3].clone());
+            thread
+                .stack_frames
+                .push(frame(values[4].clone(), values[5].clone()));
+            thread.insert_binding(thread.global_env.len(), values[6].clone());
+            thread.constant_map = ConstantMap::from_vec(vec![values[7].clone()]);
+            let mut ctx = VmCore {
+                thread,
+                constants: ConstantMap::from_vec(vec![values[8].clone()]),
+                instructions: RootedInstructions::new(vec![].into()),
+                ip: 0,
+                sp: 0,
+                pop_count: 1,
+                depth: 0,
+                root_spans: &[],
+                return_value: None,
+                is_native: false,
+                result: None,
+            };
+            let probe = CollectOnDrop {
+                engine: collector,
+                calls: calls.clone(),
+            }
+            .into_steelval()
+            .unwrap();
+            if allocation < 5 {
+                ctx.thread.heap.lock().released.push(probe);
+            } else {
+                let retained = Heap::retain_shared(vec![probe], &ctx.thread.heap);
+                ctx.thread.heap.lock().released_retained.push(retained);
+            }
+            let result = match allocation % 5 {
+                #[cfg(feature = "jit2")]
+                0 => crate::steel_vm::vm::jit::box_handler_c(&mut ctx, SteelVal::IntV(100)),
+                #[cfg(not(feature = "jit2"))]
+                0 => ctx.make_box(SteelVal::IntV(100)),
+                1 => ctx.make_mutable_vector(vec![SteelVal::IntV(100)]),
+                2 => ctx.make_mutable_vector_iter([SteelVal::IntV(100)].into_iter()),
+                3 => {
+                    // Adopted copies are not reachable from the source value until rewritten.
+                    let mut source = Heap::new();
+                    let cell = source.allocate_without_collection(SteelVal::IntV(100));
+                    let mut value = SteelVal::MutableVector(
+                        source.allocate_vec_without_collection(vec![SteelVal::HeapAllocated(cell)]),
+                    );
+                    let root = value.as_rooted();
+                    let cells = source.reached_cells(&value);
+                    let adopted = ctx
+                        .thread
+                        .with_heap(Some(&ctx.constants), |_, heap| heap.adopt(cells));
+                    assert!(adopted.rewrite(&mut value).is_empty());
+                    drop(root);
+                    let SteelVal::MutableVector(vector) = value else {
+                        panic!("expected an adopted vector");
+                    };
+                    vector.get()[0].clone()
+                }
+                _ => {
+                    ctx.thread.with_heap(Some(&ctx.constants), |_, _| {});
+                    SteelVal::IntV(100)
+                }
+            };
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            match result {
+                SteelVal::HeapAllocated(cell) => assert_eq!(cell.get(), SteelVal::IntV(100)),
+                SteelVal::MutableVector(vector) => {
+                    assert_eq!(vector.get(), [SteelVal::IntV(100)]);
+                }
+                SteelVal::IntV(100) => {}
+                _ => panic!("unexpected allocation result"),
+            }
+            for (i, value) in values.iter().enumerate() {
+                let SteelVal::HeapAllocated(cell) = value else {
+                    unreachable!();
+                };
+                assert_eq!(cell.get(), SteelVal::IntV(42 + i as isize), "root {i}");
+            }
+            assert_eq!(unrelated.get(), SteelVal::Void);
+        }
+    }
+
+    #[test]
     fn garbage_collection_releases_discarded_native_values() {
         use crate::steel_vm::register_fn::RegisterFn;
         use std::sync::Arc;

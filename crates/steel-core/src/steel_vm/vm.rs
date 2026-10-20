@@ -31,8 +31,8 @@ use crate::rvals::{as_underlying_type, AsRefSteelValFromRef};
 use crate::steel_vm::primitives::steel_set_box_mutable;
 use crate::steel_vm::primitives::steel_unbox_mutable;
 use crate::steel_vm::primitives::{gt_primitive, gte_primitive, lt_primitive, steel_not};
-use crate::values::closed::Heap;
 use crate::values::closed::MarkAndSweepContext;
+use crate::values::closed::{Heap, HeapResult};
 use crate::values::functions::CaptureVec;
 use crate::values::functions::RootedInstructions;
 use crate::values::functions::SerializedLambda;
@@ -422,6 +422,44 @@ pub struct SteelThread {
 
     // Release execution ownership after all VM roots.
     pub(crate) heap: HeapHandle,
+}
+
+struct ActiveHeapRoots {
+    values: Vec<SteelVal>,
+    global_env: Env,
+    constants: ConstantMap,
+    additional_constants: Option<ConstantMap>,
+}
+
+impl crate::rvals::Custom for ActiveHeapRoots {
+    fn gc_visit_children(&self, context: &mut MarkAndSweepContext) {
+        for value in self.values.iter().chain(self.global_env.roots()) {
+            context.push_back(value.clone());
+        }
+        self.constants.trace(context);
+        if let Some(constants) = &self.additional_constants {
+            constants.trace(context);
+        }
+    }
+}
+
+impl ActiveHeapRoots {
+    fn new(thread: &SteelThread, constants: Option<&ConstantMap>) -> Self {
+        let mut values = thread.stack.clone();
+        values.extend_from_slice(&thread.thread_local_storage);
+        for frame in std::iter::once(&thread.current_frame).chain(&thread.stack_frames) {
+            values.push(SteelVal::Closure(frame.function.clone()));
+            if let Some(handler) = frame.attachments.as_ref().and_then(|x| x.handler.as_ref()) {
+                values.push(handler.clone());
+            }
+        }
+        Self {
+            values,
+            global_env: thread.global_env.clone(),
+            constants: thread.constant_map.clone(),
+            additional_constants: constants.cloned(),
+        }
+    }
 }
 
 impl Clone for SteelThread {
@@ -1221,15 +1259,44 @@ impl SteelThread {
         thunk(self)
     }
 
-    pub(crate) fn with_heap<T>(&mut self, thunk: impl FnOnce(&mut Self, &mut Heap) -> T) -> T {
+    pub(crate) fn with_heap<T: HeapResult>(
+        &mut self,
+        constants: Option<&ConstantMap>,
+        thunk: impl FnOnce(&mut Self, &mut Heap) -> T,
+    ) -> T {
         let heap = self.heap.clone_for_storage();
         let mut guard = self.enter_safepoint(|_| heap.lock());
         let result = thunk(self, &mut guard);
         let released = core::mem::take(&mut guard.released);
         let retained = core::mem::take(&mut guard.released_retained);
+        let can_reenter = !retained.is_empty()
+            || released.iter().any(|value| {
+                !matches!(
+                    value,
+                    SteelVal::BoolV(_)
+                        | SteelVal::NumV(_)
+                        | SteelVal::IntV(_)
+                        | SteelVal::Rational(_)
+                        | SteelVal::CharV(_)
+                        | SteelVal::Void
+                        | SteelVal::FuncV(_)
+                        | SteelVal::MutFunc(_)
+                        | SteelVal::BuiltIn(_)
+                )
+            });
+        // Destructors can collect through another engine before the result reaches the stack.
+        let active_roots = can_reenter.then(|| {
+            ActiveHeapRoots::new(self, constants)
+                .into_steelval()
+                .unwrap()
+                .as_rooted()
+        });
+        let result_roots = can_reenter.then(|| result.root_result());
         drop(guard);
         drop(released);
         drop(retained);
+        drop(active_roots);
+        drop(result_roots);
         result
     }
 
@@ -1325,7 +1392,7 @@ impl SteelThread {
     }
 
     pub fn insert_binding(&mut self, idx: usize, value: SteelVal) {
-        self.with_heap(|_, _| {});
+        self.with_heap(None, |_, _| {});
 
         #[cfg(feature = "sync")]
         self.with_locked_env(move |_, env| {
@@ -2212,72 +2279,76 @@ impl<'a> VmCore<'a> {
     }
 
     pub fn make_box(&mut self, value: SteelVal) -> SteelVal {
-        self.thread.with_heap(|thread, heap| {
-            let allocated_var = heap.allocate(
-                value,
-                &thread.stack,
-                thread.stack_frames.iter().map(|x| x.function.as_ref()),
-                thread.global_env.roots(),
-                &self.constants,
-                &thread.thread_local_storage,
-                &mut thread.synchronizer,
-            );
+        self.thread
+            .with_heap(Some(&self.constants), |thread, heap| {
+                let allocated_var = heap.allocate(
+                    value,
+                    &thread.stack,
+                    thread.stack_frames.iter().map(|x| x.function.as_ref()),
+                    thread.global_env.roots(),
+                    &self.constants,
+                    &thread.thread_local_storage,
+                    &mut thread.synchronizer,
+                );
 
-            SteelVal::HeapAllocated(allocated_var)
-        })
+                SteelVal::HeapAllocated(allocated_var)
+            })
     }
 
     // TODO: Accept a slice instead, or an iterator with a known size.
     // That way we can take advantage of a pre allocation.
     pub fn make_mutable_vector(&mut self, values: Vec<SteelVal>) -> SteelVal {
-        self.thread.with_heap(|thread, heap| {
-            let allocated_var = heap.allocate_vector(
-                values,
-                &thread.stack,
-                thread.stack_frames.iter().map(|x| x.function.as_ref()),
-                thread.global_env.roots(),
-                &self.constants,
-                &thread.thread_local_storage,
-                &mut thread.synchronizer,
-            );
+        self.thread
+            .with_heap(Some(&self.constants), |thread, heap| {
+                let allocated_var = heap.allocate_vector(
+                    values,
+                    &thread.stack,
+                    thread.stack_frames.iter().map(|x| x.function.as_ref()),
+                    thread.global_env.roots(),
+                    &self.constants,
+                    &thread.thread_local_storage,
+                    &mut thread.synchronizer,
+                );
 
-            SteelVal::MutableVector(allocated_var)
-        })
+                SteelVal::MutableVector(allocated_var)
+            })
     }
 
     pub fn make_mutable_vector_iter(
         &mut self,
         values: impl Iterator<Item = SteelVal> + Clone,
     ) -> SteelVal {
-        self.thread.with_heap(|thread, heap| {
-            let allocated_var = heap.allocate_vector_iter(
-                values,
-                &thread.stack,
-                thread.stack_frames.iter().map(|x| x.function.as_ref()),
-                thread.global_env.roots(),
-                &self.constants,
-                &thread.thread_local_storage,
-                &mut thread.synchronizer,
-            );
+        self.thread
+            .with_heap(Some(&self.constants), |thread, heap| {
+                let allocated_var = heap.allocate_vector_iter(
+                    values,
+                    &thread.stack,
+                    thread.stack_frames.iter().map(|x| x.function.as_ref()),
+                    thread.global_env.roots(),
+                    &self.constants,
+                    &thread.thread_local_storage,
+                    &mut thread.synchronizer,
+                );
 
-            SteelVal::MutableVector(allocated_var)
-        })
+                SteelVal::MutableVector(allocated_var)
+            })
     }
 
     pub(crate) fn gc_collect(&mut self) {
         // Before we acquire a lock on the heap, make sure we're not going to block
         // anything since we could deadlock up to this point.
-        self.thread.with_heap(|thread, heap| {
-            heap.collection(
-                &thread.stack,
-                thread.stack_frames.iter().map(|x| x.function.as_ref()),
-                thread.global_env.roots(),
-                &self.constants,
-                &thread.thread_local_storage,
-                &mut thread.synchronizer,
-                true,
-            );
-        })
+        self.thread
+            .with_heap(Some(&self.constants), |thread, heap| {
+                heap.collection(
+                    &thread.stack,
+                    thread.stack_frames.iter().map(|x| x.function.as_ref()),
+                    thread.global_env.roots(),
+                    &self.constants,
+                    &thread.thread_local_storage,
+                    &mut thread.synchronizer,
+                    true,
+                );
+            })
     }
 
     // TODO: Expose a function for this! Or alternatively, set up an incremental
@@ -4510,7 +4581,7 @@ impl<'a> VmCore<'a> {
     // get in place mutation.
     // Basically a `MoveReadGlobal`
     fn handle_set(&mut self, index: usize) -> Result<()> {
-        self.thread.with_heap(|_, _| {});
+        self.thread.with_heap(Some(&self.constants), |_, _| {});
         let value_to_assign = self.thread.stack.pop().unwrap();
 
         let value = if self.thread.safepoints_enabled {
@@ -5017,7 +5088,7 @@ impl<'a> VmCore<'a> {
     // #[inline(always)]
     fn handle_bind(&mut self, payload_size: usize) {
         // Guard against the heap
-        self.thread.with_heap(|_, _| {});
+        self.thread.with_heap(Some(&self.constants), |_, _| {});
 
         let value = self.thread.stack.pop().unwrap();
 
@@ -7796,7 +7867,7 @@ fn cons_handler(ctx: &mut VmCore<'_>) -> Result<()> {
 fn new_box_handler(ctx: &mut VmCore<'_>) -> Result<()> {
     let last = ctx.thread.stack.pop().unwrap();
 
-    ctx.thread.with_heap(|thread, heap| {
+    ctx.thread.with_heap(Some(&ctx.constants), |thread, heap| {
         let allocated_var = heap.allocate(
             last,
             &thread.stack,
@@ -7810,10 +7881,9 @@ fn new_box_handler(ctx: &mut VmCore<'_>) -> Result<()> {
         let result = SteelVal::HeapAllocated(allocated_var);
 
         thread.stack.push(result);
-
-        ctx.ip += 2;
-        Ok(())
-    })
+    });
+    ctx.ip += 2;
+    Ok(())
 }
 
 #[allow(unused)]

@@ -155,12 +155,16 @@ impl<'a> GlobalSlotRecycler<'a> {
         self.visit_kept(roots);
 
         // Values reached first through a registered root keep only this compiler's slots.
+        let visited = core::mem::take(&mut self.visited);
+        let struct_types = core::mem::take(&mut self.struct_types);
         self.rooted_functions = Some(function_ids);
         for root in persistent_roots_snapshot() {
             self.push_back(root);
         }
         self.visit();
         self.rooted_functions = None;
+        self.visited = visited;
+        self.struct_types = struct_types;
         self.visit_kept(roots);
 
         // An early exit must not leave roots or visited cells for the next pass.
@@ -310,6 +314,38 @@ impl Custom for DirectHeapChildren {
 }
 
 #[test]
+fn recycling_traces_registered_strong_box_cycles_once_per_pass() {
+    let boxed = Gc::new_mut(SteelVal::Void);
+    *boxed.write() = SteelVal::Boxed(boxed.clone());
+    let mut recycler = GlobalSlotRecycler::default();
+    recycler.visit_boxed_value(boxed.clone());
+    let Some(SteelVal::Boxed(revisited)) = recycler.pop_front() else {
+        panic!("the first visit must trace the box's value");
+    };
+    recycler.visit_boxed_value(revisited);
+    *boxed.write() = SteelVal::Void;
+    // Fail before running a full traversal if a cycle would requeue itself forever.
+    assert!(recycler.queue.is_empty());
+
+    let registered = SteelVal::Boxed(boxed.clone()).as_rooted();
+    let mut heap = Heap::new();
+    let mut symbols = SymbolMap::new();
+    let functions = Default::default();
+    for _ in 0..2 {
+        *boxed.write() = SteelVal::Boxed(boxed.clone());
+        let mut roots = [SteelVal::IntV(42)];
+        symbols.free_list.shadowed_slots.push(0);
+        drop(recycler.recycle(&mut roots, &mut symbols, &functions, &mut heap));
+        *boxed.write() = SteelVal::Void;
+        assert_eq!(roots, [SteelVal::Void]);
+        assert_eq!(symbols.free_list.free_list.pop(), Some(0));
+        assert!(recycler.queue.is_empty());
+        assert!(recycler.visited.is_empty());
+    }
+    drop(registered);
+}
+
+#[test]
 fn recycling_traces_registered_closures_and_custom_heap_cycles() {
     use crate::core::instructions::DenseInstruction;
 
@@ -394,6 +430,67 @@ fn recycling_keeps_slots_only_for_rooted_closures_of_this_compiler() {
     // The freed slot's value is released with the traversed values.
     assert!(released.contains(&SteelVal::IntV(1)));
     drop(rooted);
+}
+
+#[test]
+fn recycling_revisits_filtered_roots_through_kept_globals() {
+    use crate::core::instructions::{u24, DenseInstruction};
+
+    struct Child(SteelVal);
+    impl Custom for Child {
+        fn gc_visit_children(&self, context: &mut MarkAndSweepContext) {
+            context.push_back(self.0.clone());
+        }
+    }
+
+    const OWNED: u32 = u32::MAX - 3;
+    const FOREIGN: u32 = u32::MAX - 4;
+    let closure = |id, slot| {
+        SteelVal::Closure(Gc::new(ByteCodeLambda::new(
+            id,
+            vec![DenseInstruction::new(OpCode::PUSH, u24::from_usize(slot))].into(),
+            0,
+            false,
+            Default::default(),
+        )))
+    };
+    let descriptor = VTable::new_entry("recycler-property".into(), None, None);
+    let properties = [(SteelVal::SymbolV("#:child".into()), closure(FOREIGN, 1))]
+        .into_iter()
+        .collect();
+    VTable::set_entry(&descriptor, None, Gc::new(properties));
+    let shared_values = [
+        SteelVal::Boxed(Gc::new_mut(closure(FOREIGN, 1))),
+        Child(closure(FOREIGN, 1)).into_steelval().unwrap(),
+        SteelVal::HashMapV(
+            Gc::new(
+                [(SteelVal::IntV(0), closure(FOREIGN, 1))]
+                    .into_iter()
+                    .collect::<crate::values::HashMap<_, _>>(),
+            )
+            .into(),
+        ),
+        descriptor.into_steelval().unwrap(),
+    ];
+    let functions = [OWNED].into_iter().collect();
+    let mut recycler = GlobalSlotRecycler::default();
+    let mut heap = Heap::new();
+    let mut symbols = SymbolMap::new();
+    for shared in shared_values {
+        let registered =
+            SteelVal::ListV(vec![closure(OWNED, 0), shared.clone()].into()).as_rooted();
+        for _ in 0..2 {
+            let mut roots = [shared.clone(), SteelVal::IntV(42), SteelVal::IntV(99)];
+            symbols.free_list.shadowed_slots.extend([0, 1, 2]);
+            drop(recycler.recycle(&mut roots, &mut symbols, &functions, &mut heap));
+            assert_eq!(roots[0], shared);
+            assert_eq!(roots[1..], [SteelVal::IntV(42), SteelVal::Void]);
+            assert_eq!(symbols.free_list.free_list, [2]);
+            symbols.free_list.free_list.clear();
+        }
+        drop(registered);
+    }
+    VTable::set_entry(&descriptor, None, Gc::new(Default::default()));
 }
 
 #[test]
@@ -550,7 +647,9 @@ impl BreadthFirstSearchSteelValVisitor for GlobalSlotRecycler<'_> {
         self.push_back(iterator.read().root.clone());
     }
     fn visit_boxed_value(&mut self, boxed_value: GcMut<SteelVal>) -> Self::Output {
-        self.push_back(boxed_value.read().clone());
+        if self.visited.insert(boxed_value.as_ptr() as usize) {
+            self.push_back(boxed_value.read().clone());
+        }
     }
 
     fn visit_builtin_function(&mut self, _function: BuiltInSignature) -> Self::Output {}
@@ -1750,7 +1849,7 @@ fn basic_free_list_usage() {
 
     drop(pointers);
 
-    free_list.weak_collection();
+    free_list.weak_collection(drop);
 
     for var in &free_list.elements {
         assert!(!var.read().is_reachable());
@@ -1984,7 +2083,7 @@ fn free_list_continues_allocating_when_full() {
 
     drop(pointers);
 
-    free_list.weak_collection();
+    free_list.weak_collection(drop);
 
     for var in &free_list.elements {
         assert!(!var.read().is_reachable());
@@ -2015,7 +2114,7 @@ fn free_list_continues_allocating_in_the_middle() {
 
     drop(pointers);
 
-    free_list.weak_collection();
+    free_list.weak_collection(drop);
 
     // Check that the first 100 elements are in fact, gone
 
@@ -2323,7 +2422,11 @@ impl<T: HeapAble + Sync + Send + 'static> FreeList<T> {
 
     // Can incrementally collect with the from / to space, assuming that the collections
     // are done incrementally from the other side.
-    fn collect_on_condition(&mut self, func: fn(&HeapElement<T>) -> bool) -> usize {
+    fn collect_on_condition(
+        &mut self,
+        func: fn(&HeapElement<T>) -> bool,
+        mut release: impl FnMut(T),
+    ) -> usize {
         log::debug!(target: "gc", "Free count before weak collection: {}", self.alloc_count);
         let mut amount_dropped = 0;
 
@@ -2339,7 +2442,8 @@ impl<T: HeapAble + Sync + Send + 'static> FreeList<T> {
                     // Reset the values as well?
                     amount_dropped += 1;
                 }
-                guard.value = T::empty();
+                // Queue the payload for destruction after the heap is unlocked.
+                release(core::mem::replace(&mut guard.value, T::empty()));
             }
         });
 
@@ -2350,9 +2454,10 @@ impl<T: HeapAble + Sync + Send + 'static> FreeList<T> {
     }
 
     // Full weak collection
-    fn weak_collection(&mut self) -> usize {
+    fn weak_collection(&mut self, release: impl FnMut(T)) -> usize {
         // Just mark them to be dead
-        let res = self.collect_on_condition(|inner| StandardShared::weak_count(inner) == 0);
+        let res =
+            self.collect_on_condition(|inner| StandardShared::weak_count(inner) == 0, release);
         #[cfg(debug_assertions)]
         {
             assert!(!self.elements[self.cursor].read().is_reachable());
@@ -2392,8 +2497,8 @@ impl<T: HeapAble + Sync + Send + 'static> FreeList<T> {
         }
     }
 
-    fn strong_collection(&mut self) -> usize {
-        self.collect_on_condition(|inner| !inner.read().is_reachable())
+    fn strong_collection(&mut self, release: impl FnMut(T)) -> usize {
+        self.collect_on_condition(|inner| !inner.read().is_reachable(), release)
     }
 }
 
@@ -2549,7 +2654,11 @@ impl<T: HeapAble + 'static> FreeList<T> {
 
     // Can incrementally collect with the from / to space, assuming that the collections
     // are done incrementally from the other side.
-    fn collect_on_condition(&mut self, func: fn(&HeapElement<T>) -> bool) -> usize {
+    fn collect_on_condition(
+        &mut self,
+        func: fn(&HeapElement<T>) -> bool,
+        mut release: impl FnMut(T),
+    ) -> usize {
         log::debug!(target: "gc", "Free count before weak collection: {}", self.alloc_count);
         let mut amount_dropped = 0;
 
@@ -2564,7 +2673,8 @@ impl<T: HeapAble + 'static> FreeList<T> {
                     guard.reachable = false;
                     amount_dropped += 1;
                 }
-                guard.value = T::empty();
+                // Queue the payload for destruction after the heap is unlocked.
+                release(core::mem::replace(&mut guard.value, T::empty()));
             }
         });
 
@@ -2575,9 +2685,10 @@ impl<T: HeapAble + 'static> FreeList<T> {
     }
 
     // Full weak collection
-    fn weak_collection(&mut self) -> usize {
+    fn weak_collection(&mut self, release: impl FnMut(T)) -> usize {
         // Just mark them to be dead
-        let res = self.collect_on_condition(|inner| StandardShared::weak_count(inner) == 0);
+        let res =
+            self.collect_on_condition(|inner| StandardShared::weak_count(inner) == 0, release);
         #[cfg(debug_assertions)]
         {
             assert!(!self.elements[self.cursor].read().is_reachable());
@@ -2617,8 +2728,8 @@ impl<T: HeapAble + 'static> FreeList<T> {
         }
     }
 
-    fn strong_collection(&mut self) -> usize {
-        self.collect_on_condition(|inner| !inner.read().is_reachable())
+    fn strong_collection(&mut self, release: impl FnMut(T)) -> usize {
+        self.collect_on_condition(|inner| !inner.read().is_reachable(), release)
     }
 }
 
@@ -2823,6 +2934,42 @@ pub(crate) struct AdoptedCells {
     remapper: HeapRemapper,
     // Dropped after `rewrite`, outside the heap locks.
     _traced: Vec<SteelVal>,
+}
+
+pub(crate) trait HeapResult {
+    fn root_result(&self) -> Option<RootedSteelVal>;
+}
+
+impl HeapResult for () {
+    fn root_result(&self) -> Option<RootedSteelVal> {
+        None
+    }
+}
+
+impl HeapResult for SteelVal {
+    fn root_result(&self) -> Option<RootedSteelVal> {
+        Some(self.as_rooted())
+    }
+}
+
+impl HeapResult for AdoptedCells {
+    fn root_result(&self) -> Option<RootedSteelVal> {
+        let roots = self
+            .values
+            .iter()
+            .map(|cell| {
+                SteelVal::HeapAllocated(HeapRef {
+                    inner: StandardShared::downgrade(cell),
+                })
+            })
+            .chain(self.vectors.iter().map(|cell| {
+                SteelVal::MutableVector(HeapRef {
+                    inner: StandardShared::downgrade(cell),
+                })
+            }))
+            .collect();
+        Some(SteelVal::VectorV(roots).as_rooted())
+    }
 }
 
 impl AdoptedCells {
@@ -4201,7 +4348,8 @@ impl Heap {
             // let now = crate::time::Instant::now();
             // Attempt a weak collection
             log::debug!(target: "gc", "SteelVal gc invocation");
-            self.memory_free_list.weak_collection();
+            self.memory_free_list
+                .weak_collection(|value| self.released.push(value));
 
             log::debug!(target: "gc", "Memory size post weak collection: {}", self.memory_free_list.percent_full());
             // log::debug!(target: "gc", "Weak collection time: {:?}", now.elapsed());
@@ -4297,7 +4445,8 @@ impl Heap {
 
         if self.vector_free_list.percent_full() > 0.50 && self.vector_free_list.should_run_weak {
             log::debug!(target: "gc", "Running weak collection because the vector free list is 50% full");
-            self.vector_free_list.weak_collection();
+            self.vector_free_list
+                .weak_collection(|values| self.released.extend(values));
 
             if self.vector_free_list.percent_full() > 0.30 {
                 self.vector_free_list.should_run_weak = false;
@@ -4308,7 +4457,8 @@ impl Heap {
             // let now = crate::time::Instant::now();
             // Attempt a weak collection
             log::debug!(target: "gc", "Vec<SteelVal> gc invocation");
-            self.vector_free_list.weak_collection();
+            self.vector_free_list
+                .weak_collection(|values| self.released.extend(values));
             self.vector_free_list.calculate_slots_reachable();
             // log::debug!(target: "gc", "Weak collection time: {:?}", now.elapsed());
             // log::debug!(target: "gc", "Weak collection time: {:?}", now.elapsed());
@@ -4374,7 +4524,8 @@ impl Heap {
         }
 
         if self.vector_free_list.percent_full() > 0.50 && self.vector_free_list.should_run_weak {
-            self.vector_free_list.weak_collection();
+            self.vector_free_list
+                .weak_collection(|values| self.released.extend(values));
 
             if self.vector_free_list.percent_full() > 0.30 {
                 self.vector_free_list.should_run_weak = false;
@@ -4385,7 +4536,8 @@ impl Heap {
             // let now = crate::time::Instant::now();
             // Attempt a weak collection
             log::debug!(target: "gc", "Vec<SteelVal> gc invocation");
-            self.vector_free_list.weak_collection();
+            self.vector_free_list
+                .weak_collection(|values| self.released.extend(values));
             self.vector_free_list.calculate_slots_reachable();
             // log::debug!(target: "gc", "Weak collection time: {:?}", now.elapsed());
             // log::debug!(target: "gc", "Weak collection time: {:?}", now.elapsed());
@@ -4596,8 +4748,10 @@ impl Heap {
             Some(ordinary.as_ref().unwrap_or(&stats.reachable)),
         );
         // Free slots must release their payloads even if no later allocation reuses them.
-        self.memory_free_list.strong_collection();
-        self.vector_free_list.strong_collection();
+        self.memory_free_list
+            .strong_collection(|value| self.released.push(value));
+        self.vector_free_list
+            .strong_collection(|values| self.released.extend(values));
         stats
     }
 }

@@ -639,20 +639,7 @@ fn vector_set_handler_register_two(
 fn box_handler_c(ctx: *mut VmCore, arg: SteelVal) -> SteelVal {
     let this = unsafe { &mut *ctx };
 
-    let constants = &this.constants;
-    let allocated_var = this.thread.with_heap(|thread, heap| {
-        heap.allocate(
-            arg,
-            &thread.stack,
-            thread.stack_frames.iter().map(|x| x.function.as_ref()),
-            thread.global_env.roots(),
-            constants,
-            &thread.thread_local_storage,
-            &mut thread.synchronizer,
-        )
-    });
-
-    SteelVal::HeapAllocated(allocated_var)
+    this.make_box(arg)
 }
 
 #[cross_platform_fn]
