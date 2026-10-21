@@ -1880,6 +1880,17 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
             ExprKind::Macro(m) => self.visit_macro(m),
             ExprKind::Atom(a) => self.visit_atom(a),
             ExprKind::List(l) => {
+                // Quoted data is not code, so definitions in quoted templates stay unlowered.
+                if l.first().is_some_and(|head| {
+                    head.atom_syntax_object()
+                        .is_some_and(|syntax| match syntax.ty {
+                            TokenType::Quote => true,
+                            TokenType::Identifier(name) => name == *QUOTE,
+                            _ => false,
+                        })
+                }) {
+                    return Ok(());
+                }
                 if l.first().is_some_and(|head| {
                     head.atom_syntax_object()
                         .is_some_and(|syntax| matches!(syntax.ty, TokenType::Define))

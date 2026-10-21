@@ -3981,6 +3981,15 @@ struct MemorySpace {
 
 type MemoryBlock = (Vec<HeapValue>, Vec<HeapVector>);
 
+// Collections visit free slots too, and those already hold `Void`; defer only real payloads.
+fn defer_release(released: &mut Vec<SteelVal>) -> impl FnMut(SteelVal) + '_ {
+    move |value| {
+        if !matches!(value, SteelVal::Void) {
+            released.push(value);
+        }
+    }
+}
+
 impl Heap {
     // Retention roots are traced only by their source heap, which a heap's address identifies
     // while a retained handle keeps it alive.
@@ -4398,7 +4407,7 @@ impl Heap {
             // Attempt a weak collection
             log::debug!(target: "gc", "SteelVal gc invocation");
             self.memory_free_list
-                .weak_collection(|value| self.released.push(value));
+                .weak_collection(defer_release(&mut self.released));
 
             log::debug!(target: "gc", "Memory size post weak collection: {}", self.memory_free_list.percent_full());
             // log::debug!(target: "gc", "Weak collection time: {:?}", now.elapsed());
@@ -4788,7 +4797,7 @@ impl Heap {
         );
         // Free slots must release their payloads even if no later allocation reuses them.
         self.memory_free_list
-            .strong_collection(|value| self.released.push(value));
+            .strong_collection(defer_release(&mut self.released));
         self.vector_free_list
             .strong_collection(|values| self.released.extend(values));
         stats

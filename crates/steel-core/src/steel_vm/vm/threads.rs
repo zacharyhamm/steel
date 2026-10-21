@@ -14,7 +14,6 @@ use crate::{
     steel_vm::{builtin::BuiltInModule, engine::ModuleContainer, register_fn::RegisterFn},
     values::{
         closed::RootedSteelVal,
-        functions::SerializedLambdaPrototype,
         structs::{SendableVTableEntry, VTable},
     },
 };
@@ -200,29 +199,14 @@ pub(crate) fn thread_interrupt(handle: &SteelVal) -> Result<SteelVal> {
     Ok(SteelVal::Void)
 }
 
-thread_local! {
-    static CACHED_CLOSURES: RefCell<FxHashMap<u32, SerializedLambdaPrototype>> = RefCell::new(FxHashMap::default());
-}
-
 pub fn closure_into_serializable(
     c: &ByteCodeLambda,
     ctx: &mut SerializationContext,
 ) -> Result<SerializedLambda> {
-    let cached = CACHED_CLOSURES.with(|x| x.borrow().get(&c.id).cloned());
-    let prototype = cached.unwrap_or_else(|| {
-        let prototype = SerializedLambdaPrototype {
-            id: c.id,
-            body_exp: c.original_instructions().collect(),
-            arity: c.arity as _,
-            is_multi_arity: c.is_multi_arity,
-            constants: HashMap::new(),
-        };
-        CACHED_CLOSURES.with(|x| x.borrow_mut().insert(c.id, prototype.clone()));
-        prototype
-    });
+    let body_exp: Vec<_> = c.original_instructions().collect();
     let mut constants = HashMap::new();
-    // Dependencies belong to this serialization context, including on cache hits.
-    for instr in &prototype.body_exp {
+    // Dependencies belong to this serialization context.
+    for instr in &body_exp {
         match instr.op_code {
             OpCode::PUSHCONST => {
                 let index = instr.payload_size.to_usize();
@@ -241,10 +225,10 @@ pub fn closure_into_serializable(
         }
     }
     Ok(SerializedLambda {
-        id: prototype.id,
-        body_exp: prototype.body_exp,
-        arity: prototype.arity,
-        is_multi_arity: prototype.is_multi_arity,
+        id: c.id,
+        body_exp,
+        arity: c.arity as _,
+        is_multi_arity: c.is_multi_arity,
         captures: c
             .captures
             .iter()

@@ -60,7 +60,7 @@ use crate::{
 };
 use alloc::sync::Arc;
 use core::hash::Hash;
-use core::{cell::RefCell, iter::Iterator};
+use core::iter::Iterator;
 use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::PathBuf;

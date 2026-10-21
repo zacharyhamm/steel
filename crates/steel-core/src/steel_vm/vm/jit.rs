@@ -69,17 +69,18 @@ pub(crate) fn jit_compile_lambda(ctx: &mut VmCore, mut func: ByteCodeLambda) -> 
     let super_instructions = Some(fn_pointer);
     func.super_instructions = super_instructions;
 
-    let mut instructions = func.body_exp.iter().copied().collect::<Vec<_>>();
-
-    // Save the entry instruction in the event we end up serializing this
-    // later.
-    func.header.get_or_insert(instructions[0].op_code);
-
-    instructions[0].op_code = OpCode::DynSuperInstruction;
-
-    func.body_exp = Arc::from(instructions.into_boxed_slice());
+    patch_entry_instruction(&mut func);
 
     func
+}
+
+// Route entry into the compiled code, keeping the original entry for dependency scans and
+// serialization.
+fn patch_entry_instruction(func: &mut ByteCodeLambda) {
+    let mut instructions = func.body_exp.iter().copied().collect::<Vec<_>>();
+    func.header.get_or_insert(instructions[0].op_code);
+    instructions[0].op_code = OpCode::DynSuperInstruction;
+    func.body_exp = Arc::from(instructions.into_boxed_slice());
 }
 
 #[steel_derive::context(name = "#%jit-compile-2", arity = "AtLeast(1)")]
@@ -123,11 +124,7 @@ pub(crate) fn jit_compile_two(ctx: &mut VmCore, args: &[SteelVal]) -> Option<Res
                     let super_instructions = Some(fn_pointer);
                     func.super_instructions = super_instructions;
 
-                    let mut instructions = func.body_exp.iter().copied().collect::<Vec<_>>();
-                    func.header.get_or_insert(instructions[0].op_code);
-                    instructions[0].op_code = OpCode::DynSuperInstruction;
-
-                    func.body_exp = Arc::from(instructions.into_boxed_slice());
+                    patch_entry_instruction(&mut func);
 
                     let return_func = Gc::new(func);
                     ctx.thread
@@ -193,11 +190,7 @@ pub(crate) fn jit_compile(ctx: &mut VmCore, args: &[SteelVal]) -> Option<Result<
         let super_instructions = Some(fn_pointer);
         func.super_instructions = super_instructions;
 
-        let mut instructions = func.body_exp.iter().copied().collect::<Vec<_>>();
-        func.header.get_or_insert(instructions[0].op_code);
-        instructions[0].op_code = OpCode::DynSuperInstruction;
-
-        func.body_exp = Arc::from(instructions.into_boxed_slice());
+        patch_entry_instruction(&mut func);
 
         let return_func = Gc::new(func);
         ctx.thread

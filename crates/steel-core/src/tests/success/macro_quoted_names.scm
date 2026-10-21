@@ -22,3 +22,10 @@
   (syntax-rules ()
     [(_ v) (let ([tmp v]) (list 'tmp tmp))]))
 (assert! (equal? (let ([tmp 5]) (bind-and-quote tmp)) '(tmp 5)))
+
+;; a quoted definition in a template is data, not a definition to lower
+(define-syntax quote-define
+  (syntax-rules ()
+    [(_ x) (quote (define (k x) x))]))
+(assert! (equal? (quote-define a) '(define (k a) a)))
+(assert! (equal? (quote-define 1) '(define (k 1) 1)))
