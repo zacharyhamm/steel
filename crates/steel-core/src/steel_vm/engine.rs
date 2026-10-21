@@ -3010,6 +3010,10 @@ fn raw_engine_native_forms_respect_lexical_shadowing() {
             format!("((lambda () (define (call . {name}) (set! {name} (lambda (x) x)) ({name} 42)) (call)))"),
             format!("((lambda () (define (call x . {name}) (set! {name} (lambda (x) x)) ({name} x)) (call 42)))"),
             format!("((lambda () (define {name} (lambda (x) x)) ({name} 42)))"),
+            format!("((lambda () (define (call) ({name} 42)) (define ({name} x) x) (call)))"),
+            format!("((lambda () (define call (lambda () ({name} 42))) (begin (begin (define {name} (lambda (x) x)))) (call)))"),
+            format!("(let ((x 42)) (define (call) ({name} x)) (begin (define ({name} x) x)) (call))"),
+            format!("(let loop ((x 42)) (define call (lambda () ({name} x))) (define {name} (lambda (x) x)) (call))"),
         ] {
             assert_eq!(
                 engine
@@ -3026,6 +3030,128 @@ fn raw_engine_native_forms_respect_lexical_shadowing() {
                 "{source}"
             );
         }
+    }
+}
+
+#[test]
+fn raw_engine_native_forms_respect_global_shadowing() {
+    for name in ["struct", "define-values"] {
+        for definition in [
+            format!("(define ({name} x) x)"),
+            format!("(define {name} (lambda (x) x))"),
+            format!("(begin (begin (define ({name} x) x)))"),
+        ] {
+            for separate_run in [false, true] {
+                let mut engine = Engine::new_raw_no_kernel();
+                let call = format!("({name} 42)");
+                let source = if separate_run {
+                    engine.run(definition.clone()).unwrap();
+                    call
+                } else {
+                    format!("{definition} {call}")
+                };
+                engine
+                    .emit_expanded_ast_without_optimizations(&source, None)
+                    .unwrap();
+                assert_eq!(
+                    engine.run(source).unwrap().last(),
+                    Some(&SteelVal::IntV(42))
+                );
+            }
+            for caller in [
+                format!("(define (call) ({name} 42))"),
+                format!("(define call (lambda () ({name} 42)))"),
+                format!("(define (call) (let ((x 42)) ({name} x)))"),
+                format!("(begin (begin (define (call) ({name} 42))))"),
+            ] {
+                let mut engine = Engine::new_raw_no_kernel();
+                let source = format!("{caller} {definition} (call)");
+                engine
+                    .emit_expanded_ast_without_optimizations(&source, None)
+                    .unwrap();
+                assert_eq!(
+                    engine
+                        .run(source.clone())
+                        .unwrap_or_else(|error| panic!("{source}: {error}"))
+                        .last(),
+                    Some(&SteelVal::IntV(42))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_native_forms_can_bind_their_own_names() {
+    for (declaration, call) in [
+        (
+            "(define-values (define-values) (lambda (x) x))",
+            "(define-values 42)",
+        ),
+        ("(struct struct (x))", "(struct-x (struct 42))"),
+    ] {
+        let source = format!("{declaration} {call}");
+        for body in [source.clone(), format!("((lambda () {source}))")] {
+            let mut engine = Engine::new_raw_no_kernel();
+            assert_eq!(engine.run(body).unwrap().last(), Some(&SteelVal::IntV(42)));
+        }
+        let mut engine = Engine::new_raw_no_kernel();
+        engine.register_steel_module(
+            "native-declarations".into(),
+            format!("(provide answer) {declaration} (define answer {call})"),
+        );
+        assert_eq!(
+            engine
+                .run("(require \"native-declarations\") answer")
+                .unwrap()
+                .last(),
+            Some(&SteelVal::IntV(42))
+        );
+    }
+}
+
+#[test]
+fn dotted_constant_survives_full_gc() {
+    use crate::values::lists::Pair;
+
+    let mut engine = Engine::new();
+    let leaf = engine.run("(box 42)").unwrap().pop().unwrap();
+    let value = (0..30_000).fold(leaf, |tail, _| Pair::cons(SteelVal::IntV(1), tail).into());
+    let mut constants = engine.virtual_machine.compiler.read().constant_map.clone();
+    let before = constants.len();
+    let idx = constants.add_or_get(value);
+    assert_eq!(constants.len(), before + 1);
+    constants.flush();
+    engine.run("(#%gc-collect) (#%gc-collect)").unwrap();
+    let value = constants.get(idx);
+    let mut tail = &value;
+    for _ in 0..30_000 {
+        let pair = tail.pair().unwrap();
+        assert_eq!(pair.car_ref(), &SteelVal::IntV(1));
+        tail = pair.cdr_ref();
+    }
+    engine.register_value("saved-leaf", tail.clone());
+    assert_eq!(
+        engine.run("(unbox saved-leaf)").unwrap().last(),
+        Some(&SteelVal::IntV(42))
+    );
+}
+
+#[test]
+fn raw_engine_native_forms_respect_module_shadowing() {
+    for name in ["struct", "define-values"] {
+        let mut engine = Engine::new_raw_no_kernel();
+        engine.register_steel_module(
+            "native-shadowing".into(),
+            format!("(provide call) (define (call) ({name} 42)) (begin (define ({name} x) x))"),
+        );
+        assert_eq!(
+            engine
+                .run("(require \"native-shadowing\") (call)")
+                .unwrap()
+                .last(),
+            Some(&SteelVal::IntV(42))
+        );
     }
 }
 

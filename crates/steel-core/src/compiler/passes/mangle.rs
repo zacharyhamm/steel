@@ -28,7 +28,21 @@ Steps for doing having scoped macros
 
 pub fn collect_globals(exprs: &[ExprKind]) -> FxHashSet<InternedString> {
     let mut global_defs = FxHashSet::default();
+    collect_definitions(exprs, true, &mut |name| {
+        global_defs.insert(name);
+    });
+    global_defs
+}
 
+pub(crate) fn collect_defines(exprs: &[ExprKind], define: &mut impl FnMut(InternedString)) {
+    collect_definitions(exprs, false, define);
+}
+
+fn collect_definitions(
+    exprs: &[ExprKind],
+    include_define_values: bool,
+    define: &mut impl FnMut(InternedString),
+) {
     for expr in exprs {
         match expr {
             ExprKind::Define(d) => {
@@ -36,22 +50,19 @@ pub fn collect_globals(exprs: &[ExprKind]) -> FxHashSet<InternedString> {
                     if name.resolve().starts_with(MANGLER_PREFIX) {
                         continue;
                     }
-                    global_defs.insert(*name);
+                    define(*name);
                 }
             }
             // Global prelude macros expand after modules are named; preserve their exported bindings.
             ExprKind::List(l)
-                if l.first_ident()
-                    .is_some_and(|name| name.resolve() == "define-values") =>
+                if include_define_values
+                    && l.first_ident()
+                        .is_some_and(|name| name.resolve() == "define-values") =>
             {
                 if let Some(ExprKind::List(bindings)) = l.get(1) {
-                    global_defs.extend(
-                        bindings
-                            .args
-                            .iter()
-                            .filter_map(ExprKind::atom_identifier)
-                            .copied(),
-                    );
+                    for name in bindings.args.iter().filter_map(ExprKind::atom_identifier) {
+                        define(*name);
+                    }
                 }
             }
             ExprKind::List(l)
@@ -68,7 +79,7 @@ pub fn collect_globals(exprs: &[ExprKind]) -> FxHashSet<InternedString> {
                                 continue;
                             }
                             // println!("Inserting: {}", name);
-                            global_defs.insert(*name);
+                            define(*name);
                         }
                     }
 
@@ -78,7 +89,7 @@ pub fn collect_globals(exprs: &[ExprKind]) -> FxHashSet<InternedString> {
                                 continue;
                             }
                             // println!("Inserting: {}", name);
-                            global_defs.insert(*name);
+                            define(*name);
                         }
                     }
 
@@ -93,21 +104,17 @@ pub fn collect_globals(exprs: &[ExprKind]) -> FxHashSet<InternedString> {
                         .unwrap_or_default() =>
             {
                 if l.len() > 1 {
-                    let collected_defs = collect_globals(&l[1..]);
-                    global_defs.extend(collected_defs);
+                    collect_definitions(&l[1..], include_define_values, define);
                 }
 
                 // let collected_defs =collect_globals(&l[])
             }
             ExprKind::Begin(b) => {
-                let collected_defs = collect_globals(&b.exprs);
-                global_defs.extend(collected_defs);
+                collect_definitions(&b.exprs, include_define_values, define);
             }
             _ => {}
         }
     }
-
-    global_defs
 }
 
 pub struct NameUnMangler<'a> {
@@ -273,6 +280,32 @@ mod name_mangling_tests {
     use super::*;
 
     use crate::parser::parser::Parser;
+
+    #[test]
+    fn explicit_definitions_stop_at_data_and_nested_scopes() {
+        let source = "(define (function x) x)
+                      (begin (begin (define value 42)))
+                      '(define quoted 1)
+                      (quote (begin (define template 2)))
+                      (lambda () (define nested 3))
+                      (let () (define local 4))
+                      (define-values (generated) 5)
+                      (struct record (field))";
+        for ast in [
+            Parser::parse(source).unwrap(),
+            Parser::parse_without_lowering(source).unwrap(),
+        ] {
+            let mut definitions = FxHashSet::default();
+            collect_defines(&ast, &mut |name| {
+                definitions.insert(name);
+            });
+            assert_eq!(
+                definitions,
+                ["function".into(), "value".into()].into_iter().collect()
+            );
+            assert!(collect_globals(&ast).contains(&"generated".into()));
+        }
+    }
 
     #[test]
     fn basic_mangling() {

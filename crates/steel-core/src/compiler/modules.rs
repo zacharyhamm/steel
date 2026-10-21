@@ -54,7 +54,7 @@ use super::{
     passes::{
         analysis::is_a_builtin_definition,
         begin::FlattenBegin,
-        mangle::{collect_globals, NameMangler},
+        mangle::{collect_defines, collect_globals, NameMangler},
     },
     program::{FOR_SYNTAX, ONLY_IN, PREFIX_IN, REQUIRE_IDENT_SPEC},
 };
@@ -2349,6 +2349,10 @@ impl<'a> ModuleBuilder<'a> {
 
         let loaded_syntax_transformers = prev_length != ast.len();
 
+        let mut native_globals = FxHashSet::default();
+        collect_defines(&ast, &mut |name| {
+            native_globals.insert(name);
+        });
         let globals = collect_globals(&ast);
         let globals = GlobalMap::Set(&globals);
 
@@ -2398,8 +2402,11 @@ impl<'a> ModuleBuilder<'a> {
                     self.builtin_modules.clone(),
                     // Expanding macros in the environment?
                     self.name.to_str().unwrap(),
-                    globals,
+                    GlobalMap::Set(&native_globals),
                 )?;
+                collect_defines(std::slice::from_ref(expr), &mut |name| {
+                    native_globals.insert(name);
+                });
 
                 expand(expr, &self.macro_map, globals)?;
             }
@@ -2416,8 +2423,11 @@ impl<'a> ModuleBuilder<'a> {
                 self.builtin_modules.clone(),
                 // Expanding macros in the environment?
                 self.name.to_str().unwrap(),
-                globals,
+                GlobalMap::Set(&native_globals),
             )?;
+            collect_defines(std::slice::from_ref(expr), &mut |name| {
+                native_globals.insert(name);
+            });
             // })
         }
 
@@ -2496,8 +2506,11 @@ impl<'a> ModuleBuilder<'a> {
                 self.builtin_modules.clone(),
                 // Expanding macros in the environment?
                 self.name.to_str().unwrap(),
-                globals,
+                GlobalMap::Set(&native_globals),
             )?;
+            collect_defines(std::slice::from_ref(expr), &mut |name| {
+                native_globals.insert(name);
+            });
 
             expand(expr, &many_expander.map, globals)?;
 
@@ -2516,8 +2529,11 @@ impl<'a> ModuleBuilder<'a> {
                         // We don't need to expand those here
                         ModuleContainer::default(),
                         &req_macro.module_name,
-                        globals,
+                        GlobalMap::Set(&native_globals),
                     )?;
+                    collect_defines(std::slice::from_ref(expr), &mut |name| {
+                        native_globals.insert(name);
+                    });
 
                     if local_changed {
                         req_macro.name_mangler.visit(expr);
@@ -2559,8 +2575,11 @@ impl<'a> ModuleBuilder<'a> {
                 self.kernel.as_mut(),
                 self.builtin_modules.clone(),
                 self.name.to_str().unwrap(),
-                globals,
+                GlobalMap::Set(&native_globals),
             )?;
+            collect_defines(std::slice::from_ref(expr), &mut |name| {
+                native_globals.insert(name);
+            });
         }
 
         // TODO: @Matt - fix this hack

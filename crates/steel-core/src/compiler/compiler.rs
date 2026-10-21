@@ -54,7 +54,10 @@ use crate::steel_vm::const_evaluation::ConstantEvaluatorManager;
 use super::{
     constants::SerializableConstantMap,
     modules::{steel_search_dirs, CompiledModule, ModuleManager, SourceModuleResolver},
-    passes::{analysis::Analysis, mangle::NameMangler},
+    passes::{
+        analysis::Analysis,
+        mangle::{collect_defines, NameMangler},
+    },
     program::RawProgramWithSymbols,
 };
 
@@ -966,13 +969,18 @@ impl Compiler {
         //     crate::parser::expand_visitor::expand(expr, &self.macro_env)?;
         // }
 
+        let mut native_globals: FxHashSet<_> = self.symbol_map.map().keys().copied().collect();
+        collect_defines(&expanded_statements, &mut |name| {
+            native_globals.insert(name);
+        });
+
         for expr in expanded_statements.iter_mut() {
             expand_kernel_in_env(
                 expr,
                 self.kernel.as_mut(),
                 self.builtin_modules.clone(),
                 "top-level",
-                GlobalMap::Map(self.symbol_map.map()),
+                GlobalMap::Set(&native_globals),
             )?;
             crate::parser::expand_visitor::expand(
                 expr,
@@ -1002,7 +1010,7 @@ impl Compiler {
                     self.kernel.as_mut(),
                     self.builtin_modules.clone(),
                     module,
-                    GlobalMap::Map(self.symbol_map.map()),
+                    GlobalMap::Set(&native_globals),
                 )?;
 
                 if changed {
@@ -1015,7 +1023,7 @@ impl Compiler {
                 self.kernel.as_mut(),
                 self.builtin_modules.clone(),
                 "top-level",
-                GlobalMap::Map(self.symbol_map.map()),
+                GlobalMap::Set(&native_globals),
             )?;
 
             // TODO: If we have this, then we have to lower all of the expressions again
@@ -1028,6 +1036,9 @@ impl Compiler {
             // for expr in expanded_statements.iter_mut() {
             lower_entire_ast(expr)?;
 
+            collect_defines(std::slice::from_ref(expr), &mut |name| {
+                native_globals.insert(name);
+            });
             ResolveExpansionMarks::resolve(expr);
         }
 
@@ -1159,13 +1170,18 @@ impl Compiler {
             kernel.load_syntax_transformers(&mut expanded_statements, "top-level".to_string())?;
         }
 
+        let mut native_globals: FxHashSet<_> = self.symbol_map.map().keys().copied().collect();
+        collect_defines(&expanded_statements, &mut |name| {
+            native_globals.insert(name);
+        });
+
         for expr in expanded_statements.iter_mut() {
             expand_kernel_in_env(
                 expr,
                 self.kernel.as_mut(),
                 self.builtin_modules.clone(),
                 "top-level",
-                GlobalMap::Map(self.symbol_map.map()),
+                GlobalMap::Set(&native_globals),
             )?;
             crate::parser::expand_visitor::expand(
                 expr,
@@ -1197,7 +1213,7 @@ impl Compiler {
                     self.kernel.as_mut(),
                     self.builtin_modules.clone(),
                     module,
-                    GlobalMap::Map(self.symbol_map.map()),
+                    GlobalMap::Set(&native_globals),
                 )?;
 
                 if changed {
@@ -1210,7 +1226,7 @@ impl Compiler {
                 self.kernel.as_mut(),
                 self.builtin_modules.clone(),
                 "top-level",
-                GlobalMap::Map(self.symbol_map.map()),
+                GlobalMap::Set(&native_globals),
             )?;
 
             // TODO: If we have this, then we have to lower all of the expressions again
@@ -1223,6 +1239,9 @@ impl Compiler {
             // for expr in expanded_statements.iter_mut() {
             lower_entire_ast(expr)?;
 
+            collect_defines(std::slice::from_ref(expr), &mut |name| {
+                native_globals.insert(name);
+            });
             ResolveExpansionMarks::resolve(expr);
         }
 

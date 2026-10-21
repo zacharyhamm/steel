@@ -10,7 +10,8 @@ use steel_parser::parser::SourceId;
 use steel_parser::tokens::NumberLiteral;
 
 use crate::compiler::modules::RequiredModuleMacros;
-use crate::compiler::program::{LAMBDA, LAMBDA_SYMBOL, LET};
+use crate::compiler::passes::mangle::collect_defines;
+use crate::compiler::program::{BEGIN, LAMBDA, LAMBDA_SYMBOL, LET};
 use crate::parser::ast::ExprKind;
 use crate::parser::parser::SyntaxObject;
 use crate::parser::span_visitor::get_span;
@@ -164,6 +165,7 @@ fn visit_let_form<V: VisitorMutRef<Output = Result<()>>>(
     visitor: &mut V,
     scope: fn(&mut V) -> &mut ScopeSet<InternedString, FxBuildHasher>,
     l: &mut List,
+    predeclare_defines: bool,
 ) -> Result<()> {
     let name = l.args.get(1).and_then(|x| x.atom_identifier()).copied();
     let bindings_index = if name.is_some() { 2 } else { 1 };
@@ -193,6 +195,11 @@ fn visit_let_form<V: VisitorMutRef<Output = Result<()>>>(
     }
 
     if let Some(body_args) = l.args.get_mut(bindings_index + 1..) {
+        if predeclare_defines {
+            collect_defines(body_args, &mut |name| {
+                scope(visitor).define(name);
+            });
+        }
         for body_expr in body_args {
             visitor.visit(body_expr)?;
         }
@@ -407,7 +414,7 @@ impl<'a> VisitorMutRef for Expander<'a> {
                     }
 
                     Some(head) if is_let_head(head) => {
-                        return visit_let_form(self, |v| &mut v.in_scope_values, l);
+                        return visit_let_form(self, |v| &mut v.in_scope_values, l, false);
                     }
 
                     Some(ExprKind::Atom(Atom {
@@ -773,7 +780,7 @@ impl<'a> VisitorMutRef for ExpanderMany<'a> {
                         }
                     }
                     Some(head) if is_let_head(head) => {
-                        return visit_let_form(self, |v| &mut v.in_scope_values, l);
+                        return visit_let_form(self, |v| &mut v.in_scope_values, l, false);
                     }
                     Some(ExprKind::Atom(Atom {
                         syn:
@@ -1745,11 +1752,8 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
                 syntax.ty = TokenType::Identifier(*DEFINE_SYNTAX);
             }
         }
-        // An internal definition shadows native forms such as `struct` in the rest of its body.
-        if self.in_scope_values.depth() > 1 {
-            if let Some(ident) = define.name.atom_identifier() {
-                self.in_scope_values.define(*ident);
-            }
+        if let Some(ident) = define.name.atom_identifier() {
+            self.in_scope_values.define(*ident);
         }
         self.define_context = Some(define.name.clone());
         self.visit(&mut define.body)?;
@@ -1777,6 +1781,9 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
                 self.visit(value)?;
             }
 
+            collect_defines(std::slice::from_ref(&lambda_function.body), &mut |name| {
+                self.in_scope_values.define(name);
+            });
             self.visit(&mut lambda_function.body)?;
 
             self.in_scope_values.pop_layer();
@@ -1799,6 +1806,9 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
     }
 
     fn visit_begin(&mut self, begin: &mut super::ast::Begin) -> Self::Output {
+        collect_defines(&begin.exprs, &mut |name| {
+            self.in_scope_values.define(name);
+        });
         for expr in begin.exprs.iter_mut() {
             self.visit(expr)?;
         }
@@ -1857,6 +1867,9 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
             self.visit(expr)?;
         }
 
+        collect_defines(std::slice::from_ref(&l.body_expr), &mut |name| {
+            self.in_scope_values.define(name);
+        });
         self.visit(&mut l.body_expr)?;
 
         self.in_scope_values.pop_layer();
@@ -1892,6 +1905,15 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
                     return Ok(());
                 }
                 if l.first().is_some_and(|head| {
+                    head.atom_syntax_object().is_some_and(|syntax| {
+                        syntax.ty == TokenType::Begin || head.atom_identifier() == Some(&*BEGIN)
+                    })
+                }) {
+                    collect_defines(&l.args[1..], &mut |name| {
+                        self.in_scope_values.define(name);
+                    });
+                }
+                if l.first().is_some_and(|head| {
                     head.atom_syntax_object()
                         .is_some_and(|syntax| matches!(syntax.ty, TokenType::Define))
                 }) {
@@ -1910,7 +1932,9 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
                 }
                 if self.map.is_none()
                     && l.first_ident().is_some_and(|name| {
-                        name.resolve() == "define-values" && !self.in_scope_values.contains(name)
+                        name.resolve() == "define-values"
+                            && !self.in_scope_values.contains(name)
+                            && !self.globals.actually_contains(name)
                     })
                 {
                     *expr = expand_define_values(l)?;
@@ -1920,7 +1944,9 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
 
                 if self.map.is_none()
                     && l.first_ident().is_some_and(|name| {
-                        name.resolve() == "struct" && !self.in_scope_values.contains(name)
+                        name.resolve() == "struct"
+                            && !self.in_scope_values.contains(name)
+                            && !self.globals.actually_contains(name)
                     })
                 {
                     *expr = expand_immutable_struct(l)?;
@@ -1931,20 +1957,17 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
                 {
                     match l.first() {
                         Some(head) if is_let_head(head) => {
-                            return visit_let_form(self, |v| &mut v.in_scope_values, l);
+                            return visit_let_form(self, |v| &mut v.in_scope_values, l, true);
                         }
-                        Some(ExprKind::Atom(
-                            ident @ Atom {
-                                syn:
-                                    SyntaxObject {
-                                        ty: TokenType::Identifier(s),
-                                        ..
-                                    },
-                            },
-                        )) if *s == *LAMBDA_SYMBOL || *s == *LAMBDA => {
-                            if let ExprKind::LambdaFunction(mut lambda) =
-                                parse_lambda(ident.clone(), l.args.clone())?
-                            {
+                        Some(ExprKind::Atom(ident))
+                            if ident.syn.ty == TokenType::Lambda
+                                || matches!(ident.syn.ty, TokenType::Identifier(name)
+                                    if name == *LAMBDA_SYMBOL || name == *LAMBDA) =>
+                        {
+                            if let ExprKind::LambdaFunction(mut lambda) = parse_lambda(
+                                ident.clone(),
+                                l.clone().args_proper(TokenType::Lambda)?,
+                            )? {
                                 self.visit_lambda_function(&mut lambda)?;
 
                                 *expr = ExprKind::LambdaFunction(lambda);
@@ -2243,6 +2266,38 @@ mod expansion_tests {
     }
 
     #[test]
+    fn native_forms_predeclare_lowered_and_unlowered_bindings() {
+        for name in ["struct", "define-values"] {
+            for source in [
+                format!("(begin (define (call) ({name} 42)) (begin (define ({name} x) x)))"),
+                format!("(lambda () (define (call) ({name} 42)) (begin (define {name} (lambda (x) x))) (call))"),
+                format!("(let ((x 42)) (define (call) ({name} x)) (begin (define ({name} x) x)) (call))"),
+            ] {
+                for mut ast in [
+                    steel_parser::parser::Parser::parse(&source).unwrap(),
+                    steel_parser::parser::Parser::parse_without_lowering(&source).unwrap(),
+                ] {
+                    assert!(!expand_kernel_in_env_with_change(
+                        &mut ast[0], None, ModuleContainer::default(), "top-level",
+                        GlobalMap::Map(&FxHashMap::default()),
+                    ).unwrap(), "{source}");
+                }
+            }
+            let mut ast =
+                steel_parser::parser::Parser::parse_without_lowering(&format!("({name} 42)"))
+                    .unwrap();
+            assert!(!expand_kernel_in_env_with_change(
+                &mut ast[0],
+                None,
+                ModuleContainer::default(),
+                "top-level",
+                GlobalMap::Map(&[(name.into(), 0)].into_iter().collect()),
+            )
+            .unwrap());
+        }
+    }
+
+    #[test]
     fn native_forms_skip_definition_signatures() {
         for source in [
             "(#%define-syntax (struct expr) (struct local (field)))",
@@ -2275,7 +2330,11 @@ mod expansion_tests {
                     panic!("expected a lowered lambda: {source}");
                 };
                 assert_eq!(lambda.args[..], signature.args[1..], "{source}");
-                assert!(matches!(lambda.body, ExprKind::Begin(_)), "{source}");
+                if define.name.atom_identifier().unwrap().resolve() == "struct" {
+                    assert!(matches!(lambda.body, ExprKind::List(_)), "{source}");
+                } else {
+                    assert!(matches!(lambda.body, ExprKind::Begin(_)), "{source}");
+                }
             } else {
                 let ExprKind::List(expanded) = expanded else {
                     panic!("expected an unlowered macro definition: {source}");
