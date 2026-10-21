@@ -1412,33 +1412,12 @@ impl SteelThread {
         constants: Option<&ConstantMap>,
         thunk: impl FnOnce(&mut Self, &mut Heap) -> T,
     ) -> T {
+        // Before locking, so a collection in `thunk` no longer snapshots their result roots.
+        #[cfg(feature = "sync")]
+        self.release_completed_threads(constants);
         let heap = self.heap.clone_for_storage();
         let mut guard = self.enter_safepoint(|_| heap.lock());
         let result = thunk(self, &mut guard);
-        #[cfg(feature = "sync")]
-        {
-            use std::sync::atomic::Ordering::{AcqRel, Acquire};
-
-            let pending = &self.synchronizer.cleanup_pending;
-            // Consume before scanning so concurrent completions leave another notification.
-            if pending.load(Acquire) && pending.swap(false, AcqRel) {
-                // Completed results can run destructors that reenter this heap or synchronizer.
-                self.synchronizer
-                    .threads
-                    .lock()
-                    .unwrap()
-                    .retain_mut(|thread| {
-                        if thread.ctx.strong_count() > 0 {
-                            true
-                        } else {
-                            guard
-                                .released
-                                .push(core::mem::replace(&mut thread.handle, SteelVal::Void));
-                            false
-                        }
-                    });
-            }
-        }
         let released = core::mem::take(&mut guard.released);
         let retained = core::mem::take(&mut guard.released_retained);
         #[cfg(feature = "biased")]
@@ -1476,6 +1455,45 @@ impl SteelThread {
         drop(active_roots);
         drop(result_roots);
         result
+    }
+
+    #[cfg(feature = "sync")]
+    fn release_completed_threads(&mut self, constants: Option<&ConstantMap>) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+
+        let pending = &self.synchronizer.cleanup_pending;
+        // Consume before scanning so concurrent completions leave another notification.
+        if !(pending.load(Acquire) && pending.swap(false, AcqRel)) {
+            return;
+        }
+        let mut released = Vec::new();
+        // Waiting on the registry is a safepoint: its holder can be waiting for this thread.
+        self.enter_safepoint(|thread| {
+            thread
+                .synchronizer
+                .threads
+                .lock()
+                .unwrap()
+                .retain_mut(|thread| {
+                    if thread.ctx.strong_count() > 0 {
+                        true
+                    } else {
+                        released.push(core::mem::replace(&mut thread.handle, SteelVal::Void));
+                        false
+                    }
+                });
+        });
+        if released.is_empty() {
+            return;
+        }
+        // Completed results can run destructors that reenter this heap or synchronizer, or
+        // collect through another engine while this thread is outside a safepoint.
+        let active_roots = ActiveHeapRoots::new(self, constants)
+            .into_steelval()
+            .unwrap()
+            .as_rooted();
+        drop(released);
+        drop(active_roots);
     }
 
     // Allow this thread to be available for garbage collection

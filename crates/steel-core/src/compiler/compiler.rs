@@ -969,7 +969,7 @@ impl Compiler {
         //     crate::parser::expand_visitor::expand(expr, &self.macro_env)?;
         // }
 
-        let mut native_globals: FxHashSet<_> = self.symbol_map.map().keys().copied().collect();
+        let mut native_globals = FxHashSet::default();
         collect_defines(&expanded_statements, &mut |name| {
             native_globals.insert(name);
         });
@@ -980,7 +980,7 @@ impl Compiler {
                 self.kernel.as_mut(),
                 self.builtin_modules.clone(),
                 "top-level",
-                GlobalMap::Set(&native_globals),
+                GlobalMap::Layered(self.symbol_map.map(), &native_globals),
             )?;
             crate::parser::expand_visitor::expand(
                 expr,
@@ -1010,7 +1010,7 @@ impl Compiler {
                     self.kernel.as_mut(),
                     self.builtin_modules.clone(),
                     module,
-                    GlobalMap::Set(&native_globals),
+                    GlobalMap::Layered(self.symbol_map.map(), &native_globals),
                 )?;
 
                 if changed {
@@ -1023,7 +1023,7 @@ impl Compiler {
                 self.kernel.as_mut(),
                 self.builtin_modules.clone(),
                 "top-level",
-                GlobalMap::Set(&native_globals),
+                GlobalMap::Layered(self.symbol_map.map(), &native_globals),
             )?;
 
             // TODO: If we have this, then we have to lower all of the expressions again
@@ -1170,7 +1170,7 @@ impl Compiler {
             kernel.load_syntax_transformers(&mut expanded_statements, "top-level".to_string())?;
         }
 
-        let mut native_globals: FxHashSet<_> = self.symbol_map.map().keys().copied().collect();
+        let mut native_globals = FxHashSet::default();
         collect_defines(&expanded_statements, &mut |name| {
             native_globals.insert(name);
         });
@@ -1181,7 +1181,7 @@ impl Compiler {
                 self.kernel.as_mut(),
                 self.builtin_modules.clone(),
                 "top-level",
-                GlobalMap::Set(&native_globals),
+                GlobalMap::Layered(self.symbol_map.map(), &native_globals),
             )?;
             crate::parser::expand_visitor::expand(
                 expr,
@@ -1213,7 +1213,7 @@ impl Compiler {
                     self.kernel.as_mut(),
                     self.builtin_modules.clone(),
                     module,
-                    GlobalMap::Set(&native_globals),
+                    GlobalMap::Layered(self.symbol_map.map(), &native_globals),
                 )?;
 
                 if changed {
@@ -1226,7 +1226,7 @@ impl Compiler {
                 self.kernel.as_mut(),
                 self.builtin_modules.clone(),
                 "top-level",
-                GlobalMap::Set(&native_globals),
+                GlobalMap::Layered(self.symbol_map.map(), &native_globals),
             )?;
 
             // TODO: If we have this, then we have to lower all of the expressions again

@@ -44,20 +44,15 @@ struct ThreadOwner {
 
 impl ThreadOwner {
     fn new() -> Self {
-        let mut id = NEXT_THREAD_ID.load(Ordering::Relaxed);
-        loop {
-            let next = id.checked_add(1).unwrap_or_else(|| std::process::abort());
-            match NEXT_THREAD_ID.compare_exchange_weak(
-                id,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(current) => id = current,
-            }
+        // Identities are never reused, so exhausting them (or wrapping to 0) aborts.
+        let id = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
+        if id == usize::MAX {
+            std::process::abort();
         }
-        let id = ThreadId(NonZeroUsize::new(id).unwrap());
+        let Some(id) = NonZeroUsize::new(id) else {
+            std::process::abort();
+        };
+        let id = ThreadId(id);
         QUEUE.map.insert(id, Vec::new());
         Self { id }
     }
@@ -357,6 +352,10 @@ impl<T: ?Sized> RcBox<T> {
     pub fn slow_increment(&self) {
         let mut old = self.rcword.shared.load(Ordering::Relaxed);
         loop {
+            // Like the biased path, overflow aborts instead of panicking in `set_value`.
+            if old.get_counter() >= (1 << 29) - 1 {
+                std::process::abort();
+            }
             let mut new = old;
             new.update_counter(|count| count + 1);
             match self.rcword.shared.compare_exchange(

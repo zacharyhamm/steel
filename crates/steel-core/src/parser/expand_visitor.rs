@@ -83,6 +83,11 @@ pub fn extract_macro_defs(
 pub enum GlobalMap<'a> {
     Map(&'a FxHashMap<InternedString, usize>),
     Set(&'a FxHashSet<InternedString>),
+    // Existing globals plus the definitions collected for the program being compiled.
+    Layered(
+        &'a FxHashMap<InternedString, usize>,
+        &'a FxHashSet<InternedString>,
+    ),
 }
 
 impl<'a> GlobalMap<'a> {
@@ -91,6 +96,7 @@ impl<'a> GlobalMap<'a> {
             // TODO: Fix this so that we can actually leverage it!
             GlobalMap::Map(_) => false,
             GlobalMap::Set(hash_set) => hash_set.contains(i),
+            GlobalMap::Layered(map, set) => map.contains_key(i) || set.contains(i),
         }
     }
 
@@ -99,6 +105,7 @@ impl<'a> GlobalMap<'a> {
             // TODO: Fix this so that we can actually leverage it!
             GlobalMap::Map(m) => m.contains_key(i),
             GlobalMap::Set(hash_set) => hash_set.contains(i),
+            GlobalMap::Layered(map, set) => map.contains_key(i) || set.contains(i),
         }
     }
 }
@@ -1964,10 +1971,13 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
                                 || matches!(ident.syn.ty, TokenType::Identifier(name)
                                     if name == *LAMBDA_SYMBOL || name == *LAMBDA) =>
                         {
-                            if let ExprKind::LambdaFunction(mut lambda) = parse_lambda(
-                                ident.clone(),
-                                l.clone().args_proper(TokenType::Lambda)?,
-                            )? {
+                            let ident = ident.clone();
+                            // The list is replaced by the parsed lambda, so move it instead of
+                            // cloning the whole body.
+                            let list = core::mem::replace(l, List::new(ThinVec::new()));
+                            if let ExprKind::LambdaFunction(mut lambda) =
+                                parse_lambda(ident, list.args_proper(TokenType::Lambda)?)?
+                            {
                                 self.visit_lambda_function(&mut lambda)?;
 
                                 *expr = ExprKind::LambdaFunction(lambda);

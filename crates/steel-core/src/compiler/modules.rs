@@ -2425,9 +2425,6 @@ impl<'a> ModuleBuilder<'a> {
                 self.name.to_str().unwrap(),
                 GlobalMap::Set(&native_globals),
             )?;
-            collect_defines(std::slice::from_ref(expr), &mut |name| {
-                native_globals.insert(name);
-            });
             // })
         }
 
