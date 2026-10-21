@@ -160,7 +160,7 @@ fn thread_creation(c: &mut Criterion) {
   (vector 10 20 30 40 x))
 
 (define (block)
-    (thread-join! (spawn-thread! (lambda () (vector-ref (foo 100) 4))))) 
+    (thread-join! (spawn-native-thread (lambda () (vector-ref (foo 100) 4)))))
 "#,
     )
     .unwrap();
@@ -220,6 +220,15 @@ fn fib_28_contract(c: &mut Criterion) {
 
 fn engine_creation(c: &mut Criterion) {
     c.bench_function("engine-creation", |b| b.iter(Engine::new));
+}
+
+fn idle_thread_cleanup(c: &mut Criterion) {
+    benchmark_template(
+        c,
+        "idle-thread-cleanup",
+        "(define cleanup-value (box 1)) (set! cleanup-value (box 2))",
+        "",
+    );
 }
 
 fn register_function(c: &mut Criterion) {
@@ -324,6 +333,7 @@ criterion_group!(
     fib_28,
     thread_creation,
     engine_creation,
+    idle_thread_cleanup,
     register_function,
     multiple_transducers,
     binary_trees,

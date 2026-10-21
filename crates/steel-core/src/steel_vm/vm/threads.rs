@@ -1150,7 +1150,10 @@ pub(crate) fn spawn_native_thread(ctx: &mut VmCore, args: &[SteelVal]) -> Option
     let controller = ThreadStateController::default();
     thread.synchronizer.state = controller.clone();
     // This thread needs its own context
-    thread.synchronizer.ctx = Arc::new(AtomicCell::new(None));
+    thread.synchronizer.ctx = Arc::new(ThreadContextCell {
+        context: AtomicCell::new(None),
+        cleanup_pending: thread.synchronizer.cleanup_pending.clone(),
+    });
 
     thread.id = EngineId::new();
 
@@ -1209,15 +1212,10 @@ pub(crate) fn spawn_native_thread(ctx: &mut VmCore, args: &[SteelVal]) -> Option
 
     ctx.thread.enter_safepoint(|thread| {
         // Store for the shared runtime
-        thread
-            .synchronizer
-            .threads
-            .lock()
-            .unwrap()
-            .push(ThreadContext {
-                ctx: weak_ctx.clone(),
-                handle: value.clone(),
-            });
+        thread.synchronizer.register_thread(ThreadContext {
+            ctx: weak_ctx.clone(),
+            handle: value.clone(),
+        });
     });
 
     log::debug!(target: "threads", "Time to spawn thread: {:?}", thread_time.elapsed());

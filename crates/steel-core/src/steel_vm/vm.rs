@@ -629,6 +629,11 @@ mod heap_handle_tests {
             &ordinary.synchronizer.threads
         ));
         assert!(Arc::ptr_eq(&original.ctx, &ordinary.synchronizer.ctx));
+        #[cfg(feature = "sync")]
+        assert!(Arc::ptr_eq(
+            &original.cleanup_pending,
+            &ordinary.synchronizer.cleanup_pending
+        ));
         assert!(Arc::ptr_eq(
             &original.state.paused,
             &ordinary.synchronizer.state.paused
@@ -650,12 +655,17 @@ mod heap_handle_tests {
             for other in &coordinators[index + 1..] {
                 assert!(!Arc::ptr_eq(&coordinator.threads, &other.threads));
                 assert!(!Arc::ptr_eq(&coordinator.ctx, &other.ctx));
+                #[cfg(feature = "sync")]
+                assert!(!Arc::ptr_eq(
+                    &coordinator.cleanup_pending,
+                    &other.cleanup_pending
+                ));
                 assert!(!Arc::ptr_eq(&coordinator.state.paused, &other.state.paused));
                 assert!(!Arc::ptr_eq(&coordinator.state.state, &other.state.state));
             }
         }
         original.state.pause_for_safepoint();
-        original.threads.lock().unwrap().push(ThreadContext {
+        original.register_thread(ThreadContext {
             ctx: Arc::downgrade(&ordinary.synchronizer.ctx),
             handle: SteelVal::Void,
         });
@@ -782,6 +792,107 @@ mod heap_handle_tests {
     }
 }
 
+#[cfg(all(test, feature = "sync"))]
+mod thread_cleanup_tests {
+    use super::{Synchronizer, ThreadContext, ThreadContextCell};
+    use crate::{steel_vm::engine::Engine, SteelVal};
+    use crossbeam_utils::atomic::AtomicCell;
+    use std::{
+        panic::{catch_unwind, AssertUnwindSafe},
+        sync::{atomic::Ordering, Arc},
+        time::{Duration, Instant},
+    };
+
+    fn context(synchronizer: &Synchronizer) -> Arc<ThreadContextCell> {
+        Arc::new(ThreadContextCell {
+            context: AtomicCell::new(None),
+            cleanup_pending: synchronizer.cleanup_pending.clone(),
+        })
+    }
+
+    #[test]
+    fn cleanup_notification_waits_for_final_context_owner() {
+        for unwind in [false, true] {
+            let synchronizer = Synchronizer::new();
+            let pending = synchronizer.cleanup_pending.clone();
+            let clone = synchronizer.clone();
+            let context = synchronizer.ctx.clone();
+            drop(synchronizer);
+            assert!(!pending.load(Ordering::Acquire));
+            drop(clone);
+            assert!(!pending.load(Ordering::Acquire));
+            if unwind {
+                assert!(catch_unwind(AssertUnwindSafe(move || {
+                    let _context = context;
+                    panic!("unwind the final context owner");
+                }))
+                .is_err());
+            } else {
+                drop(context);
+            }
+            assert!(pending.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn completed_context_registration_restores_cleanup_notification() {
+        let mut engine = Engine::new_raw_no_kernel();
+        let synchronizer = engine.virtual_machine.synchronizer.clone();
+        let context = context(&synchronizer);
+        let entry = ThreadContext {
+            ctx: Arc::downgrade(&context),
+            handle: SteelVal::Void,
+        };
+        drop(context);
+        assert!(synchronizer.cleanup_pending.load(Ordering::Acquire));
+
+        // Another heap operation can consume the notification before registration.
+        engine.virtual_machine.with_heap(None, |_, _| {});
+        assert!(!synchronizer.cleanup_pending.load(Ordering::Acquire));
+        synchronizer.register_thread(entry);
+        assert!(synchronizer.cleanup_pending.load(Ordering::Acquire));
+        engine.virtual_machine.with_heap(None, |_, _| {});
+        assert!(!synchronizer.cleanup_pending.load(Ordering::Acquire));
+        assert_eq!(synchronizer.threads.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn completion_while_cleanup_waits_keeps_notification() {
+        let mut engine = Engine::new_raw_no_kernel();
+        let synchronizer = engine.virtual_machine.synchronizer.clone();
+        let first = context(&synchronizer);
+        let second = context(&synchronizer);
+        for context in [&first, &second] {
+            synchronizer.register_thread(ThreadContext {
+                ctx: Arc::downgrade(context),
+                handle: SteelVal::Void,
+            });
+        }
+        drop(first);
+        let guard = synchronizer.threads.lock().unwrap();
+        let worker = std::thread::spawn(move || {
+            engine.virtual_machine.with_heap(None, |_, _| {});
+            engine
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while synchronizer.cleanup_pending.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let consumed_before_lock = !synchronizer.cleanup_pending.load(Ordering::Acquire);
+        drop(second);
+        drop(guard);
+        let mut engine = worker.join().unwrap();
+        assert!(
+            consumed_before_lock,
+            "cleanup must consume its notification before locking"
+        );
+        assert!(synchronizer.cleanup_pending.load(Ordering::Acquire));
+        engine.virtual_machine.with_heap(None, |_, _| {});
+        assert!(!synchronizer.cleanup_pending.load(Ordering::Acquire));
+        assert_eq!(synchronizer.threads.lock().unwrap().len(), 1);
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct RunTimeOptions {
     pub(crate) contracts_on: bool,
@@ -850,9 +961,32 @@ impl ThreadStateController {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct ThreadContextCell {
+    context: AtomicCell<Option<*mut SteelThread>>,
+    #[cfg(feature = "sync")]
+    cleanup_pending: Arc<AtomicBool>,
+}
+
+impl core::ops::Deref for ThreadContextCell {
+    type Target = AtomicCell<Option<*mut SteelThread>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.context
+    }
+}
+
+#[cfg(feature = "sync")]
+impl Drop for ThreadContextCell {
+    fn drop(&mut self) {
+        self.cleanup_pending
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ThreadContext {
-    pub(crate) ctx: std::sync::Weak<AtomicCell<Option<*mut SteelThread>>>,
+    pub(crate) ctx: std::sync::Weak<ThreadContextCell>,
     pub(crate) handle: SteelVal,
 }
 
@@ -863,12 +997,14 @@ pub struct Synchronizer {
     // in a world in which these kinds of threads might basically
     // share memory space, we probably need to handle this
     pub(crate) threads: Arc<Mutex<Vec<ThreadContext>>>,
+    #[cfg(feature = "sync")]
+    cleanup_pending: Arc<AtomicBool>,
     // The signal to actually tell all the threads to stop
     pub(crate) state: ThreadStateController,
 
     // If we're at a safe point, then this will include a _live_ pointer
     // to the context. Once we exit the safe point, we're done.
-    pub(crate) ctx: Arc<AtomicCell<Option<*mut SteelThread>>>,
+    pub(crate) ctx: Arc<ThreadContextCell>,
 
     spawned_via_make_thread: bool,
 }
@@ -879,13 +1015,16 @@ unsafe impl Send for Synchronizer {}
 
 impl Synchronizer {
     pub fn new() -> Self {
+        let ctx = Arc::new(ThreadContextCell::default());
         Self {
             threads: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(feature = "sync")]
+            cleanup_pending: ctx.cleanup_pending.clone(),
             state: ThreadStateController {
                 paused: Arc::new(AtomicBool::new(false)),
                 state: Arc::new(AtomicCell::new(ThreadState::Running)),
             },
-            ctx: Arc::new(AtomicCell::new(None)),
+            ctx,
             spawned_via_make_thread: false,
         }
     }
@@ -906,11 +1045,22 @@ impl Synchronizer {
 
         // TODO: Entering safepoint should happen often
         // for the main thread?
-        synchronizer.threads.lock().unwrap().push(ThreadContext {
+        synchronizer.register_thread(ThreadContext {
             ctx: weak_ctx,
             handle,
         });
         synchronizer
+    }
+
+    fn register_thread(&self, thread: ThreadContext) {
+        let mut threads = self.threads.lock().unwrap();
+        #[cfg(feature = "sync")]
+        if thread.ctx.strong_count() == 0 {
+            // Cleanup may have consumed the completion before this entry was registered.
+            self.cleanup_pending
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        threads.push(thread);
     }
 
     pub(crate) unsafe fn maybe_call_per_ctx(
@@ -1265,21 +1415,30 @@ impl SteelThread {
         let heap = self.heap.clone_for_storage();
         let mut guard = self.enter_safepoint(|_| heap.lock());
         let result = thunk(self, &mut guard);
-        // Completed results can run destructors that reenter this heap or synchronizer.
-        self.synchronizer
-            .threads
-            .lock()
-            .unwrap()
-            .retain_mut(|thread| {
-                if thread.ctx.strong_count() > 0 {
-                    true
-                } else {
-                    guard
-                        .released
-                        .push(core::mem::replace(&mut thread.handle, SteelVal::Void));
-                    false
-                }
-            });
+        #[cfg(feature = "sync")]
+        {
+            use std::sync::atomic::Ordering::{AcqRel, Acquire};
+
+            let pending = &self.synchronizer.cleanup_pending;
+            // Consume before scanning so concurrent completions leave another notification.
+            if pending.load(Acquire) && pending.swap(false, AcqRel) {
+                // Completed results can run destructors that reenter this heap or synchronizer.
+                self.synchronizer
+                    .threads
+                    .lock()
+                    .unwrap()
+                    .retain_mut(|thread| {
+                        if thread.ctx.strong_count() > 0 {
+                            true
+                        } else {
+                            guard
+                                .released
+                                .push(core::mem::replace(&mut thread.handle, SteelVal::Void));
+                            false
+                        }
+                    });
+            }
+        }
         let released = core::mem::take(&mut guard.released);
         let retained = core::mem::take(&mut guard.released_retained);
         #[cfg(feature = "biased")]
@@ -2213,7 +2372,10 @@ impl<'a> VmCore<'a> {
         let controller = ThreadStateController::default();
         thread.synchronizer.state = controller.clone();
         // This thread needs its own context
-        thread.synchronizer.ctx = Arc::new(AtomicCell::new(None));
+        thread.synchronizer.ctx = Arc::new(ThreadContextCell {
+            context: AtomicCell::new(None),
+            cleanup_pending: thread.synchronizer.cleanup_pending.clone(),
+        });
 
         thread.synchronizer.spawned_via_make_thread = true;
 
@@ -2232,15 +2394,10 @@ impl<'a> VmCore<'a> {
         .into_steelval()
         .unwrap();
 
-        self.thread
-            .synchronizer
-            .threads
-            .lock()
-            .unwrap()
-            .push(ThreadContext {
-                ctx: weak_ctx,
-                handle: value.clone(),
-            });
+        self.thread.synchronizer.register_thread(ThreadContext {
+            ctx: weak_ctx,
+            handle: value,
+        });
 
         for frame in &self.thread.stack_frames {
             self.close_continuation_marks(frame);

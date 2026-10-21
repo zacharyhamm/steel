@@ -3678,6 +3678,41 @@ mod embedding_regressions {
         }
     }
 
+    #[test]
+    fn idle_heap_operations_do_not_lock_thread_registry() {
+        use crate::SteelVal;
+
+        if !in_teardown_child("idle_heap_operations_do_not_lock_thread_registry") {
+            return;
+        }
+
+        let mut engine = Engine::new();
+        #[cfg(feature = "sync")]
+        let callback = engine
+            .run("(#%closure->boxed-function (lambda () 1))")
+            .unwrap();
+        #[cfg(feature = "sync")]
+        let mut surviving_callback = callback.clone();
+        #[cfg(feature = "sync")]
+        drop(callback);
+        let registry = engine.virtual_machine.synchronizer.threads.clone();
+
+        for _ in 0..2 {
+            {
+                let _guard = registry.lock().unwrap();
+                let cell = engine.virtual_machine.with_heap(None, |_, heap| {
+                    SteelVal::HeapAllocated(heap.allocate_without_collection(SteelVal::IntV(42)))
+                });
+                assert_eq!(cell.as_box_to_inner(), Some(SteelVal::IntV(42)));
+            }
+
+            #[cfg(feature = "sync")]
+            surviving_callback.clear();
+            engine.virtual_machine.with_heap(None, |_, _| {});
+            assert_eq!(registry.lock().unwrap().len(), 1);
+        }
+    }
+
     #[cfg(feature = "sync")]
     #[test]
     fn completed_thread_cleanup_allows_reentrant_collection() {
