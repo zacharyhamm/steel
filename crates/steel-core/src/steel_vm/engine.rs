@@ -2123,7 +2123,12 @@ impl Engine {
     pub fn update_value(&mut self, name: &str, value: SteelVal) -> Option<&mut Self> {
         let idx = self.virtual_machine.compiler.read().get_idx(name)?;
 
-        let value = self.virtual_machine.with_heap(None, |_, _| value);
+        let value = self.virtual_machine.with_heap_input(
+            None,
+            value,
+            crate::values::closed::HeapResult::root_result,
+            |_, _, value| value,
+        );
 
         #[cfg(feature = "sync")]
         {
@@ -3077,6 +3082,312 @@ fn raw_engine_native_forms_respect_global_shadowing() {
                     Some(&SteelVal::IntV(42))
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_native_definitions_support_forward_references() {
+    for name in ["struct", "define-values"] {
+        for caller in [
+            format!("(define (call) ({name} 42))"),
+            format!("(define-values (call) (lambda () ({name} 42)))"),
+            format!("(begin (begin (struct before (x)))) (define (call) ({name} 42))"),
+        ] {
+            let body = format!(
+                "{caller}
+             (begin (begin (define-values ({name}) (lambda (x) x))))
+             (call)"
+            );
+            for source in [
+                body.clone(),
+                format!("(begin {body})"),
+                format!("((lambda () {body}))"),
+                format!("(let () {body})"),
+                format!("(let loop () {body})"),
+            ] {
+                let mut engine = Engine::new_raw_no_kernel();
+                engine
+                    .emit_expanded_ast_without_optimizations(&source, None)
+                    .unwrap_or_else(|error| panic!("{source}: {error}"));
+                assert_eq!(
+                    engine
+                        .run(source.clone())
+                        .unwrap_or_else(|error| panic!("{source}: {error}"))
+                        .last(),
+                    Some(&SteelVal::IntV(42)),
+                    "{source}"
+                );
+            }
+            for require in ["", "(require \"unused-module\")"] {
+                let mut engine = Engine::new_raw_no_kernel();
+                engine.register_steel_module(
+                    "unused-module".into(),
+                    "(provide unused) (define unused 1)".into(),
+                );
+                engine.register_steel_module(
+                    "native-forward-reference".into(),
+                    format!("{require} (provide call) {body}"),
+                );
+                assert_eq!(
+                    engine
+                        .run("(require \"native-forward-reference\") (call)")
+                        .unwrap()
+                        .last(),
+                    Some(&SteelVal::IntV(42))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_native_definitions_support_forward_references_across_expressions() {
+    let declaration = "(define-syntax ignore (syntax-rules () [(ignore) 0]))";
+    for name in ["struct", "define-values"] {
+        for definition in [
+            format!("(define-values ({name}) (lambda (x) x))"),
+            format!("(define ({name} x) x)"),
+        ] {
+            for separator in ["((lambda () 0))", "(ignore)"] {
+                // Heads expand in order, so `before` is a native struct, but bodies see every
+                // definition, so `call` sees the later binding of `name`.
+                let body = format!(
+                    "(begin (struct before (x)))
+                     (define (call) ({name} (before-x (before 42))))
+                     {separator}
+                     {definition}
+                     (call)"
+                );
+                for source in [
+                    body.clone(),
+                    format!("(begin {body})"),
+                    format!("((lambda () {body}))"),
+                    format!("(let () {body})"),
+                ] {
+                    let mut engine = Engine::new_raw_no_kernel();
+                    let source = format!("{declaration} {source}");
+                    assert_eq!(
+                        engine
+                            .run(source.clone())
+                            .unwrap_or_else(|error| panic!("{source}: {error}"))
+                            .last(),
+                        Some(&SteelVal::IntV(42)),
+                        "{source}"
+                    );
+                }
+                let mut engine = Engine::new_raw_no_kernel();
+                let source = format!("{declaration} (provide call) {body}");
+                engine.register_steel_module("native-forward-reference".into(), source.clone());
+                assert_eq!(
+                    engine
+                        .run("(require \"native-forward-reference\") (call)")
+                        .unwrap_or_else(|error| panic!("{source}: {error}"))
+                        .last(),
+                    Some(&SteelVal::IntV(42)),
+                    "{source}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_native_definitions_predeclare_across_macro_calls() {
+    let declaration = "(define-syntax ignore (syntax-rules () [(ignore) 0]))";
+    for (definitions, call) in [
+        ("(struct struct (x))", "(struct-x (struct 42))"),
+        (
+            "(struct define-values (x))",
+            "(define-values-x (define-values 42))",
+        ),
+        // A later binding of `define-values` leaves the native form before it in place.
+        (
+            "(define-values (struct) (lambda (x) x)) (define (define-values . args) args)",
+            "(struct 42)",
+        ),
+    ] {
+        for require in ["", "(require \"unused-module\")"] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine.register_steel_module(
+                "unused-module".into(),
+                "(provide unused) (define unused 1)".into(),
+            );
+            let source = format!(
+                "{require} {declaration} (provide answer)
+                 (define (call) {call})
+                 (ignore)
+                 {definitions}
+                 (define answer (call))"
+            );
+            engine.register_steel_module("native-predeclare".into(), source.clone());
+            assert_eq!(
+                engine
+                    .run("(require \"native-predeclare\") answer")
+                    .unwrap_or_else(|error| panic!("{source}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_native_definitions_follow_expansion_order() {
+    for declaration in [
+        "(struct define-values (x))",
+        "(begin (begin (struct define-values (x))))",
+    ] {
+        let body = format!("{declaration} (define-values 42) (define-values-x (define-values 42))");
+        for source in [
+            body.clone(),
+            format!("(begin {body})"),
+            format!("((lambda () {body}))"),
+            format!("(let () {body})"),
+            format!("(let loop () {body})"),
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine
+                .emit_expanded_ast_without_optimizations(&source, None)
+                .unwrap_or_else(|error| panic!("{source}: {error}"));
+            assert_eq!(
+                engine
+                    .run(source.clone())
+                    .unwrap_or_else(|error| panic!("{source}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_native_definitions_follow_macro_expansion() {
+    let declaration = "(define-syntax bind-name
+                         (syntax-rules ()
+                           [(bind-name name) (define (name x) x)]))";
+    for origin in ["local", "local-with-import", "imported"] {
+        for binding in [
+            "(bind-name define-values)",
+            "(begin (begin (bind-name define-values)))",
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine.register_steel_module(
+                "binding-macro".into(),
+                format!("(provide bind-name) {declaration}"),
+            );
+            engine.register_steel_module(
+                "unused-module".into(),
+                "(provide unused) (define unused 1)".into(),
+            );
+            let prefix = match origin {
+                "local" => declaration.to_owned(),
+                "local-with-import" => format!("(require \"unused-module\") {declaration}"),
+                "imported" => "(require \"binding-macro\")".to_owned(),
+                _ => unreachable!(),
+            };
+            engine.register_steel_module(
+                "macro-binding".into(),
+                format!("{prefix} (provide answer) {binding} (define-values 42) (define answer (define-values 42))"),
+            );
+            assert_eq!(
+                engine
+                    .run("(require \"macro-binding\") answer")
+                    .unwrap_or_else(|error| panic!("{origin}, {binding}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{origin}, {binding}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_native_definitions_preserve_macro_precedence() {
+    let declaration = "(define-syntax define-values
+                         (syntax-rules ()
+                           [(define-values (name) value) (define name 42)]))";
+    let body = "(define-values (answer) 1) answer";
+    for source in [
+        body.to_owned(),
+        format!("((lambda () {body}))"),
+        format!("(let () {body})"),
+    ] {
+        let mut engine = Engine::new_raw_no_kernel();
+        let source = format!("{declaration} {source}");
+        engine
+            .emit_expanded_ast_without_optimizations(&source, None)
+            .unwrap();
+        assert_eq!(
+            engine.run(source).unwrap().last(),
+            Some(&SteelVal::IntV(42))
+        );
+    }
+    for origin in ["global", "local", "imported"] {
+        let mut engine = Engine::new_raw_no_kernel();
+        let prefix = match origin {
+            "global" => {
+                engine.run(declaration).unwrap();
+                String::new()
+            }
+            "local" => declaration.to_owned(),
+            "imported" => {
+                engine.register_steel_module(
+                    "values-macro".into(),
+                    format!("(provide define-values) {declaration}"),
+                );
+                "(require \"values-macro\")".to_owned()
+            }
+            _ => unreachable!(),
+        };
+        engine.register_steel_module(
+            "macro-precedence".into(),
+            format!("{prefix} (provide answer) {body}"),
+        );
+        assert_eq!(
+            engine
+                .run("(require \"macro-precedence\") answer")
+                .unwrap()
+                .last(),
+            Some(&SteelVal::IntV(42)),
+            "{origin}"
+        );
+    }
+}
+
+#[test]
+fn raw_engine_module_native_heads_preserve_struct_macro_precedence() {
+    let declaration = "(define-syntax struct
+                         (syntax-rules ()
+                           [(struct name) (define name 42)]))";
+    for origin in ["local", "imported"] {
+        for binding in ["(struct answer)", "(begin (struct answer))"] {
+            let mut engine = Engine::new_raw_no_kernel();
+            let prefix = match origin {
+                "local" => declaration.to_owned(),
+                "imported" => {
+                    engine.register_steel_module(
+                        "struct-macro".into(),
+                        format!("(provide struct) {declaration}"),
+                    );
+                    "(require \"struct-macro\")".to_owned()
+                }
+                _ => unreachable!(),
+            };
+            engine.register_steel_module(
+                "struct-precedence".into(),
+                format!("{prefix} (provide answer) {binding}"),
+            );
+            assert_eq!(
+                engine
+                    .run("(require \"struct-precedence\") answer")
+                    .unwrap_or_else(|error| panic!("{origin}, {binding}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{origin}, {binding}"
+            );
         }
     }
 }

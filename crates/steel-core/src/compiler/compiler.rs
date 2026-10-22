@@ -12,7 +12,10 @@ use crate::{
     core::{instructions::u24, labels::Expr},
     gc::Shared,
     parser::{
-        expand_visitor::{expand_kernel_in_env, expand_kernel_in_env_with_change, GlobalMap},
+        expand_visitor::{
+            expand_kernel_in_env, expand_kernel_in_env_with_change, prepare_native_globals,
+            GlobalMap,
+        },
         interner::InternedString,
         kernel::Kernel,
         parser::{lower_entire_ast, lower_macro_and_require_definitions, SourcesCollector},
@@ -947,6 +950,31 @@ impl Compiler {
         Ok(results)
     }
 
+    // Collect the definitions visible to native forms, lowering native heads without a kernel.
+    fn native_globals(
+        &self,
+        expanded_statements: &mut [ExprKind],
+    ) -> Result<FxHashSet<InternedString>> {
+        let mut native_globals = FxHashSet::default();
+        if self.kernel.is_some() {
+            collect_defines(expanded_statements, &mut |name| {
+                native_globals.insert(name);
+            });
+            return Ok(native_globals);
+        }
+        if self.macro_env.contains_key(&"define-values".into()) {
+            native_globals.insert("define-values".into());
+        }
+        // Macros are already expanded, so this lowers every native head before any body.
+        prepare_native_globals(
+            expanded_statements,
+            Some(self.symbol_map.map()),
+            &mut native_globals,
+            &|_| false,
+        )?;
+        Ok(native_globals)
+    }
+
     // TODO: Compare this to the lower_expressions_impl and merge the behavior
     fn expand_ast(&mut self, exprs: Vec<ExprKind>, path: Option<PathBuf>) -> Result<Vec<ExprKind>> {
         let mut expanded_statements = self.expand_expressions(exprs, path)?;
@@ -969,10 +997,7 @@ impl Compiler {
         //     crate::parser::expand_visitor::expand(expr, &self.macro_env)?;
         // }
 
-        let mut native_globals = FxHashSet::default();
-        collect_defines(&expanded_statements, &mut |name| {
-            native_globals.insert(name);
-        });
+        let mut native_globals = self.native_globals(&mut expanded_statements)?;
 
         for expr in expanded_statements.iter_mut() {
             expand_kernel_in_env(
@@ -1170,10 +1195,7 @@ impl Compiler {
             kernel.load_syntax_transformers(&mut expanded_statements, "top-level".to_string())?;
         }
 
-        let mut native_globals = FxHashSet::default();
-        collect_defines(&expanded_statements, &mut |name| {
-            native_globals.insert(name);
-        });
+        let mut native_globals = self.native_globals(&mut expanded_statements)?;
 
         for expr in expanded_statements.iter_mut() {
             expand_kernel_in_env(

@@ -32,7 +32,7 @@ use crate::steel_vm::primitives::steel_set_box_mutable;
 use crate::steel_vm::primitives::steel_unbox_mutable;
 use crate::steel_vm::primitives::{gt_primitive, gte_primitive, lt_primitive, steel_not};
 use crate::values::closed::MarkAndSweepContext;
-use crate::values::closed::{Heap, HeapResult};
+use crate::values::closed::{Heap, HeapResult, RootedSteelVal};
 use crate::values::functions::CaptureVec;
 use crate::values::functions::RootedInstructions;
 use crate::values::functions::SerializedLambda;
@@ -1412,17 +1412,52 @@ impl SteelThread {
         constants: Option<&ConstantMap>,
         thunk: impl FnOnce(&mut Self, &mut Heap) -> T,
     ) -> T {
+        self.with_heap_input(
+            constants,
+            (),
+            |_| None,
+            |thread, heap, ()| thunk(thread, heap),
+        )
+    }
+
+    pub(crate) fn with_heap_input<I, T: HeapResult>(
+        &mut self,
+        constants: Option<&ConstantMap>,
+        input: I,
+        root_input: impl FnOnce(&I) -> Option<RootedSteelVal>,
+        thunk: impl FnOnce(&mut Self, &mut Heap, I) -> T,
+    ) -> T {
         // Before locking, so a collection in `thunk` no longer snapshots their result roots.
         #[cfg(feature = "sync")]
-        self.release_completed_threads(constants);
+        let input_roots = if self
+            .synchronizer
+            .cleanup_pending
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let roots = root_input(&input);
+            // Without released handles nothing can reenter, so `input` alone keeps its values.
+            if self.release_completed_threads(constants) {
+                roots
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        #[cfg(not(feature = "sync"))]
+        let input_roots: Option<RootedSteelVal> = {
+            let _ = root_input;
+            None
+        };
         let heap = self.heap.clone_for_storage();
         let mut guard = self.enter_safepoint(|_| heap.lock());
-        let result = thunk(self, &mut guard);
+        let result = thunk(self, &mut guard, input);
         let released = core::mem::take(&mut guard.released);
         let retained = core::mem::take(&mut guard.released_retained);
         #[cfg(feature = "biased")]
         let pending = steel_rc::QueueHandle::take_pending();
-        let can_reenter = !retained.is_empty()
+        let can_reenter = input_roots.is_some()
+            || !retained.is_empty()
             || released.iter().any(|value| {
                 !matches!(
                     value,
@@ -1452,19 +1487,21 @@ impl SteelThread {
         drop(retained);
         #[cfg(feature = "biased")]
         pending.merge();
+        drop(input_roots);
         drop(active_roots);
         drop(result_roots);
         result
     }
 
+    // Return whether any completed handles were released.
     #[cfg(feature = "sync")]
-    fn release_completed_threads(&mut self, constants: Option<&ConstantMap>) {
+    fn release_completed_threads(&mut self, constants: Option<&ConstantMap>) -> bool {
         use std::sync::atomic::Ordering::{AcqRel, Acquire};
 
         let pending = &self.synchronizer.cleanup_pending;
         // Consume before scanning so concurrent completions leave another notification.
         if !(pending.load(Acquire) && pending.swap(false, AcqRel)) {
-            return;
+            return false;
         }
         let mut released = Vec::new();
         // Waiting on the registry is a safepoint: its holder can be waiting for this thread.
@@ -1484,7 +1521,7 @@ impl SteelThread {
                 });
         });
         if released.is_empty() {
-            return;
+            return false;
         }
         // Completed results can run destructors that reenter this heap or synchronizer, or
         // collect through another engine while this thread is outside a safepoint.
@@ -1494,6 +1531,7 @@ impl SteelThread {
             .as_rooted();
         drop(released);
         drop(active_roots);
+        true
     }
 
     // Allow this thread to be available for garbage collection
@@ -1588,7 +1626,7 @@ impl SteelThread {
     }
 
     pub fn insert_binding(&mut self, idx: usize, value: SteelVal) {
-        let value = self.with_heap(None, |_, _| value);
+        let value = self.with_heap_input(None, value, HeapResult::root_result, |_, _, value| value);
 
         #[cfg(feature = "sync")]
         self.with_locked_env(move |_, env| {
@@ -2473,8 +2511,11 @@ impl<'a> VmCore<'a> {
     }
 
     pub fn make_box(&mut self, value: SteelVal) -> SteelVal {
-        self.thread
-            .with_heap(Some(&self.constants), |thread, heap| {
+        self.thread.with_heap_input(
+            Some(&self.constants),
+            value,
+            HeapResult::root_result,
+            |thread, heap, value| {
                 let allocated_var = heap.allocate(
                     value,
                     &thread.stack,
@@ -2486,14 +2527,18 @@ impl<'a> VmCore<'a> {
                 );
 
                 SteelVal::HeapAllocated(allocated_var)
-            })
+            },
+        )
     }
 
     // TODO: Accept a slice instead, or an iterator with a known size.
     // That way we can take advantage of a pre allocation.
     pub fn make_mutable_vector(&mut self, values: Vec<SteelVal>) -> SteelVal {
-        self.thread
-            .with_heap(Some(&self.constants), |thread, heap| {
+        self.thread.with_heap_input(
+            Some(&self.constants),
+            values,
+            |values| Some(SteelVal::VectorV(values.iter().cloned().collect()).as_rooted()),
+            |thread, heap, values| {
                 let allocated_var = heap.allocate_vector(
                     values,
                     &thread.stack,
@@ -2505,15 +2550,19 @@ impl<'a> VmCore<'a> {
                 );
 
                 SteelVal::MutableVector(allocated_var)
-            })
+            },
+        )
     }
 
     pub fn make_mutable_vector_iter(
         &mut self,
         values: impl Iterator<Item = SteelVal> + Clone,
     ) -> SteelVal {
-        self.thread
-            .with_heap(Some(&self.constants), |thread, heap| {
+        self.thread.with_heap_input(
+            Some(&self.constants),
+            values,
+            |values| Some(SteelVal::VectorV(values.clone().collect()).as_rooted()),
+            |thread, heap, values| {
                 let allocated_var = heap.allocate_vector_iter(
                     values,
                     &thread.stack,
@@ -2525,7 +2574,8 @@ impl<'a> VmCore<'a> {
                 );
 
                 SteelVal::MutableVector(allocated_var)
-            })
+            },
+        )
     }
 
     pub(crate) fn gc_collect(&mut self) {
@@ -8059,9 +8109,8 @@ fn cons_handler(ctx: &mut VmCore<'_>) -> Result<()> {
 }
 
 fn new_box_handler(ctx: &mut VmCore<'_>) -> Result<()> {
-    let last = ctx.thread.stack.pop().unwrap();
-
     ctx.thread.with_heap(Some(&ctx.constants), |thread, heap| {
+        let last = thread.stack.pop().unwrap();
         let allocated_var = heap.allocate(
             last,
             &thread.stack,

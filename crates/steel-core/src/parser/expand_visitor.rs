@@ -168,11 +168,18 @@ fn is_let_head(head: &ExprKind) -> bool {
     }
 }
 
+fn is_begin_head(head: &ExprKind) -> bool {
+    head.atom_identifier() == Some(&*BEGIN)
+        || head
+            .atom_syntax_object()
+            .is_some_and(|syntax| syntax.ty == TokenType::Begin)
+}
+
 fn visit_let_form<V: VisitorMutRef<Output = Result<()>>>(
     visitor: &mut V,
     scope: fn(&mut V) -> &mut ScopeSet<InternedString, FxBuildHasher>,
     l: &mut List,
-    predeclare_defines: bool,
+    visit_body: impl FnOnce(&mut V, &mut [ExprKind]) -> Result<()>,
 ) -> Result<()> {
     let name = l.args.get(1).and_then(|x| x.atom_identifier()).copied();
     let bindings_index = if name.is_some() { 2 } else { 1 };
@@ -202,14 +209,7 @@ fn visit_let_form<V: VisitorMutRef<Output = Result<()>>>(
     }
 
     if let Some(body_args) = l.args.get_mut(bindings_index + 1..) {
-        if predeclare_defines {
-            collect_defines(body_args, &mut |name| {
-                scope(visitor).define(name);
-            });
-        }
-        for body_expr in body_args {
-            visitor.visit(body_expr)?;
-        }
+        visit_body(visitor, body_args)?;
     }
 
     scope(visitor).pop_layer();
@@ -421,7 +421,12 @@ impl<'a> VisitorMutRef for Expander<'a> {
                     }
 
                     Some(head) if is_let_head(head) => {
-                        return visit_let_form(self, |v| &mut v.in_scope_values, l, false);
+                        return visit_let_form(
+                            self,
+                            |v| &mut v.in_scope_values,
+                            l,
+                            |v, body| body.iter_mut().try_for_each(|expr| v.visit(expr)),
+                        );
                     }
 
                     Some(ExprKind::Atom(Atom {
@@ -787,7 +792,12 @@ impl<'a> VisitorMutRef for ExpanderMany<'a> {
                         }
                     }
                     Some(head) if is_let_head(head) => {
-                        return visit_let_form(self, |v| &mut v.in_scope_values, l, false);
+                        return visit_let_form(
+                            self,
+                            |v| &mut v.in_scope_values,
+                            l,
+                            |v, body| body.iter_mut().try_for_each(|expr| v.visit(expr)),
+                        );
                     }
                     Some(ExprKind::Atom(Atom {
                         syn:
@@ -1229,6 +1239,23 @@ pub struct KernelExpander<'a> {
 }
 
 impl<'a> KernelExpander<'a> {
+    fn visit_body(&mut self, exprs: &mut [ExprKind]) -> Result<()> {
+        if self.map.is_none() {
+            // Macros are already expanded, so this lowers every native head before any body and
+            // records every definition.
+            let (changed, _) =
+                lower_native_definitions(exprs, self.globals, &mut self.in_scope_values, &|_| {
+                    false
+                })?;
+            self.changed |= changed;
+        } else {
+            collect_defines(exprs, &mut |name| {
+                self.in_scope_values.define(name);
+            });
+        }
+        exprs.iter_mut().try_for_each(|expr| self.visit(expr))
+    }
+
     pub fn new(
         map: Option<&'a mut Kernel>,
         builtin_modules: ModuleContainer,
@@ -1595,6 +1622,141 @@ fn expand_keyword_and_default_arguments(
     Ok(())
 }
 
+// Lower the native binding forms heading top-level statements, up to the first statement whose
+// head `is_macro`, and record the prepared statements' definitions in `native_globals`.
+// Return how many statements were prepared.
+pub(crate) fn prepare_native_globals(
+    exprs: &mut [ExprKind],
+    existing: Option<&FxHashMap<InternedString, usize>>,
+    native_globals: &mut FxHashSet<InternedString>,
+    is_macro: &dyn Fn(&InternedString) -> bool,
+) -> Result<usize> {
+    let globals = match existing {
+        Some(map) => GlobalMap::Layered(map, native_globals),
+        None => GlobalMap::Set(native_globals),
+    };
+    let (_, count) = lower_native_definitions(exprs, globals, &mut ScopeSet::default(), is_macro)?;
+    collect_defines(&exprs[..count], &mut |name| {
+        native_globals.insert(name);
+    });
+    Ok(count)
+}
+
+// Lower each statement headed by a native `define-values` or `struct` in order, recording every
+// statement's definitions in `scope` as it goes, so a head sees only the bindings before it.
+// Bodies are expanded afterwards, once every definition is known. Stop at a statement whose head
+// `is_macro`, since its expansion can bind names that change later heads.
+// Return the changed flag and the number of statements prepared.
+fn lower_native_definitions(
+    exprs: &mut [ExprKind],
+    globals: GlobalMap,
+    scope: &mut ScopeSet<InternedString, FxBuildHasher>,
+    is_macro: &dyn Fn(&InternedString) -> bool,
+) -> Result<(bool, usize)> {
+    let mut changed = false;
+    for (index, expr) in exprs.iter_mut().enumerate() {
+        match expr {
+            ExprKind::Begin(begin) => {
+                let (nested_changed, prepared) =
+                    lower_native_definitions(&mut begin.exprs, globals, scope, is_macro)?;
+                changed |= nested_changed;
+                if prepared < begin.exprs.len() {
+                    return Ok((changed, index));
+                }
+                continue;
+            }
+            ExprKind::List(list) if list.first().is_some_and(is_begin_head) => {
+                let (nested_changed, prepared) =
+                    lower_native_definitions(&mut list.args[1..], globals, scope, is_macro)?;
+                changed |= nested_changed;
+                if prepared < list.args.len() - 1 {
+                    return Ok((changed, index));
+                }
+                continue;
+            }
+            ExprKind::List(list) => {
+                // Macros take precedence over native forms of the same name.
+                if list.first_ident().is_some_and(is_macro) {
+                    return Ok((changed, index));
+                }
+                // Leave the producer and field accessors for normal expansion.
+                if let Some(lowered) = lower_native_form(list, |name| {
+                    scope.contains(name) || globals.actually_contains(name)
+                })? {
+                    *expr = lowered;
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+        collect_defines(std::slice::from_ref(expr), &mut |name| {
+            scope.define(name);
+        });
+    }
+    Ok((changed, exprs.len()))
+}
+
+// Lower `list` when it is headed by a native `define-values` or `struct` that `is_bound` does not
+// shadow.
+fn lower_native_form(
+    list: &List,
+    is_bound: impl Fn(&InternedString) -> bool,
+) -> Result<Option<ExprKind>> {
+    match list.first_ident() {
+        Some(name) if is_bound(name) => Ok(None),
+        Some(name) if name.resolve() == "define-values" => expand_define_values(list).map(Some),
+        Some(name) if name.resolve() == "struct" => expand_immutable_struct(list).map(Some),
+        _ => Ok(None),
+    }
+}
+
+// Record the bindings of the native definitions heading top-level statements as if each were
+// lowered in order, so a body can see a native definition that a later macro call keeps from
+// being prepared yet. Heads see `heads` and the statements before them. Macro calls are skipped,
+// and malformed forms are left to report their errors when they are prepared.
+pub(crate) fn predeclare_native_definitions(
+    exprs: &[ExprKind],
+    heads: &FxHashSet<InternedString>,
+    is_macro: &dyn Fn(&InternedString) -> bool,
+    define: &mut impl FnMut(InternedString),
+) {
+    fn walk(
+        exprs: &[ExprKind],
+        heads: &FxHashSet<InternedString>,
+        scope: &mut ScopeSet<InternedString, FxBuildHasher>,
+        is_macro: &dyn Fn(&InternedString) -> bool,
+        define: &mut impl FnMut(InternedString),
+    ) {
+        for expr in exprs {
+            let lowered = match expr {
+                ExprKind::Begin(begin) => {
+                    walk(&begin.exprs, heads, scope, is_macro, define);
+                    continue;
+                }
+                ExprKind::List(list) if list.first().is_some_and(is_begin_head) => {
+                    walk(&list.args[1..], heads, scope, is_macro, define);
+                    continue;
+                }
+                ExprKind::List(list) if list.first_ident().is_some_and(is_macro) => continue,
+                ExprKind::List(list) => {
+                    lower_native_form(list, |name| scope.contains(name) || heads.contains(name))
+                        .ok()
+                        .flatten()
+                }
+                _ => None,
+            };
+            collect_defines(
+                std::slice::from_ref(lowered.as_ref().unwrap_or(expr)),
+                &mut |name| {
+                    scope.define(name);
+                    define(name);
+                },
+            );
+        }
+    }
+    walk(exprs, heads, &mut ScopeSet::default(), is_macro, define);
+}
+
 fn expand_define_values(list: &List) -> Result<ExprKind> {
     let span = get_span(&ExprKind::List(list.clone()));
     if list.improper || list.len() != 3 {
@@ -1788,9 +1950,12 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
                 self.visit(value)?;
             }
 
-            collect_defines(std::slice::from_ref(&lambda_function.body), &mut |name| {
-                self.in_scope_values.define(name);
-            });
+            // Without a kernel, `visit_body` records the body's definitions in order.
+            if self.map.is_some() {
+                collect_defines(std::slice::from_ref(&lambda_function.body), &mut |name| {
+                    self.in_scope_values.define(name);
+                });
+            }
             self.visit(&mut lambda_function.body)?;
 
             self.in_scope_values.pop_layer();
@@ -1813,14 +1978,7 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
     }
 
     fn visit_begin(&mut self, begin: &mut super::ast::Begin) -> Self::Output {
-        collect_defines(&begin.exprs, &mut |name| {
-            self.in_scope_values.define(name);
-        });
-        for expr in begin.exprs.iter_mut() {
-            self.visit(expr)?;
-        }
-
-        Ok(())
+        self.visit_body(&mut begin.exprs)
     }
 
     fn visit_return(&mut self, r: &mut super::ast::Return) -> Self::Output {
@@ -1874,9 +2032,12 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
             self.visit(expr)?;
         }
 
-        collect_defines(std::slice::from_ref(&l.body_expr), &mut |name| {
-            self.in_scope_values.define(name);
-        });
+        // Without a kernel, `visit_body` records the body's definitions in order.
+        if self.map.is_some() {
+            collect_defines(std::slice::from_ref(&l.body_expr), &mut |name| {
+                self.in_scope_values.define(name);
+            });
+        }
         self.visit(&mut l.body_expr)?;
 
         self.in_scope_values.pop_layer();
@@ -1911,14 +2072,8 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
                 }) {
                     return Ok(());
                 }
-                if l.first().is_some_and(|head| {
-                    head.atom_syntax_object().is_some_and(|syntax| {
-                        syntax.ty == TokenType::Begin || head.atom_identifier() == Some(&*BEGIN)
-                    })
-                }) {
-                    collect_defines(&l.args[1..], &mut |name| {
-                        self.in_scope_values.define(name);
-                    });
+                if l.first().is_some_and(is_begin_head) {
+                    return self.visit_body(&mut l.args[1..]);
                 }
                 if l.first().is_some_and(|head| {
                     head.atom_syntax_object()
@@ -1937,34 +2092,25 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
                     }
                     return Ok(());
                 }
-                if self.map.is_none()
-                    && l.first_ident().is_some_and(|name| {
-                        name.resolve() == "define-values"
-                            && !self.in_scope_values.contains(name)
-                            && !self.globals.actually_contains(name)
-                    })
-                {
-                    *expr = expand_define_values(l)?;
-                    self.changed = true;
-                    return self.visit(expr);
-                }
-
-                if self.map.is_none()
-                    && l.first_ident().is_some_and(|name| {
-                        name.resolve() == "struct"
-                            && !self.in_scope_values.contains(name)
-                            && !self.globals.actually_contains(name)
-                    })
-                {
-                    *expr = expand_immutable_struct(l)?;
-                    self.changed = true;
-                    return self.visit(expr);
+                if self.map.is_none() {
+                    if let Some(lowered) = lower_native_form(l, |name| {
+                        self.in_scope_values.contains(name) || self.globals.actually_contains(name)
+                    })? {
+                        *expr = lowered;
+                        self.changed = true;
+                        return self.visit(expr);
+                    }
                 }
 
                 {
                     match l.first() {
                         Some(head) if is_let_head(head) => {
-                            return visit_let_form(self, |v| &mut v.in_scope_values, l, true);
+                            return visit_let_form(
+                                self,
+                                |v| &mut v.in_scope_values,
+                                l,
+                                Self::visit_body,
+                            );
                         }
                         Some(ExprKind::Atom(ident))
                             if ident.syn.ty == TokenType::Lambda
@@ -2304,6 +2450,84 @@ mod expansion_tests {
                 GlobalMap::Map(&[(name.into(), 0)].into_iter().collect()),
             )
             .unwrap());
+        }
+    }
+
+    #[test]
+    fn native_definitions_prepare_lowered_and_unlowered_scopes() {
+        for name in ["struct", "define-values"] {
+            let body = format!(
+                "(define (call) ({name} 42))
+                 (begin (begin (define-values ({name}) (lambda (x) x)))) (call)"
+            );
+            for source in [
+                format!("(begin {body})"),
+                format!("(lambda () {body})"),
+                format!("(let () {body})"),
+                format!("(let loop () {body})"),
+                format!("(begin (begin (struct before (x))) {body})"),
+                format!("(lambda () (begin (struct before (x))) {body})"),
+                format!("(let () (begin (struct before (x))) {body})"),
+                format!("(let loop () (begin (struct before (x))) {body})"),
+            ] {
+                for mut ast in [
+                    steel_parser::parser::Parser::parse(&source).unwrap(),
+                    steel_parser::parser::Parser::parse_without_lowering(&source).unwrap(),
+                ] {
+                    assert!(
+                        expand_kernel_in_env_with_change(
+                            &mut ast[0],
+                            None,
+                            ModuleContainer::default(),
+                            "top-level",
+                            GlobalMap::Map(&FxHashMap::default()),
+                        )
+                        .unwrap(),
+                        "{source}"
+                    );
+                    assert!(
+                        ast[0].to_string().contains(&format!("({name} 42)")),
+                        "{source}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_definitions_follow_expansion_in_lowered_and_unlowered_scopes() {
+        for declaration in [
+            "(struct define-values (x))",
+            "(begin (begin (struct define-values (x))))",
+        ] {
+            let body = format!("{declaration} (define-values 42)");
+            for source in [
+                format!("(begin {body})"),
+                format!("(lambda () {body})"),
+                format!("(let () {body})"),
+                format!("(let loop () {body})"),
+            ] {
+                for mut ast in [
+                    steel_parser::parser::Parser::parse(&source).unwrap(),
+                    steel_parser::parser::Parser::parse_without_lowering(&source).unwrap(),
+                ] {
+                    assert!(
+                        expand_kernel_in_env_with_change(
+                            &mut ast[0],
+                            None,
+                            ModuleContainer::default(),
+                            "top-level",
+                            GlobalMap::Map(&FxHashMap::default()),
+                        )
+                        .unwrap_or_else(|error| panic!("{source}: {error}")),
+                        "{source}"
+                    );
+                    assert!(
+                        ast[0].to_string().contains("(define-values 42)"),
+                        "{source}"
+                    );
+                }
+            }
         }
     }
 

@@ -3717,8 +3717,10 @@ mod embedding_regressions {
     #[test]
     fn completed_thread_cleanup_allows_reentrant_collection() {
         use crate::{
+            compiler::constants::ConstantMap,
             rvals::IntoSteelVal,
-            steel_vm::vm::{threads::thread_finished, Synchronizer},
+            steel_vm::vm::{threads::thread_finished, Synchronizer, VmCore},
+            values::functions::RootedInstructions,
             SteelVal,
         };
         use std::{
@@ -3748,7 +3750,15 @@ mod embedding_regressions {
             }
         }
 
-        for update in [false, true] {
+        for operation in [
+            "call",
+            "register",
+            "update",
+            "box",
+            "vector",
+            "vector-iter",
+            "input-drop",
+        ] {
             let mut engine = Engine::new();
             register_gc(&mut engine);
             engine
@@ -3790,24 +3800,86 @@ mod embedding_regressions {
                     .lock()
                     .allocate_without_collection(SteelVal::IntV(42)),
             );
-            if update {
-                assert!(engine.update_value("incoming", live).is_some());
+            if matches!(operation, "register" | "update") {
+                if operation == "update" {
+                    assert!(engine.update_value("incoming", live).is_some());
+                } else {
+                    engine.register_value("incoming", live);
+                }
                 assert_eq!(
                     engine.extract_value("incoming").unwrap().as_box_to_inner(),
                     Some(SteelVal::IntV(42))
                 );
-            } else {
+            } else if operation == "call" {
                 assert_eq!(
                     engine
                         .call_function_by_name_with_args("collect-with-live", vec![live])
                         .unwrap(),
                     SteelVal::IntV(42)
                 );
+            } else if operation == "input-drop" {
+                let probe = Probe {
+                    engine: engine.clone(),
+                    synchronizer: engine.virtual_machine.synchronizer.clone(),
+                    calls: calls.clone(),
+                }
+                .into_steelval()
+                .unwrap();
+                let result = engine.virtual_machine.with_heap_input(
+                    None,
+                    (probe, live),
+                    |(probe, live)| {
+                        Some(
+                            SteelVal::VectorV([probe.clone(), live.clone()].into_iter().collect())
+                                .as_rooted(),
+                        )
+                    },
+                    |_, heap, (probe, live)| {
+                        // The input root owns the last copy until after the heap unlocks.
+                        drop(probe);
+                        SteelVal::HeapAllocated(heap.allocate_without_collection(live))
+                    },
+                );
+                assert_eq!(
+                    result.as_box_to_inner().unwrap().as_box_to_inner(),
+                    Some(SteelVal::IntV(42))
+                );
+            } else {
+                let mut ctx = VmCore {
+                    thread: &mut engine.virtual_machine,
+                    constants: ConstantMap::default(),
+                    instructions: RootedInstructions::new(vec![].into()),
+                    ip: 0,
+                    sp: 0,
+                    pop_count: 1,
+                    depth: 0,
+                    root_spans: &[],
+                    return_value: None,
+                    is_native: false,
+                    result: None,
+                };
+                let result = match operation {
+                    "box" => ctx.make_box(live),
+                    "vector" => ctx.make_mutable_vector(vec![live]),
+                    "vector-iter" => ctx.make_mutable_vector_iter([live].into_iter()),
+                    _ => unreachable!(),
+                };
+                let incoming = match result {
+                    SteelVal::HeapAllocated(cell) => cell.get(),
+                    SteelVal::MutableVector(vector) => vector.get()[0].clone(),
+                    _ => panic!("unexpected allocation result"),
+                };
+                assert_eq!(
+                    incoming.as_box_to_inner(),
+                    Some(SteelVal::IntV(42)),
+                    "{operation}"
+                );
             }
-            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let expected_calls = if operation == "input-drop" { 2 } else { 1 };
+            assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
             engine.run("(probe-gc)").unwrap();
             drop(engine);
-            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
         }
     }
 

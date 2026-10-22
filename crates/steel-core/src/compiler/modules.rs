@@ -6,8 +6,8 @@ use crate::{
     parser::{
         ast::{Atom, Begin, Define, ExprKind, List, Quote},
         expand_visitor::{
-            expand_kernel_in_env, expand_kernel_in_env_with_change, ExpanderMany, GlobalMap,
-            RequiredMacroMap,
+            expand_kernel_in_env, expand_kernel_in_env_with_change, predeclare_native_definitions,
+            prepare_native_globals, ExpanderMany, GlobalMap, RequiredMacroMap,
         },
         interner::InternedString,
         kernel::Kernel,
@@ -1999,6 +1999,36 @@ pub struct RequiredModuleMacros {
     pub name_mangler: NameMangler,
 }
 
+// Bodies can expand before a native definition after a macro call is prepared, so predeclare the
+// bindings of every native definition for bodies. Heads check `native_heads` instead, so a form
+// binding a native form's name itself still lowers natively.
+fn predeclare_native_bindings(
+    ast: &[ExprKind],
+    native_heads: &FxHashSet<InternedString>,
+    native_globals: &mut FxHashSet<InternedString>,
+    is_macro: &dyn Fn(&InternedString) -> bool,
+) {
+    predeclare_native_definitions(ast, native_heads, is_macro, &mut |name| {
+        native_globals.insert(name);
+    });
+}
+
+// Prepare native heads from `ast[index]` up to the next macro call, recording their definitions
+// for both heads and bodies. Return the index to prepare from next.
+fn prepare_native_heads(
+    ast: &mut [ExprKind],
+    index: usize,
+    native_heads: &mut FxHashSet<InternedString>,
+    native_globals: &mut FxHashSet<InternedString>,
+    is_macro: &dyn Fn(&InternedString) -> bool,
+) -> Result<usize> {
+    let count = prepare_native_globals(&mut ast[index..], None, native_heads, is_macro)?;
+    collect_defines(&ast[index..index + count], &mut |name| {
+        native_globals.insert(name);
+    });
+    Ok(index + count)
+}
+
 impl<'a> ModuleBuilder<'a> {
     #[allow(clippy::too_many_arguments)]
     #[allow(unused)]
@@ -2349,12 +2379,21 @@ impl<'a> ModuleBuilder<'a> {
 
         let loaded_syntax_transformers = prev_length != ast.len();
 
+        // Native heads see only the definitions before them, while bodies see every definition.
+        let mut native_heads = FxHashSet::default();
         let mut native_globals = FxHashSet::default();
+        if self.kernel.is_none()
+            && (self.macro_map.contains_key(&"define-values".into())
+                || self.global_macro_map.contains_key(&"define-values".into()))
+        {
+            native_heads.insert("define-values".into());
+            native_globals.insert("define-values".into());
+        }
         collect_defines(&ast, &mut |name| {
             native_globals.insert(name);
         });
-        let globals = collect_globals(&ast);
-        let globals = GlobalMap::Set(&globals);
+        let global_defs = collect_globals(&ast);
+        let globals = GlobalMap::Set(&global_defs);
 
         // TODO: Revisit if caching is something we want here
         // if self.kernel.is_some() && !loaded_syntax_transformers {
@@ -2385,11 +2424,38 @@ impl<'a> ModuleBuilder<'a> {
         // should happen together.
 
         if self.require_objects.is_empty() {
-            for expr in ast.iter_mut() {
+            let is_macro = |name: &InternedString| self.macro_map.contains_key(name);
+            if self.kernel.is_none() {
+                predeclare_native_bindings(&ast, &native_heads, &mut native_globals, &is_macro);
+            }
+            let mut prepared = 0;
+            for index in 0..ast.len() {
+                if self.kernel.is_none() && index >= prepared {
+                    prepared = prepare_native_heads(
+                        &mut ast,
+                        index,
+                        &mut native_heads,
+                        &mut native_globals,
+                        &is_macro,
+                    )?;
+                }
+                let expr = &mut ast[index];
                 // println!("GETTING HERE: {}", expr);
 
                 // Remove from the local macros?
                 expand(expr, &self.macro_map, globals)?;
+
+                // A macro call stopped preparation, so prepare its expansion.
+                if self.kernel.is_none() && index >= prepared {
+                    prepared = prepare_native_heads(
+                        &mut ast,
+                        index,
+                        &mut native_heads,
+                        &mut native_globals,
+                        &is_macro,
+                    )?;
+                }
+                let expr = &mut ast[index];
 
                 // for item in found.iter() {
                 //     // Remove from the list?
@@ -2405,6 +2471,7 @@ impl<'a> ModuleBuilder<'a> {
                     GlobalMap::Set(&native_globals),
                 )?;
                 collect_defines(std::slice::from_ref(expr), &mut |name| {
+                    native_heads.insert(name);
                     native_globals.insert(name);
                 });
 
@@ -2484,6 +2551,17 @@ impl<'a> ModuleBuilder<'a> {
             }
         }
 
+        if self.kernel.is_none()
+            && required_macros.iter().any(|required| {
+                required
+                    .in_scope_macros
+                    .contains_key(&"define-values".into())
+            })
+        {
+            native_heads.insert("define-values".into());
+            native_globals.insert("define-values".into());
+        }
+
         let overlays = required_macros
             .iter_mut()
             .map(|x| RequiredMacroMap {
@@ -2493,9 +2571,45 @@ impl<'a> ModuleBuilder<'a> {
             .collect::<Vec<_>>();
 
         let mut many_expander = ExpanderMany::new(macro_map, overlays, globals);
+        let is_macro = |expander: &ExpanderMany, name: &InternedString| {
+            expander.map.contains_key(name)
+                || expander
+                    .overlays
+                    .iter()
+                    .any(|overlay| overlay.map.in_scope_macros.contains_key(name))
+        };
 
-        for expr in ast.iter_mut() {
-            many_expander.expand(expr)?;
+        // Without requires, the loop above already prepared every native head.
+        let prepare_heads = self.kernel.is_none() && !self.require_objects.is_empty();
+        if prepare_heads {
+            predeclare_native_bindings(&ast, &native_heads, &mut native_globals, &|name| {
+                is_macro(&many_expander, name)
+            });
+        }
+        let mut prepared = 0;
+        for index in 0..ast.len() {
+            if prepare_heads && index >= prepared {
+                prepared = prepare_native_heads(
+                    &mut ast,
+                    index,
+                    &mut native_heads,
+                    &mut native_globals,
+                    &|name| is_macro(&many_expander, name),
+                )?;
+            }
+            many_expander.expand(&mut ast[index])?;
+
+            // A macro call stopped preparation, so prepare its expansion.
+            if prepare_heads && index >= prepared {
+                prepared = prepare_native_heads(
+                    &mut ast,
+                    index,
+                    &mut native_heads,
+                    &mut native_globals,
+                    &|name| is_macro(&many_expander, name),
+                )?;
+            }
+            let expr = &mut ast[index];
 
             expand_kernel_in_env(
                 expr,
@@ -2506,6 +2620,7 @@ impl<'a> ModuleBuilder<'a> {
                 GlobalMap::Set(&native_globals),
             )?;
             collect_defines(std::slice::from_ref(expr), &mut |name| {
+                native_heads.insert(name);
                 native_globals.insert(name);
             });
 
@@ -2529,6 +2644,7 @@ impl<'a> ModuleBuilder<'a> {
                         GlobalMap::Set(&native_globals),
                     )?;
                     collect_defines(std::slice::from_ref(expr), &mut |name| {
+                        native_heads.insert(name);
                         native_globals.insert(name);
                     });
 
