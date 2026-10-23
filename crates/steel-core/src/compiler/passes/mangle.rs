@@ -10,6 +10,7 @@ use crate::{
     parser::{
         ast::{Atom, ExprKind, Quote},
         interner::InternedString,
+        parser::SyntaxObject,
         tokens::TokenType,
     },
 };
@@ -28,20 +29,27 @@ Steps for doing having scoped macros
 
 pub fn collect_globals(exprs: &[ExprKind]) -> FxHashSet<InternedString> {
     let mut global_defs = FxHashSet::default();
-    collect_definitions(exprs, true, &mut |name| {
+    collect_definitions(exprs, true, &mut |name, _| {
         global_defs.insert(name);
     });
     global_defs
 }
 
 pub(crate) fn collect_defines(exprs: &[ExprKind], define: &mut impl FnMut(InternedString)) {
+    collect_define_syntax(exprs, &mut |name, _| define(name));
+}
+
+pub(crate) fn collect_define_syntax(
+    exprs: &[ExprKind],
+    define: &mut impl FnMut(InternedString, &SyntaxObject),
+) {
     collect_definitions(exprs, false, define);
 }
 
 fn collect_definitions(
     exprs: &[ExprKind],
     include_define_values: bool,
-    define: &mut impl FnMut(InternedString),
+    define: &mut impl FnMut(InternedString, &SyntaxObject),
 ) {
     for expr in exprs {
         match expr {
@@ -50,7 +58,7 @@ fn collect_definitions(
                     if name.resolve().starts_with(MANGLER_PREFIX) {
                         continue;
                     }
-                    define(*name);
+                    define(*name, d.name.atom_syntax_object().unwrap());
                 }
             }
             // Global prelude macros expand after modules are named; preserve their exported bindings.
@@ -60,8 +68,10 @@ fn collect_definitions(
                         .is_some_and(|name| name.resolve() == "define-values") =>
             {
                 if let Some(ExprKind::List(bindings)) = l.get(1) {
-                    for name in bindings.args.iter().filter_map(ExprKind::atom_identifier) {
-                        define(*name);
+                    for binding in &bindings.args {
+                        if let Some(name) = binding.atom_identifier() {
+                            define(*name, binding.atom_syntax_object().unwrap());
+                        }
                     }
                 }
             }
@@ -79,7 +89,7 @@ fn collect_definitions(
                                 continue;
                             }
                             // println!("Inserting: {}", name);
-                            define(*name);
+                            define(*name, l.args[1].atom_syntax_object().unwrap());
                         }
                     }
 
@@ -89,7 +99,7 @@ fn collect_definitions(
                                 continue;
                             }
                             // println!("Inserting: {}", name);
-                            define(*name);
+                            define(*name, l.args[0].atom_syntax_object().unwrap());
                         }
                     }
 
@@ -229,7 +239,7 @@ impl VisitorMutRefUnit for NameMangler {
     #[inline]
     fn visit_atom(&mut self, a: &mut Atom) {
         if let TokenType::Identifier(i) = &mut a.syn.ty {
-            if self.globals.contains(i) {
+            if !a.syn.global_reference && self.globals.contains(i) {
                 if let Some(new) = self.mangle_cache.get(i) {
                     *i = *new;
                 } else {

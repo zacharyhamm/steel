@@ -169,6 +169,9 @@ pub struct RawSyntaxObject<T> {
     // Identifiers with the same name from different expansions are different variables.
     #[serde(skip)]
     pub mark: ExpansionMark,
+    // Free reference from a global macro expanded before module names are mangled.
+    #[serde(skip)]
+    pub global_reference: bool,
 }
 
 impl<T: Clone> Clone for RawSyntaxObject<T> {
@@ -180,6 +183,7 @@ impl<T: Clone> Clone for RawSyntaxObject<T> {
             unresolved: self.unresolved,
             introduced_via_macro: self.introduced_via_macro,
             mark: self.mark,
+            global_reference: self.global_reference,
         }
     }
 }
@@ -220,6 +224,7 @@ impl SyntaxObject {
             unresolved: false,
             introduced_via_macro: false,
             mark: ExpansionMark::NONE,
+            global_reference: false,
         }
     }
 
@@ -232,6 +237,7 @@ impl SyntaxObject {
             unresolved: false,
             introduced_via_macro: false,
             mark: ExpansionMark::NONE,
+            global_reference: false,
         }
     }
 
@@ -250,6 +256,7 @@ impl SyntaxObject {
             unresolved: false,
             introduced_via_macro: false,
             mark: ExpansionMark::NONE,
+            global_reference: false,
         }
     }
 }

@@ -14,6 +14,7 @@ use crate::compiler::passes::mangle::collect_defines;
 use crate::compiler::program::{BEGIN, LAMBDA, LAMBDA_SYMBOL, LET};
 use crate::parser::ast::ExprKind;
 use crate::parser::parser::SyntaxObject;
+use crate::parser::rename_idents::{resolve_template_bindings, TemplateBindings};
 use crate::parser::span_visitor::get_span;
 use crate::steel_vm::engine::ModuleContainer;
 use crate::{compiler::program::AS_KEYWORD, parser::tokens::TokenType};
@@ -88,6 +89,9 @@ pub enum GlobalMap<'a> {
         &'a FxHashMap<InternedString, usize>,
         &'a FxHashSet<InternedString>,
     ),
+    // Expansion-site bindings are separate from a global template's definition-site globals.
+    // Lookups see only the expansion-site set; definition-site lookups match on the variant.
+    Scoped(&'a GlobalMap<'a>, &'a FxHashSet<InternedString>),
 }
 
 impl<'a> GlobalMap<'a> {
@@ -97,6 +101,7 @@ impl<'a> GlobalMap<'a> {
             GlobalMap::Map(_) => false,
             GlobalMap::Set(hash_set) => hash_set.contains(i),
             GlobalMap::Layered(map, set) => map.contains_key(i) || set.contains(i),
+            GlobalMap::Scoped(_, set) => set.contains(i),
         }
     }
 
@@ -106,6 +111,7 @@ impl<'a> GlobalMap<'a> {
             GlobalMap::Map(m) => m.contains_key(i),
             GlobalMap::Set(hash_set) => hash_set.contains(i),
             GlobalMap::Layered(map, set) => map.contains_key(i) || set.contains(i),
+            GlobalMap::Scoped(_, set) => set.contains(i),
         }
     }
 }
@@ -124,10 +130,26 @@ pub fn expand(
         source_id: SourceId::none(),
         exclusions: &exclusions,
         globals,
+        module_globals: None,
+        builtin_modules: None,
+        module_scoped: false,
     };
     expander.visit(expr)?;
 
     Ok(expander.in_scope_values)
+}
+
+// Expand a module's own or imported macros. They cannot capture a global template's free
+// references, which the global macro expansion resolves at the template's definition site.
+pub(crate) fn expand_module_scoped(
+    expr: &mut ExprKind,
+    map: &FxHashMap<InternedString, SteelMacro>,
+    globals: GlobalMap,
+) -> Result<()> {
+    let exclusions = HashSet::new();
+    let mut expander = Expander::new(map, &exclusions, globals);
+    expander.module_scoped = true;
+    expander.visit(expr)
 }
 
 pub fn expand_with_source_id(
@@ -145,6 +167,9 @@ pub fn expand_with_source_id(
         source_id,
         exclusions,
         globals,
+        module_globals: None,
+        builtin_modules: None,
+        module_scoped: false,
     };
 
     expander.visit(expr)
@@ -168,11 +193,43 @@ fn is_let_head(head: &ExprKind) -> bool {
     }
 }
 
-fn is_begin_head(head: &ExprKind) -> bool {
+pub(crate) fn is_begin_head(head: &ExprKind) -> bool {
     head.atom_identifier() == Some(&*BEGIN)
         || head
             .atom_syntax_object()
             .is_some_and(|syntax| syntax.ty == TokenType::Begin)
+}
+
+// Bind a parameter list in the current layer. Defaults run before optional and keyword bindings
+// are introduced, so they see only the positional parameters ahead of them.
+fn visit_parameters<V: VisitorMutRef<Output = Result<()>>>(
+    visitor: &mut V,
+    scope: fn(&mut V) -> &mut ScopeSet<InternedString, FxBuildHasher>,
+    args: &mut [ExprKind],
+) -> Result<()> {
+    let positional_count = args
+        .iter()
+        .take_while(|arg| arg.atom_identifier().is_some())
+        .count();
+    for arg in &args[..positional_count] {
+        scope(visitor).define(*arg.atom_identifier().unwrap());
+    }
+    for arg in &mut args[positional_count..] {
+        if let ExprKind::List(binding) = arg {
+            if let Some(default) = binding.args.get_mut(1) {
+                visitor.visit(default)?;
+            }
+        }
+    }
+    for arg in &args[positional_count..] {
+        if let Some(ident) = arg
+            .atom_identifier()
+            .or_else(|| arg.list().and_then(List::first_ident))
+        {
+            scope(visitor).define(*ident);
+        }
+    }
+    Ok(())
 }
 
 fn visit_let_form<V: VisitorMutRef<Output = Result<()>>>(
@@ -252,6 +309,10 @@ pub struct Expander<'a> {
     map: &'a FxHashMap<InternedString, SteelMacro>,
     exclusions: &'a HashSet<InternedString>,
     globals: GlobalMap<'a>,
+    module_globals: Option<&'a FxHashSet<InternedString>>,
+    builtin_modules: Option<&'a ModuleContainer>,
+    // Expands a module's own or imported macros, which never claim global template references.
+    module_scoped: bool,
     pub(crate) changed: bool,
     // We're going to actually check if the macro is in scope
     in_scope_values: ScopeSet<InternedString, FxBuildHasher>,
@@ -304,8 +365,69 @@ impl<'a> ExpanderMany<'a> {
         }
 
         self.in_scope_values.clear_all();
-
         Ok(())
+    }
+
+    // Expand a statement while keeping the bindings of the statements before it in scope. Only
+    // this statement's definitions can newly shadow a macro, so scanning every binding in scope
+    // would make a module's expansion quadratic.
+    pub(crate) fn expand_in_scope(&mut self, expr: &mut ExprKind) -> Result<()> {
+        self.visit(expr)?;
+        collect_defines(std::slice::from_ref(expr), &mut |name| {
+            self.map.remove(&name);
+        });
+        Ok(())
+    }
+
+    // An unresolved global macro can change later native heads, so defer their bodies while
+    // still discovering definitions introduced by module macros. A macro named by one of the
+    // `shadowed` top-level definitions is left for the deferred pass to resolve, and the
+    // definitions found here, including those earlier in the same `begin`, are added to it.
+    pub(crate) fn expand_top_level(
+        &mut self,
+        expr: &mut ExprKind,
+        shadowed: &mut FxHashSet<InternedString>,
+    ) -> Result<()> {
+        match expr {
+            ExprKind::Begin(begin) => begin
+                .exprs
+                .iter_mut()
+                .try_for_each(|expr| self.expand_top_level(expr, shadowed)),
+            ExprKind::List(list) if list.first().is_some_and(is_begin_head) => list.args[1..]
+                .iter_mut()
+                .try_for_each(|expr| self.expand_top_level(expr, shadowed)),
+            ExprKind::List(list)
+                if list.first_ident().is_some_and(|name| {
+                    !shadowed.contains(name)
+                        && (self.map.contains_key(name)
+                            || self
+                                .overlays
+                                .iter()
+                                .any(|overlay| overlay.map.in_scope_macros.contains_key(name)))
+                }) =>
+            {
+                self.expand(expr)?;
+                // Only this expansion may name an imported module's private macros. The rest of
+                // the statement has not seen this module's own macros yet, so it must not be
+                // exposed to them.
+                for overlay in &mut self.overlays {
+                    if overlay.changed {
+                        expand_module_scoped(expr, &overlay.map.module_macros, self.globals)?;
+                        overlay.changed = false;
+                    }
+                }
+                collect_defines(std::slice::from_ref(expr), &mut |name| {
+                    shadowed.insert(name);
+                });
+                Ok(())
+            }
+            _ => {
+                collect_defines(std::slice::from_ref(expr), &mut |name| {
+                    shadowed.insert(name);
+                });
+                Ok(())
+            }
+        }
     }
 }
 
@@ -323,18 +445,108 @@ impl<'a> Expander<'a> {
             depth: 0,
             exclusions,
             globals,
+            module_globals: None,
+            builtin_modules: None,
+            module_scoped: false,
         }
     }
 
     pub fn expand(&mut self, expr: &mut ExprKind) -> Result<()> {
         self.visit(expr)
     }
-}
 
-impl<'a> VisitorMutRef for Expander<'a> {
-    type Output = Result<()>;
+    pub(crate) fn expand_global_macros(
+        expr: &mut ExprKind,
+        map: &'a FxHashMap<InternedString, SteelMacro>,
+        global_bindings: GlobalMap<'a>,
+        module_globals: &'a mut FxHashSet<InternedString>,
+        builtin_modules: &'a ModuleContainer,
+    ) -> Result<()> {
+        if map.is_empty() {
+            return Ok(());
+        }
+        collect_defines(std::slice::from_ref(expr), &mut |name| {
+            module_globals.insert(name);
+        });
+        let exclusions = HashSet::new();
+        let mut expander = Expander::new(
+            map,
+            &exclusions,
+            GlobalMap::Scoped(&global_bindings, module_globals),
+        );
+        expander.module_globals = Some(module_globals);
+        expander.builtin_modules = Some(builtin_modules);
+        expander.expand(expr)
+    }
 
-    fn visit(&mut self, expr: &mut ExprKind) -> Self::Output {
+    fn excluded(&self, name: &InternedString) -> bool {
+        self.exclusions.contains(name)
+            || self
+                .module_globals
+                .is_some_and(|globals| globals.contains(name))
+    }
+
+    // A nested macro can bind a global template's free reference as a parameter, which then names
+    // that parameter within its scope rather than a global binding. Only global macro expansion
+    // classifies free references, so other expansions have nothing to resolve.
+    fn template_parameters<'p>(
+        &self,
+        parameters: impl Iterator<Item = &'p ExprKind>,
+    ) -> Option<TemplateBindings> {
+        self.module_globals?;
+        let mut bindings = TemplateBindings::default();
+        parameters.for_each(|parameter| bindings.bind_parameter(parameter));
+        Some(bindings)
+    }
+
+    fn visit_body(&mut self, exprs: &mut [ExprKind]) -> Result<()> {
+        if self.module_globals.is_none() {
+            return exprs.iter_mut().try_for_each(|expr| self.visit(expr));
+        }
+        // Bodies see later definitions, but statement heads retain their sequential scope.
+        let mut heads = self.in_scope_values.clone();
+        predeclare_native_definitions(
+            exprs,
+            &|name| heads.contains(name),
+            self.globals,
+            &|name| self.map.contains_key(name),
+            self.builtin_modules,
+            &mut |name| self.in_scope_values.define(name),
+        );
+        self.visit_body_with_native_heads(exprs, &mut heads)
+    }
+
+    fn visit_body_with_native_heads(
+        &mut self,
+        exprs: &mut [ExprKind],
+        heads: &mut ScopeSet<InternedString, FxBuildHasher>,
+    ) -> Result<()> {
+        let mut prepared = 0;
+        for index in 0..exprs.len() {
+            if index >= prepared {
+                let (_, count) =
+                    lower_native_definitions(&mut exprs[index..], self.globals, heads, &|name| {
+                        self.map.contains_key(name)
+                    })?;
+                prepared = index + count;
+                collect_defines(&exprs[index..prepared], &mut |name| {
+                    self.in_scope_values.define(name);
+                });
+            }
+            self.visit_with_native_heads(&mut exprs[index], Some(heads))?;
+            resolve_template_bindings(exprs, index);
+            collect_defines(std::slice::from_ref(&exprs[index]), &mut |name| {
+                heads.define(name);
+            });
+        }
+        Ok(())
+    }
+
+    fn visit_with_native_heads(
+        &mut self,
+        expr: &mut ExprKind,
+        native_heads: Option<&mut ScopeSet<InternedString, FxBuildHasher>>,
+    ) -> Result<()> {
         if self.depth > 512 {
             stop!(Generic => "macro expansion depth reached!");
         }
@@ -343,7 +555,10 @@ impl<'a> VisitorMutRef for Expander<'a> {
             ExprKind::If(f) => self.visit_if(f),
             ExprKind::Define(d) => self.visit_define(d),
             ExprKind::LambdaFunction(l) => self.visit_lambda_function(l),
-            ExprKind::Begin(b) => self.visit_begin(b),
+            ExprKind::Begin(b) => match native_heads {
+                Some(heads) => self.visit_body_with_native_heads(&mut b.exprs, heads),
+                None => self.visit_begin(b),
+            },
             ExprKind::Return(r) => self.visit_return(r),
             ExprKind::Let(l) => self.visit_let(l),
             ExprKind::Quote(q) => self.visit_quote(q),
@@ -351,8 +566,33 @@ impl<'a> VisitorMutRef for Expander<'a> {
             ExprKind::Atom(a) => self.visit_atom(a),
             ExprKind::List(l) => {
                 restore_hygienic_macro_head(l, &self.in_scope_values, |name| {
-                    self.map.contains_key(name) && !self.exclusions.contains(name)
+                    self.map.contains_key(name) && !self.excluded(name)
                 });
+
+                if self.module_globals.is_some() {
+                    if !l
+                        .first_ident()
+                        .is_some_and(|name| self.map.contains_key(name))
+                    {
+                        if let Some(lowered) = lower_native_form(l, self.globals, |name| {
+                            native_heads
+                                .as_deref()
+                                .unwrap_or(&self.in_scope_values)
+                                .contains(name)
+                        })? {
+                            *expr = lowered;
+                            return self.visit_with_native_heads(expr, native_heads);
+                        }
+                    }
+                    if l.first().is_some_and(is_begin_head) {
+                        return match native_heads {
+                            Some(heads) => {
+                                self.visit_body_with_native_heads(&mut l.args[1..], heads)
+                            }
+                            None => self.visit_body(&mut l.args[1..]),
+                        };
+                    }
+                }
 
                 match l.first() {
                     // TODO: Come back to this?
@@ -421,11 +661,40 @@ impl<'a> VisitorMutRef for Expander<'a> {
                     }
 
                     Some(head) if is_let_head(head) => {
+                        let named = l.args.get(1).and_then(ExprKind::atom_identifier).is_some();
+                        let bindings_index = if named { 2 } else { 1 };
+                        let bindings = match l.args.get(bindings_index) {
+                            Some(ExprKind::List(bindings)) => bindings.args.as_slice(),
+                            _ => &[],
+                        };
+                        if let Some(mut parameters) = self
+                            .template_parameters(l.args[1..bindings_index].iter().chain(bindings))
+                        {
+                            // Binding values are outside the scope of the names they bind.
+                            if named {
+                                parameters.resolve(&mut l.args[1]);
+                            }
+                            if let Some(ExprKind::List(bindings)) = l.args.get_mut(bindings_index) {
+                                for binding in &mut bindings.args {
+                                    match binding {
+                                        ExprKind::List(binding) => {
+                                            if let Some(name) = binding.args.first_mut() {
+                                                parameters.resolve(name);
+                                            }
+                                        }
+                                        binding => parameters.resolve(binding),
+                                    }
+                                }
+                            }
+                            for expr in l.args.iter_mut().skip(bindings_index + 1) {
+                                parameters.resolve(expr);
+                            }
+                        }
                         return visit_let_form(
                             self,
                             |v| &mut v.in_scope_values,
                             l,
-                            |v, body| body.iter_mut().try_for_each(|expr| v.visit(expr)),
+                            Self::visit_body,
                         );
                     }
 
@@ -527,20 +796,28 @@ impl<'a> VisitorMutRef for Expander<'a> {
                         };
 
                         if is_function {
+                            if let ExprKind::List(signature) = &l.args[1] {
+                                if let Some(mut parameters) =
+                                    self.template_parameters(signature.args[1..].iter())
+                                {
+                                    l.args[1..]
+                                        .iter_mut()
+                                        .for_each(|expr| parameters.resolve(expr));
+                                }
+                            }
+
                             self.in_scope_values.push_layer();
 
-                            if let ExprKind::List(signature) = &l.args[1] {
-                                for arg in signature.args.iter().skip(1) {
-                                    if let Some(ident) = arg.atom_identifier() {
-                                        self.in_scope_values.define(*ident);
-                                    }
-                                }
+                            if let ExprKind::List(signature) = &mut l.args[1] {
+                                visit_parameters(
+                                    self,
+                                    |v| &mut v.in_scope_values,
+                                    &mut signature.args[1..],
+                                )?;
                             }
                         }
 
-                        for expr in l.args[2..].iter_mut() {
-                            self.visit(expr)?;
-                        }
+                        self.visit_body(&mut l.args[2..])?;
 
                         if is_function {
                             self.in_scope_values.pop_layer();
@@ -555,35 +832,59 @@ impl<'a> VisitorMutRef for Expander<'a> {
                                 ty: TokenType::Identifier(s),
                                 span: sp,
                                 unresolved,
+                                global_reference,
                                 ..
                             },
                     })) => {
                         // Interweave the macro expansion
                         if let Some(m) = self.map.get(s) {
-                            if !self.exclusions.contains(s) {
+                            // A global template's free reference names a global binding, so a
+                            // module's own or imported macros cannot claim it, while the global
+                            // macro expansion resolves it past any local binding of the name.
+                            // Top-level definitions in `exclusions` still shadow it.
+                            // Substituting it through a pattern variable clears `unresolved`.
+                            let applies = if *global_reference {
+                                !self.module_scoped && !self.exclusions.contains(s)
+                            } else {
+                                !self.excluded(s)
+                            };
+                            let global_template_reference =
+                                *global_reference && self.module_globals.is_some();
+                            if applies {
                                 // If this macro has been overwritten by any local value, respect
                                 // the local binding and do not expand the macro, unless the
                                 // identifier came from a macro template
                                 let visible = self.source_id.is_none()
                                     || sp.source_id() == m.location.source_id();
 
-                                if *unresolved || visible && !self.in_scope_values.contains(s) {
+                                if global_template_reference
+                                    || *unresolved
+                                    || visible && !self.in_scope_values.contains(s)
+                                {
                                     let span = *sp;
 
-                                    let mut expanded = m.expand(
+                                    let mut expanded = m.expand_with_global_scope(
                                         List::new_maybe_improper(
                                             core::mem::take(&mut l.args),
                                             l.improper,
                                         ),
                                         span,
                                         &self.in_scope_values,
-                                        self.globals,
+                                        self.module_globals
+                                            .map(GlobalMap::Set)
+                                            .unwrap_or(self.globals),
+                                        self.builtin_modules
+                                            .map(|modules| (self.map, modules, self.globals)),
                                     )?;
                                     self.changed = true;
 
                                     self.depth += 1;
 
-                                    self.visit(&mut expanded)?;
+                                    resolve_template_bindings(
+                                        std::slice::from_mut(&mut expanded),
+                                        0,
+                                    );
+                                    self.visit_with_native_heads(&mut expanded, native_heads)?;
 
                                     self.depth -= 1;
 
@@ -596,6 +897,15 @@ impl<'a> VisitorMutRef for Expander<'a> {
                             // let expanded = m.expand(l.clone(), *sp)?;
                             // self.changed = true;
                             // return self.visit(expanded);
+                        }
+                        if *s == *REQUIRE_BUILTIN {
+                            if let Some(builtin_modules) = self.builtin_modules {
+                                *expr = expand_require_builtin(&l.args[1..], builtin_modules)?;
+                                collect_defines(std::slice::from_ref(expr), &mut |name| {
+                                    self.in_scope_values.define(name);
+                                });
+                                return Ok(());
+                            }
                         }
                     }
                     // Some(other) => {
@@ -623,6 +933,14 @@ impl<'a> VisitorMutRef for Expander<'a> {
             ExprKind::Vector(v) => self.visit_vector(v),
         }
     }
+}
+
+impl<'a> VisitorMutRef for Expander<'a> {
+    type Output = Result<()>;
+
+    fn visit(&mut self, expr: &mut ExprKind) -> Self::Output {
+        self.visit_with_native_heads(expr, None)
+    }
 
     fn visit_if(&mut self, f: &mut super::ast::If) -> Self::Output {
         self.visit(&mut f.test_expr)?;
@@ -644,19 +962,18 @@ impl<'a> VisitorMutRef for Expander<'a> {
         &mut self,
         lambda_function: &mut super::ast::LambdaFunction,
     ) -> Self::Output {
+        if let Some(mut parameters) = self.template_parameters(lambda_function.args.iter()) {
+            lambda_function
+                .args
+                .iter_mut()
+                .chain(std::iter::once(&mut lambda_function.body))
+                .for_each(|expr| parameters.resolve(expr));
+        }
+
         self.in_scope_values.push_layer();
 
-        for value in &lambda_function.args {
-            if let Some(ident) = value.atom_identifier() {
-                self.in_scope_values.define(*ident);
-            }
-        }
-
-        for value in &mut lambda_function.args {
-            self.visit(value)?;
-        }
-
-        self.visit(&mut lambda_function.body)?;
+        visit_parameters(self, |v| &mut v.in_scope_values, &mut lambda_function.args)?;
+        self.visit_body(std::slice::from_mut(&mut lambda_function.body))?;
 
         self.in_scope_values.pop_layer();
 
@@ -664,11 +981,7 @@ impl<'a> VisitorMutRef for Expander<'a> {
     }
 
     fn visit_begin(&mut self, begin: &mut super::ast::Begin) -> Self::Output {
-        for expr in begin.exprs.iter_mut() {
-            self.visit(expr)?;
-        }
-
-        Ok(())
+        self.visit_body(&mut begin.exprs)
     }
 
     fn visit_return(&mut self, r: &mut super::ast::Return) -> Self::Output {
@@ -707,6 +1020,16 @@ impl<'a> VisitorMutRef for Expander<'a> {
     }
 
     fn visit_let(&mut self, l: &mut super::ast::Let) -> Self::Output {
+        if let Some(mut parameters) =
+            self.template_parameters(l.bindings.iter().map(|(binding, _)| binding))
+        {
+            l.bindings
+                .iter_mut()
+                .map(|(binding, _)| binding)
+                .chain(std::iter::once(&mut l.body_expr))
+                .for_each(|expr| parameters.resolve(expr));
+        }
+
         self.in_scope_values.push_layer();
 
         for (binding, _) in l.bindings.iter_mut() {
@@ -720,7 +1043,7 @@ impl<'a> VisitorMutRef for Expander<'a> {
             self.visit(expr)?;
         }
 
-        self.visit(&mut l.body_expr)?;
+        self.visit_body(std::slice::from_mut(&mut l.body_expr))?;
 
         self.in_scope_values.pop_layer();
 
@@ -898,12 +1221,12 @@ impl<'a> VisitorMutRef for ExpanderMany<'a> {
                         if is_function {
                             self.in_scope_values.push_layer();
 
-                            if let ExprKind::List(signature) = &l.args[1] {
-                                for arg in signature.args.iter().skip(1) {
-                                    if let Some(ident) = arg.atom_identifier() {
-                                        self.in_scope_values.define(*ident);
-                                    }
-                                }
+                            if let ExprKind::List(signature) = &mut l.args[1] {
+                                visit_parameters(
+                                    self,
+                                    |v| &mut v.in_scope_values,
+                                    &mut signature.args[1..],
+                                )?;
                             }
                         }
 
@@ -918,12 +1241,15 @@ impl<'a> VisitorMutRef for ExpanderMany<'a> {
                         return Ok(());
                     }
 
+                    // A global template's free reference cannot name a module's own or imported
+                    // macro.
                     Some(ExprKind::Atom(Atom {
                         syn:
                             SyntaxObject {
                                 ty: TokenType::Identifier(s),
                                 span: sp,
                                 unresolved,
+                                global_reference: false,
                                 ..
                             },
                     })) => {
@@ -1036,15 +1362,7 @@ impl<'a> VisitorMutRef for ExpanderMany<'a> {
     ) -> Self::Output {
         self.in_scope_values.push_layer();
 
-        for value in &lambda_function.args {
-            if let Some(ident) = value.atom_identifier() {
-                self.in_scope_values.define(*ident);
-            }
-        }
-
-        for value in &mut lambda_function.args {
-            self.visit(value)?;
-        }
+        visit_parameters(self, |v| &mut v.in_scope_values, &mut lambda_function.args)?;
 
         self.visit(&mut lambda_function.body)?;
 
@@ -1623,22 +1941,14 @@ fn expand_keyword_and_default_arguments(
 }
 
 // Lower the native binding forms heading top-level statements, up to the first statement whose
-// head `is_macro`, and record the prepared statements' definitions in `native_globals`.
-// Return how many statements were prepared.
+// head `is_macro`, where a head is shadowed by the bindings in `globals` or before it.
+// Return how many statements were prepared; the caller records their definitions.
 pub(crate) fn prepare_native_globals(
     exprs: &mut [ExprKind],
-    existing: Option<&FxHashMap<InternedString, usize>>,
-    native_globals: &mut FxHashSet<InternedString>,
+    globals: GlobalMap,
     is_macro: &dyn Fn(&InternedString) -> bool,
 ) -> Result<usize> {
-    let globals = match existing {
-        Some(map) => GlobalMap::Layered(map, native_globals),
-        None => GlobalMap::Set(native_globals),
-    };
     let (_, count) = lower_native_definitions(exprs, globals, &mut ScopeSet::default(), is_macro)?;
-    collect_defines(&exprs[..count], &mut |name| {
-        native_globals.insert(name);
-    });
     Ok(count)
 }
 
@@ -1680,9 +1990,9 @@ fn lower_native_definitions(
                     return Ok((changed, index));
                 }
                 // Leave the producer and field accessors for normal expansion.
-                if let Some(lowered) = lower_native_form(list, |name| {
-                    scope.contains(name) || globals.actually_contains(name)
-                })? {
+                if let Some(lowered) =
+                    lower_native_form(list, globals, |name| scope.contains(name))?
+                {
                     *expr = lowered;
                     changed = true;
                 }
@@ -1700,46 +2010,91 @@ fn lower_native_definitions(
 // shadow.
 fn lower_native_form(
     list: &List,
+    globals: GlobalMap,
     is_bound: impl Fn(&InternedString) -> bool,
 ) -> Result<Option<ExprKind>> {
+    let is_bound = |name| {
+        if list
+            .first()
+            .and_then(ExprKind::atom_syntax_object)
+            .is_some_and(|syntax| syntax.global_reference)
+        {
+            // Global template heads resolve at their definition site, outside module bindings.
+            match globals {
+                GlobalMap::Map(_) | GlobalMap::Layered(_, _) => globals.actually_contains(name),
+                GlobalMap::Set(_) => false,
+                GlobalMap::Scoped(globals, _) => globals.actually_contains(name),
+            }
+        } else {
+            is_bound(name) || globals.actually_contains(name)
+        }
+    };
+    // Check the head's name before its bindings, since nearly every list is neither form.
     match list.first_ident() {
-        Some(name) if is_bound(name) => Ok(None),
-        Some(name) if name.resolve() == "define-values" => expand_define_values(list).map(Some),
-        Some(name) if name.resolve() == "struct" => expand_immutable_struct(list).map(Some),
+        Some(name) if name.resolve() == "define-values" && !is_bound(name) => {
+            expand_define_values(list).map(Some)
+        }
+        Some(name) if name.resolve() == "struct" && !is_bound(name) => {
+            expand_immutable_struct(list).map(Some)
+        }
         _ => Ok(None),
     }
 }
 
 // Record the bindings of the native definitions heading top-level statements as if each were
 // lowered in order, so a body can see a native definition that a later macro call keeps from
-// being prepared yet. Heads see `heads` and the statements before them. Macro calls are skipped,
-// and malformed forms are left to report their errors when they are prepared.
+// being prepared yet. Heads see the names `is_head` accepts and the statements before them. Macro
+// calls are skipped, and malformed forms are left to report their errors when they are prepared.
 pub(crate) fn predeclare_native_definitions(
     exprs: &[ExprKind],
-    heads: &FxHashSet<InternedString>,
+    is_head: &dyn Fn(&InternedString) -> bool,
+    globals: GlobalMap,
     is_macro: &dyn Fn(&InternedString) -> bool,
+    builtin_modules: Option<&ModuleContainer>,
     define: &mut impl FnMut(InternedString),
 ) {
     fn walk(
         exprs: &[ExprKind],
-        heads: &FxHashSet<InternedString>,
+        is_head: &dyn Fn(&InternedString) -> bool,
+        globals: GlobalMap,
         scope: &mut ScopeSet<InternedString, FxBuildHasher>,
         is_macro: &dyn Fn(&InternedString) -> bool,
+        builtin_modules: Option<&ModuleContainer>,
         define: &mut impl FnMut(InternedString),
     ) {
         for expr in exprs {
             let lowered = match expr {
                 ExprKind::Begin(begin) => {
-                    walk(&begin.exprs, heads, scope, is_macro, define);
+                    walk(
+                        &begin.exprs,
+                        is_head,
+                        globals,
+                        scope,
+                        is_macro,
+                        builtin_modules,
+                        define,
+                    );
                     continue;
                 }
                 ExprKind::List(list) if list.first().is_some_and(is_begin_head) => {
-                    walk(&list.args[1..], heads, scope, is_macro, define);
+                    walk(
+                        &list.args[1..],
+                        is_head,
+                        globals,
+                        scope,
+                        is_macro,
+                        builtin_modules,
+                        define,
+                    );
                     continue;
                 }
                 ExprKind::List(list) if list.first_ident().is_some_and(is_macro) => continue,
+                ExprKind::List(list) if list.first_ident() == Some(&*REQUIRE_BUILTIN) => {
+                    builtin_modules
+                        .and_then(|modules| expand_require_builtin(&list.args[1..], modules).ok())
+                }
                 ExprKind::List(list) => {
-                    lower_native_form(list, |name| scope.contains(name) || heads.contains(name))
+                    lower_native_form(list, globals, |name| is_head(name) || scope.contains(name))
                         .ok()
                         .flatten()
                 }
@@ -1754,7 +2109,15 @@ pub(crate) fn predeclare_native_definitions(
             );
         }
     }
-    walk(exprs, heads, &mut ScopeSet::default(), is_macro, define);
+    walk(
+        exprs,
+        is_head,
+        globals,
+        &mut ScopeSet::default(),
+        is_macro,
+        builtin_modules,
+        define,
+    );
 }
 
 fn expand_define_values(list: &List) -> Result<ExprKind> {
@@ -2093,8 +2456,8 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
                     return Ok(());
                 }
                 if self.map.is_none() {
-                    if let Some(lowered) = lower_native_form(l, |name| {
-                        self.in_scope_values.contains(name) || self.globals.actually_contains(name)
+                    if let Some(lowered) = lower_native_form(l, self.globals, |name| {
+                        self.in_scope_values.contains(name)
                     })? {
                         *expr = lowered;
                         self.changed = true;
@@ -2261,108 +2624,8 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
                         }
 
                         if s == *REQUIRE_BUILTIN {
-                            match &l.args[1..] {
-                                [ExprKind::Atom(Atom {
-                                    syn:
-                                        SyntaxObject {
-                                            ty: TokenType::StringLiteral(s),
-                                            span,
-                                            ..
-                                        },
-                                })] => {
-                                    // TODO: if it can't be found, the module needs to be marked as `MaybeDylib`
-                                    // and use the binds that are listed in the dylib require spec, something like:
-                                    // (require-builtin steel/obviouslydylib/sqlite (only-in ... ... ...)) <-
-                                    // Then, we can _attempt_ to load the dylib at runtime. If we can't we move on, and
-                                    // otherwise we can error if the identifiers are not lining up.
-                                    if let Some(module) = self.builtin_modules.get(s.resolve()) {
-                                        *expr = module.to_syntax(None);
-                                        return Ok(());
-
-                                        // return Ok(module.to_syntax(None));
-                                    } else {
-                                        stop!(BadSyntax => format!("require-builtin: module not found: {}", s); *span);
-                                    }
-                                }
-
-                                [ExprKind::Atom(Atom {
-                                    syn:
-                                        SyntaxObject {
-                                            ty: TokenType::Identifier(s),
-                                            span,
-                                            ..
-                                        },
-                                })] => {
-                                    if let Some(module) = self.builtin_modules.get(s.resolve()) {
-                                        *expr = module.to_syntax(None);
-                                        return Ok(());
-                                    } else {
-                                        stop!(BadSyntax => format!("require-builtin: module not found: {}", s); *span);
-                                    }
-                                }
-
-                                [ExprKind::Atom(Atom {
-                                    syn:
-                                        SyntaxObject {
-                                            ty: TokenType::StringLiteral(s),
-                                            span,
-                                            ..
-                                        },
-                                }), ExprKind::Atom(Atom {
-                                    syn:
-                                        SyntaxObject {
-                                            ty: TokenType::Identifier(az),
-                                            ..
-                                        },
-                                }), ExprKind::Atom(Atom {
-                                    syn:
-                                        SyntaxObject {
-                                            ty: TokenType::Identifier(prefix),
-                                            ..
-                                        },
-                                })] if *az == *AS_KEYWORD => {
-                                    if let Some(module) = self.builtin_modules.get(s.resolve()) {
-                                        *expr = module.to_syntax(Some(prefix.resolve()));
-
-                                        return Ok(());
-                                    } else {
-                                        stop!(BadSyntax => format!("require-builtin: module not found: {}", s); *span);
-                                    }
-                                }
-
-                                [ExprKind::Atom(Atom {
-                                    syn:
-                                        SyntaxObject {
-                                            ty: TokenType::Identifier(s),
-                                            span,
-                                            ..
-                                        },
-                                }), ExprKind::Atom(Atom {
-                                    syn:
-                                        SyntaxObject {
-                                            ty: TokenType::Identifier(az),
-                                            ..
-                                        },
-                                }), ExprKind::Atom(Atom {
-                                    syn:
-                                        SyntaxObject {
-                                            ty: TokenType::Identifier(prefix),
-                                            ..
-                                        },
-                                })] if *az == *AS_KEYWORD => {
-                                    if let Some(module) = self.builtin_modules.get(s.resolve()) {
-                                        *expr = module.to_syntax(Some(prefix.resolve()));
-
-                                        return Ok(());
-                                    } else {
-                                        stop!(BadSyntax => format!("require-builtin: module not found: {}", s); *span);
-                                    }
-                                }
-
-                                _ => {
-                                    stop!(ArityMismatch => "require-builtin malformed - follows the pattern (require-builtin \"<module>\") or (require-builtin \"<module>\" as <prefix>")
-                                }
-                            }
+                            *expr = expand_require_builtin(&l.args[1..], &self.builtin_modules)?;
+                            return Ok(());
                         }
                     }
 
@@ -2384,6 +2647,43 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
 
     fn visit_vector(&mut self, _v: &mut super::ast::Vector) -> Self::Output {
         Ok(())
+    }
+}
+
+fn expand_require_builtin(
+    args: &[ExprKind],
+    builtin_modules: &ModuleContainer,
+) -> Result<ExprKind> {
+    let (module, prefix) = match args {
+        [module] => (module, None),
+        [module, as_keyword, prefix]
+            if as_keyword.atom_identifier() == Some(&*AS_KEYWORD)
+                && prefix.atom_identifier().is_some() =>
+        {
+            (module, prefix.atom_identifier().map(|name| name.resolve()))
+        }
+        _ => {
+            stop!(ArityMismatch => "require-builtin malformed - follows the pattern (require-builtin \"<module>\") or (require-builtin \"<module>\" as <prefix>)")
+        }
+    };
+    match module {
+        ExprKind::Atom(Atom {
+            syn:
+                SyntaxObject {
+                    ty: TokenType::StringLiteral(name) | TokenType::Identifier(name),
+                    span,
+                    ..
+                },
+        }) => {
+            if let Some(module) = builtin_modules.get(name.resolve()) {
+                Ok(module.to_syntax(prefix))
+            } else {
+                stop!(BadSyntax => format!("require-builtin: module not found: {}", name); *span)
+            }
+        }
+        _ => {
+            stop!(ArityMismatch => "require-builtin malformed - follows the pattern (require-builtin \"<module>\") or (require-builtin \"<module>\" as <prefix>)")
+        }
     }
 }
 

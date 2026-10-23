@@ -6,6 +6,7 @@ use crate::parser::parser::{ExpansionMark, SyntaxObject};
 use crate::parser::rename_idents::RenameIdentifiersVisitor;
 use crate::parser::replace_idents::replace_identifiers;
 use crate::parser::tokens::TokenType;
+use crate::steel_vm::engine::ModuleContainer;
 
 use crate::parser::span::Span;
 
@@ -298,8 +299,23 @@ impl SteelMacro {
         in_scope: &ScopeSet<InternedString, FxBuildHasher>,
         globals: GlobalMap,
     ) -> Result<ExprKind> {
+        self.expand_with_global_scope(expr, span, in_scope, globals, None)
+    }
+
+    pub(crate) fn expand_with_global_scope(
+        &self,
+        expr: List,
+        span: Span,
+        in_scope: &ScopeSet<InternedString, FxBuildHasher>,
+        globals: GlobalMap,
+        global_scope: Option<(
+            &FxHashMap<InternedString, SteelMacro>,
+            &ModuleContainer,
+            GlobalMap,
+        )>,
+    ) -> Result<ExprKind> {
         let case_to_expand = self.match_case(&expr, in_scope, globals)?;
-        let expanded_expr = case_to_expand.expand(expr, span, in_scope, globals)?;
+        let expanded_expr = case_to_expand.expand(expr, span, in_scope, globals, global_scope)?;
 
         Ok(expanded_expr)
     }
@@ -468,6 +484,11 @@ impl MacroCase {
         span: Span,
         in_scope: &ScopeSet<InternedString, FxBuildHasher>,
         globals: GlobalMap,
+        global_scope: Option<(
+            &FxHashMap<InternedString, SteelMacro>,
+            &ModuleContainer,
+            GlobalMap,
+        )>,
     ) -> Result<ExprKind> {
         thread_local! {
             static BINDINGS: RefCell<FxHashMap<InternedString, ExprKind>> = RefCell::new(FxHashMap::default());
@@ -523,6 +544,14 @@ impl MacroCase {
                     }
 
                     MarkTemplateIdentifiers(ExpansionMark::fresh()).visit(&mut body);
+                    if let Some((macros, builtin_modules, runtime_globals)) = global_scope {
+                        RenameIdentifiersVisitor::mark_global_references(
+                            &mut body,
+                            macros,
+                            builtin_modules,
+                            runtime_globals,
+                        );
+                    }
 
                     // println!("Expanding: {}", body);
                     // println!("Bindings");
@@ -1023,9 +1052,14 @@ fn match_single_pattern(
                 syn:
                     SyntaxObject {
                         ty: TokenType::Identifier(s),
+                        global_reference,
                         ..
                     },
-            }) if s == v && !in_scope.contains(s) && !globals.contains(s) => true,
+            }) if s == v
+                && (*global_reference || !in_scope.contains(s) && !globals.contains(s)) =>
+            {
+                true
+            }
             ExprKind::Atom(Atom {
                 syn:
                     SyntaxObject {
@@ -1902,6 +1936,7 @@ mod macro_case_expand_test {
                 Span::new(0, 0, SourceId::none()),
                 &ScopeSet::default(),
                 GlobalMap::Map(&Default::default()),
+                None,
             )
             .unwrap();
 

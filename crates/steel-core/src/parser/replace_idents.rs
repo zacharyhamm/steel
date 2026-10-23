@@ -668,6 +668,7 @@ impl<'a> VisitorMutRef for ReplaceExpressions<'a> {
                 if let TokenType::Identifier(s) = &mut a.syn.ty {
                     if self.in_scope.contains(s)
                         && a.syn.unresolved
+                        && !a.syn.global_reference
                         && !a.syn.introduced_via_macro
                         && !self.globals.actually_contains(s)
                     {

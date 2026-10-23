@@ -862,6 +862,7 @@ impl Compiler {
             &mut self.kernel,
             &mut self.sources,
             builtin_modules,
+            GlobalMap::Map(self.symbol_map.map()),
         )
     }
 
@@ -966,12 +967,15 @@ impl Compiler {
             native_globals.insert("define-values".into());
         }
         // Macros are already expanded, so this lowers every native head before any body.
-        prepare_native_globals(
+        // Top-level heads are also shadowed by the runtime globals.
+        let count = prepare_native_globals(
             expanded_statements,
-            Some(self.symbol_map.map()),
-            &mut native_globals,
+            GlobalMap::Layered(self.symbol_map.map(), &native_globals),
             &|_| false,
         )?;
+        collect_defines(&expanded_statements[..count], &mut |name| {
+            native_globals.insert(name);
+        });
         Ok(native_globals)
     }
 

@@ -3,33 +3,96 @@ use steel_parser::ast::{
     UNQUOTE, UNQUOTE_COMMA, UNQUOTE_SPLICING,
 };
 
+use crate::compiler::passes::mangle::{collect_define_syntax, collect_defines};
+use crate::compiler::passes::VisitorMutRefUnit;
 use crate::compiler::program::{DATUM_SYNTAX, LAMBDA_SYMBOL};
 use crate::parser::ast::ExprKind;
-use crate::parser::parser::SyntaxObject;
+use crate::parser::expand_visitor::{predeclare_native_definitions, GlobalMap};
+use crate::parser::expander::SteelMacro;
+use crate::parser::parser::{ExpansionMark, SyntaxObject};
 use crate::parser::tokens::TokenType;
 use crate::parser::visitors::VisitorMutRef;
+use crate::steel_vm::engine::ModuleContainer;
 
-use std::collections::HashSet;
+use quickscope::ScopeSet;
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use super::interner::InternedString;
 
+// Template identifiers bound by a nested macro, which are no longer free template references.
+#[derive(Default)]
+pub(crate) struct TemplateBindings(FxHashSet<(InternedString, ExpansionMark)>);
+
+impl VisitorMutRefUnit for TemplateBindings {
+    fn visit_atom(&mut self, atom: &mut Atom) {
+        if let TokenType::Identifier(name) = atom.syn.ty {
+            if self.0.contains(&(name, atom.syn.mark)) {
+                atom.syn.global_reference = false;
+                atom.syn.unresolved = false;
+            }
+        }
+    }
+}
+
+impl TemplateBindings {
+    // Record a parameter, either an identifier or the name of a `(name value)` binding.
+    pub(crate) fn bind_parameter(&mut self, parameter: &ExprKind) {
+        let name = match parameter {
+            ExprKind::List(binding) => binding.args.first(),
+            parameter => Some(parameter),
+        };
+        if let Some(syn) = name.and_then(ExprKind::atom_syntax_object) {
+            if let TokenType::Identifier(name) = syn.ty {
+                if syn.global_reference && syn.mark.is_template() {
+                    self.0.insert((name, syn.mark));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn resolve(&mut self, expr: &mut ExprKind) {
+        if !self.0.is_empty() {
+            self.visit(expr);
+        }
+    }
+}
+
+pub(crate) fn resolve_template_bindings(exprs: &mut [ExprKind], expanded: usize) {
+    let mut bindings = TemplateBindings::default();
+    collect_define_syntax(std::slice::from_ref(&exprs[expanded]), &mut |name, syn| {
+        if syn.mark.is_template() {
+            bindings.0.insert((name, syn.mark));
+        }
+    });
+    // A nested macro can bind an identifier previously classified as a free template reference.
+    for expr in exprs {
+        bindings.resolve(expr);
+    }
+}
+
 pub struct RenameIdentifiersVisitor<'a> {
-    introduced_identifiers: HashSet<InternedString>,
+    introduced_identifiers: ScopeSet<InternedString, FxBuildHasher>,
     pattern_variables: &'a [InternedString],
     syntax: &'a [InternedString],
+    global_scope: Option<(
+        &'a FxHashMap<InternedString, SteelMacro>,
+        &'a ModuleContainer,
+        GlobalMap<'a>,
+    )>,
 }
 
 impl<'a> RenameIdentifiersVisitor<'a> {
     pub fn new(pattern_variables: &'a [InternedString], syntax: &'a [InternedString]) -> Self {
         RenameIdentifiersVisitor {
-            introduced_identifiers: HashSet::new(),
+            introduced_identifiers: ScopeSet::default(),
             pattern_variables,
             syntax,
+            global_scope: None,
         }
     }
 
     pub fn add(&mut self, ident: InternedString) {
-        self.introduced_identifiers.insert(ident);
+        self.introduced_identifiers.define(ident);
     }
 
     pub fn is_gensym(&self, ident: &InternedString) -> bool {
@@ -37,7 +100,95 @@ impl<'a> RenameIdentifiersVisitor<'a> {
     }
 
     pub fn rename_identifiers(&mut self, expr: &mut ExprKind) {
-        self.visit(expr);
+        self.visit_body(std::slice::from_mut(expr));
+    }
+
+    pub(crate) fn mark_global_references(
+        expr: &mut ExprKind,
+        macros: &'a FxHashMap<InternedString, SteelMacro>,
+        builtin_modules: &'a ModuleContainer,
+        globals: GlobalMap<'a>,
+    ) {
+        let mut visitor = Self::new(&[], &[]);
+        // Template references resolve outside the calling module's bindings.
+        let globals = match globals {
+            GlobalMap::Scoped(globals, _) => *globals,
+            globals => globals,
+        };
+        visitor.global_scope = Some((macros, builtin_modules, globals));
+        visitor.visit_body(std::slice::from_mut(expr));
+    }
+
+    fn visit_body(&mut self, exprs: &mut [ExprKind]) {
+        if let Some((macros, builtin_modules, globals)) = self.global_scope {
+            // Heads see only the bindings before the body, so introduce its definitions after.
+            let mut definitions = Vec::new();
+            predeclare_native_definitions(
+                exprs,
+                &|name| self.introduced_identifiers.contains(name),
+                globals,
+                &|name| macros.contains_key(name),
+                Some(builtin_modules),
+                &mut |name| definitions.push(name),
+            );
+            for name in definitions {
+                self.add(name);
+            }
+        } else {
+            collect_defines(exprs, &mut |name| {
+                if !self.pattern_variables.contains(&name) {
+                    self.add(name);
+                }
+            });
+        }
+        for expr in exprs {
+            self.visit(expr);
+        }
+    }
+
+    fn bind(&mut self, expr: &mut ExprKind) {
+        if let Some(syntax) = expr.atom_syntax_object_mut() {
+            if let TokenType::Identifier(name) = syntax.ty {
+                if !self.pattern_variables.contains(&name) {
+                    self.add(name);
+                }
+                if self.global_scope.is_some() {
+                    return;
+                }
+                *syntax = SyntaxObject::default(TokenType::Identifier(
+                    ("##".to_string() + name.resolve()).into(),
+                ));
+                syntax.introduced_via_macro = true;
+            }
+        }
+    }
+
+    fn visit_parameters(&mut self, args: &mut [ExprKind]) {
+        let positional_count = args
+            .iter()
+            .take_while(|arg| arg.atom_identifier().is_some())
+            .count();
+        for arg in &mut args[..positional_count] {
+            self.bind(arg);
+        }
+        // Defaults see required positional parameters, but no optional or keyword bindings.
+        for arg in &mut args[positional_count..] {
+            if let ExprKind::List(binding) = arg {
+                if let Some(default) = binding.args.get_mut(1) {
+                    self.visit(default);
+                }
+            }
+        }
+        for arg in &mut args[positional_count..] {
+            match arg {
+                ExprKind::List(binding) => {
+                    if let Some(name) = binding.args.first_mut() {
+                        self.bind(name);
+                    }
+                }
+                _ => self.bind(arg),
+            }
+        }
     }
 
     // Okay so this is annoying: we'll have to handle quoted data in the template.
@@ -95,25 +246,7 @@ impl<'a> VisitorMutRef for RenameIdentifiersVisitor<'a> {
     }
 
     fn visit_define(&mut self, define: &mut super::ast::Define) -> Self::Output {
-        if let ExprKind::Atom(a) = &mut define.name {
-            if let SyntaxObject {
-                ty: TokenType::Identifier(ref s),
-                ..
-            } = a.syn
-            {
-                // If this is a special pattern variable, don't do any mangling of the variable
-                if !self.pattern_variables.contains(s) {
-                    self.add(*s);
-                    // a.syn = SyntaxObject::default(TokenType::Identifier("##".to_string() + s));
-                }
-
-                a.syn = SyntaxObject::default(TokenType::Identifier(
-                    ("##".to_string() + s.resolve()).into(),
-                ));
-                a.syn.introduced_via_macro = true;
-            }
-        }
-
+        self.bind(&mut define.name);
         self.visit(&mut define.body)
     }
 
@@ -121,32 +254,14 @@ impl<'a> VisitorMutRef for RenameIdentifiersVisitor<'a> {
         &mut self,
         lambda_function: &mut super::ast::LambdaFunction,
     ) -> Self::Output {
-        for arg in &mut lambda_function.args {
-            if let ExprKind::Atom(a) = arg {
-                if let SyntaxObject {
-                    ty: TokenType::Identifier(ref s),
-                    ..
-                } = a.syn
-                {
-                    if !self.pattern_variables.contains(s) {
-                        self.add(*s);
-                    }
-
-                    a.syn = SyntaxObject::default(TokenType::Identifier(
-                        ("##".to_string() + s.resolve()).into(),
-                    ));
-                    a.syn.introduced_via_macro = true;
-                }
-            }
-        }
-
-        self.visit(&mut lambda_function.body)
+        self.introduced_identifiers.push_layer();
+        self.visit_parameters(&mut lambda_function.args);
+        self.visit_body(std::slice::from_mut(&mut lambda_function.body));
+        self.introduced_identifiers.pop_layer();
     }
 
     fn visit_begin(&mut self, begin: &mut super::ast::Begin) -> Self::Output {
-        for expr in &mut begin.exprs {
-            self.visit(expr)
-        }
+        self.visit_body(&mut begin.exprs);
     }
 
     fn visit_return(&mut self, r: &mut super::ast::Return) -> Self::Output {
@@ -164,6 +279,11 @@ impl<'a> VisitorMutRef for RenameIdentifiersVisitor<'a> {
     fn visit_atom(&mut self, a: &mut super::ast::Atom) -> Self::Output {
         let token = a.syn.ty.clone();
         if let TokenType::Identifier(s) = token {
+            if self.global_scope.is_some() {
+                a.syn.unresolved = !self.introduced_identifiers.contains(&s);
+                a.syn.global_reference |= a.syn.unresolved;
+                return;
+            }
             if self.syntax.contains(&s) || s == *DATUM_SYNTAX {
                 return;
             }
@@ -196,6 +316,14 @@ impl<'a> VisitorMutRef for RenameIdentifiersVisitor<'a> {
                 }
             }
 
+            Some(ExprKind::Atom(Atom {
+                syn: SyntaxObject { ty, .. },
+            })) if *ty == TokenType::Begin
+                || *ty == TokenType::Identifier(*crate::compiler::program::BEGIN) =>
+            {
+                self.visit_body(&mut l.args[1..]);
+            }
+
             // Some(ExprKind::Atom(Atom {
             //     syn: SyntaxObject { ty, .. },
             // })) if *ty == TokenType::Identifier(*DATUM_SYNTAX) => {
@@ -206,63 +334,22 @@ impl<'a> VisitorMutRef for RenameIdentifiersVisitor<'a> {
             Some(ExprKind::Atom(Atom {
                 syn: SyntaxObject { ty, .. },
             })) if *ty == TokenType::Define => {
+                let mut is_function = false;
                 // TODO: Top level defines should be allowed to escape here
                 match l.args.get_mut(1) {
                     // (define name expr)
-                    Some(ExprKind::Atom(a)) => {
-                        if let SyntaxObject {
-                            ty: TokenType::Identifier(s),
-                            ..
-                        } = a.syn
-                        {
-                            if !self.pattern_variables.contains(&s) {
-                                self.add(s);
-                            }
-
-                            a.syn = SyntaxObject::default(TokenType::Identifier(
-                                ("##".to_string() + s.resolve()).into(),
-                            ));
-                            a.syn.introduced_via_macro = true;
-
-                            // TODO: Move the logic about resolving
-                            // the name actually back to the expand visitor.
-                            // This doesn't _quite_ make sense - this is the template
-                            // value that is introduced. For example, in the example:
-                            //
-                            // (define-syntax letrec*-helper
-                            //   (syntax-rules ()
-                            //     [(letrec*-helper () body ...)
-                            //      (begin
-                            //        body ...)]
-                            //     [(letrec*-helper ((var val) rest ...) body ...)
-                            //      (begin
-                            //        (define var val)
-                            //        (letrec*-helper (rest ...) body ...))]))
-                            // a.syn.previous_name = Some(s);
-                        }
-                    }
+                    Some(name @ ExprKind::Atom(_)) => self.bind(name),
 
                     // (define (name args ...) exprs ...)
                     Some(ExprKind::List(shorthand_define_function)) => {
-                        for arg in shorthand_define_function.args.iter_mut() {
-                            if let ExprKind::Atom(a) = arg {
-                                if let SyntaxObject {
-                                    ty: TokenType::Identifier(s),
-                                    ..
-                                } = a.syn
-                                {
-                                    if s != *DATUM_SYNTAX {
-                                        if !self.pattern_variables.contains(&s) {
-                                            self.add(s);
-                                        }
-
-                                        a.syn = SyntaxObject::default(TokenType::Identifier(
-                                            ("##".to_string() + s.resolve()).into(),
-                                        ));
-                                        a.syn.introduced_via_macro = true;
-                                        // a.syn.previous_name = Some(s);
-                                    }
-                                }
+                        if shorthand_define_function.first_ident() != Some(&*DATUM_SYNTAX) {
+                            if let Some(name) = shorthand_define_function.args.first_mut() {
+                                self.bind(name);
+                            }
+                            self.introduced_identifiers.push_layer();
+                            is_function = true;
+                            if let Some(args) = shorthand_define_function.args.get_mut(1..) {
+                                self.visit_parameters(args);
                             }
                         }
                     }
@@ -271,9 +358,10 @@ impl<'a> VisitorMutRef for RenameIdentifiersVisitor<'a> {
                 }
 
                 if let Some(rest) = l.args.get_mut(2..) {
-                    for expr in rest.iter_mut() {
-                        self.visit(expr)
-                    }
+                    self.visit_body(rest);
+                }
+                if is_function {
+                    self.introduced_identifiers.pop_layer();
                 }
             }
 
@@ -284,143 +372,50 @@ impl<'a> VisitorMutRef for RenameIdentifiersVisitor<'a> {
                 || *ty == TokenType::Identifier(*LAMBDA)
                 || *ty == TokenType::Identifier(*LAMBDA_FN) =>
             {
-                let arguments = l.args.get_mut(1);
-
-                if let Some(ExprKind::List(arguments)) = arguments {
-                    for arg in arguments.args.iter_mut() {
-                        if let ExprKind::Atom(a) = arg {
-                            if let SyntaxObject {
-                                ty: TokenType::Identifier(s),
-                                ..
-                            } = a.syn
-                            {
-                                if !self.pattern_variables.contains(&s) {
-                                    self.add(s);
-                                }
-
-                                a.syn = SyntaxObject::default(TokenType::Identifier(
-                                    ("##".to_string() + s.resolve()).into(),
-                                ));
-                                a.syn.introduced_via_macro = true;
-                                // a.syn.previous_name = Some(s);
-                            }
-                        }
-                    }
-                }
-
-                if let Some(ExprKind::Atom(a)) = arguments {
-                    if let SyntaxObject {
-                        ty: TokenType::Identifier(s),
-                        ..
-                    } = a.syn
-                    {
-                        if !self.pattern_variables.contains(&s) {
-                            self.add(s);
-                        }
-
-                        a.syn = SyntaxObject::default(TokenType::Identifier(
-                            ("##".to_string() + s.resolve()).into(),
-                        ));
-                        a.syn.introduced_via_macro = true;
-                        // a.syn.previous_name = Some(s);
-                    }
+                self.introduced_identifiers.push_layer();
+                match l.args.get_mut(1) {
+                    Some(ExprKind::List(arguments)) => self.visit_parameters(&mut arguments.args),
+                    Some(arg) => self.bind(arg),
+                    None => {}
                 }
 
                 if let Some(rest) = l.args.get_mut(2..) {
-                    for expr in rest.iter_mut() {
-                        self.visit(expr)
-                    }
+                    self.visit_body(rest);
                 }
+                self.introduced_identifiers.pop_layer();
             }
 
             Some(ExprKind::Atom(Atom {
                 syn: SyntaxObject { ty, .. },
             })) if *ty == TokenType::Let || *ty == TokenType::Identifier(*PLAIN_LET) => {
-                match l.args.get_mut(1) {
-                    Some(ExprKind::List(bindings)) => {
-                        for pair in &mut bindings.args {
-                            if let ExprKind::List(p) = pair {
-                                if let Some(ExprKind::Atom(a)) = p.args.get_mut(0) {
-                                    if let SyntaxObject {
-                                        ty: TokenType::Identifier(s),
-                                        ..
-                                    } = a.syn
-                                    {
-                                        if !self.pattern_variables.contains(&s) {
-                                            self.add(s);
-                                        }
-
-                                        a.syn = SyntaxObject::default(TokenType::Identifier(
-                                            ("##".to_string() + s.resolve()).into(),
-                                        ));
-                                        a.syn.introduced_via_macro = true;
-                                        // a.syn.previous_name = Some(s);
-                                    }
-                                }
-
-                                if let Some(expr) = p.args.get_mut(1) {
-                                    self.visit(expr)
-                                }
+                let named = l.args.get(1).and_then(ExprKind::atom_identifier).is_some();
+                let bindings_index = if named { 2 } else { 1 };
+                if let Some(ExprKind::List(bindings)) = l.args.get_mut(bindings_index) {
+                    for pair in &mut bindings.args {
+                        if let ExprKind::List(pair) = pair {
+                            if let Some(value) = pair.args.get_mut(1) {
+                                self.visit(value);
                             }
                         }
-                    }
-
-                    // `let loop ((binding expr) ...)`
-                    Some(ExprKind::Atom(a)) => {
-                        if let SyntaxObject {
-                            ty: TokenType::Identifier(s),
-                            ..
-                        } = a.syn
-                        {
-                            if !self.pattern_variables.contains(&s) {
-                                self.add(s);
-                            }
-
-                            a.syn = SyntaxObject::default(TokenType::Identifier(
-                                ("##".to_string() + s.resolve()).into(),
-                            ));
-                            a.syn.introduced_via_macro = true;
-                            // a.syn.previous_name = Some(s);
-                        }
-
-                        // Catch the bindings as well
-                        if let Some(ExprKind::List(bindings)) = l.args.get_mut(2) {
-                            for pair in &mut bindings.args {
-                                if let ExprKind::List(p) = pair {
-                                    if let Some(ExprKind::Atom(a)) = p.args.get_mut(0) {
-                                        if let SyntaxObject {
-                                            ty: TokenType::Identifier(s),
-                                            ..
-                                        } = a.syn
-                                        {
-                                            if !self.pattern_variables.contains(&s) {
-                                                self.add(s);
-                                            }
-
-                                            a.syn = SyntaxObject::default(TokenType::Identifier(
-                                                ("##".to_string() + s.resolve()).into(),
-                                            ));
-                                            a.syn.introduced_via_macro = true;
-                                            // a.syn.previous_name = Some(s);
-                                        }
-                                    }
-
-                                    if let Some(expr) = p.args.get_mut(1) {
-                                        self.visit(expr)
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    _ => {}
-                }
-
-                if let Some(remaining) = l.args.get_mut(2..) {
-                    for expr in remaining {
-                        self.visit(expr);
                     }
                 }
+                self.introduced_identifiers.push_layer();
+                if named {
+                    self.bind(&mut l.args[1]);
+                }
+                if let Some(ExprKind::List(bindings)) = l.args.get_mut(bindings_index) {
+                    for pair in &mut bindings.args {
+                        if let ExprKind::List(pair) = pair {
+                            if let Some(name) = pair.args.first_mut() {
+                                self.bind(name);
+                            }
+                        }
+                    }
+                }
+                if let Some(remaining) = l.args.get_mut(bindings_index + 1..) {
+                    self.visit_body(remaining);
+                }
+                self.introduced_identifiers.pop_layer();
             }
 
             _ => {
@@ -450,30 +445,16 @@ impl<'a> VisitorMutRef for RenameIdentifiersVisitor<'a> {
         }
     }
 
-    // TODO: This needs to be fixed!
     fn visit_let(&mut self, l: &mut super::ast::Let) -> Self::Output {
-        for (arg, expr) in &mut l.bindings {
-            if let ExprKind::Atom(a) = arg {
-                if let SyntaxObject {
-                    ty: TokenType::Identifier(ref s),
-                    ..
-                } = a.syn
-                {
-                    if !self.pattern_variables.contains(s) {
-                        self.add(*s);
-                    }
-
-                    a.syn = SyntaxObject::default(TokenType::Identifier(
-                        ("##".to_string() + s.resolve()).into(),
-                    ));
-                    a.syn.introduced_via_macro = true;
-                }
-            }
-
+        for (_, expr) in &mut l.bindings {
             self.visit(expr);
         }
-
-        self.visit(&mut l.body_expr);
+        self.introduced_identifiers.push_layer();
+        for (arg, _) in &mut l.bindings {
+            self.bind(arg);
+        }
+        self.visit_body(std::slice::from_mut(&mut l.body_expr));
+        self.introduced_identifiers.pop_layer();
     }
 
     fn visit_vector(&mut self, v: &mut super::ast::Vector) -> Self::Output {

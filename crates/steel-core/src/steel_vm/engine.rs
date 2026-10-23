@@ -3207,8 +3207,19 @@ fn raw_engine_module_native_definitions_predeclare_across_macro_calls() {
             "(struct 42)",
         ),
     ] {
-        for require in ["", "(require \"unused-module\")"] {
+        for (global_macro, require) in [
+            (false, ""),
+            (false, "(require \"unused-module\")"),
+            (true, ""),
+            (true, "(require \"unused-module\")"),
+        ] {
             let mut engine = Engine::new_raw_no_kernel();
+            let declaration = if global_macro {
+                engine.run(declaration).unwrap();
+                ""
+            } else {
+                declaration
+            };
             engine.register_steel_module(
                 "unused-module".into(),
                 "(provide unused) (define unused 1)".into(),
@@ -3229,6 +3240,68 @@ fn raw_engine_module_native_definitions_predeclare_across_macro_calls() {
                 Some(&SteelVal::IntV(42)),
                 "{source}"
             );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_local_bindings_predeclare_across_global_macro_calls() {
+    for require in ["", "(require \"unused-module\")"] {
+        for name in ["struct", "define-values"] {
+            for definition in [
+                format!("(define ({name} x) x)"),
+                format!("(define-values ({name}) (lambda (x) x))"),
+            ] {
+                let body = format!(
+                    "(begin (struct before (x)))
+                     (define (nested) ({name} (before-x (before 42))))
+                     (ignore)
+                     {definition}
+                     (nested)"
+                );
+                for source in [
+                    format!("(define (call) {body}) (define answer (call))"),
+                    format!("(define answer ((lambda () {body})))"),
+                    format!("(define answer (let () {body}))"),
+                    format!(
+                        "(define answer
+                           ((lambda ()
+                              (forward (begin (ignore) (struct before (x))))
+                              (define (nested) ({name} (before-x (before 42))))
+                              (ignore)
+                              {definition}
+                              (nested))))"
+                    ),
+                    format!("(define answer ((lambda () (bind-name {name}) ({name} 42))))"),
+                    format!("(define answer (let () (begin (bind-name {name})) ({name} 42)))"),
+                ] {
+                    let mut engine = Engine::new_raw_no_kernel();
+                    engine
+                        .run(
+                            "(define-syntax ignore (syntax-rules () [(ignore) 0]))
+                             (define-syntax forward (syntax-rules () [(forward expr) expr]))
+                             (define-syntax bind-name
+                               (syntax-rules () [(bind-name name) (define (name x) x)]))",
+                        )
+                        .unwrap();
+                    engine.register_steel_module(
+                        "unused-module".into(),
+                        "(provide unused) (define unused 0)".into(),
+                    );
+                    engine.register_steel_module(
+                        "local-predeclare".into(),
+                        format!("{require} (provide answer) {source}"),
+                    );
+                    assert_eq!(
+                        engine
+                            .run("(require \"local-predeclare\") answer")
+                            .unwrap_or_else(|error| panic!("{require}, {source}: {error}"))
+                            .last(),
+                        Some(&SteelVal::IntV(42)),
+                        "{require}, {source}"
+                    );
+                }
+            }
         }
     }
 }
@@ -3268,10 +3341,19 @@ fn raw_engine_module_native_definitions_follow_macro_expansion() {
     let declaration = "(define-syntax bind-name
                          (syntax-rules ()
                            [(bind-name name) (define (name x) x)]))";
-    for origin in ["local", "local-with-import", "imported"] {
+    for (origin, name) in [
+        "global",
+        "global-with-import",
+        "local",
+        "local-with-import",
+        "imported",
+    ]
+    .into_iter()
+    .flat_map(|origin| ["struct", "define-values"].map(|name| (origin, name)))
+    {
         for binding in [
-            "(bind-name define-values)",
-            "(begin (begin (bind-name define-values)))",
+            format!("(bind-name {name})"),
+            format!("(begin (begin (bind-name {name})))"),
         ] {
             let mut engine = Engine::new_raw_no_kernel();
             engine.register_steel_module(
@@ -3283,6 +3365,14 @@ fn raw_engine_module_native_definitions_follow_macro_expansion() {
                 "(provide unused) (define unused 1)".into(),
             );
             let prefix = match origin {
+                "global" | "global-with-import" => {
+                    engine.run(declaration).unwrap();
+                    if origin == "global-with-import" {
+                        "(require \"unused-module\")".to_owned()
+                    } else {
+                        String::new()
+                    }
+                }
                 "local" => declaration.to_owned(),
                 "local-with-import" => format!("(require \"unused-module\") {declaration}"),
                 "imported" => "(require \"binding-macro\")".to_owned(),
@@ -3290,7 +3380,10 @@ fn raw_engine_module_native_definitions_follow_macro_expansion() {
             };
             engine.register_steel_module(
                 "macro-binding".into(),
-                format!("{prefix} (provide answer) {binding} (define-values 42) (define answer (define-values 42))"),
+                format!(
+                    "{prefix} (provide answer) {binding} ({name} 42)
+                         (define (call) ({name} 42)) (define answer (call))"
+                ),
             );
             assert_eq!(
                 engine
@@ -3362,11 +3455,32 @@ fn raw_engine_module_native_heads_preserve_struct_macro_precedence() {
     let declaration = "(define-syntax struct
                          (syntax-rules ()
                            [(struct name) (define name 42)]))";
-    for origin in ["local", "imported"] {
-        for binding in ["(struct answer)", "(begin (struct answer))"] {
+    for origin in [
+        "global",
+        "global-with-import",
+        "local",
+        "local-with-import",
+        "imported",
+    ] {
+        for binding in ["(struct answer)", "(begin (begin (struct answer)))"] {
             let mut engine = Engine::new_raw_no_kernel();
+            engine.register_steel_module(
+                "unused-module".into(),
+                "(provide unused) (define unused 1)".into(),
+            );
+            // Local and imported macros must still win over a global macro with the same name.
+            engine.run(declaration.replace("42", "1")).unwrap();
             let prefix = match origin {
+                "global" | "global-with-import" => {
+                    engine.run(declaration).unwrap();
+                    if origin == "global-with-import" {
+                        "(require \"unused-module\")".to_owned()
+                    } else {
+                        String::new()
+                    }
+                }
                 "local" => declaration.to_owned(),
+                "local-with-import" => format!("(require \"unused-module\") {declaration}"),
                 "imported" => {
                     engine.register_steel_module(
                         "struct-macro".into(),
@@ -3388,6 +3502,12 @@ fn raw_engine_module_native_heads_preserve_struct_macro_precedence() {
                 Some(&SteelVal::IntV(42)),
                 "{origin}, {binding}"
             );
+            if origin.starts_with("global") {
+                assert!(!engine.virtual_machine.compiler.read().modules()
+                    [std::path::Path::new("struct-precedence")]
+                .macro_map
+                .contains_key(&"struct".into()));
+            }
         }
     }
 }
@@ -3463,6 +3583,1463 @@ fn raw_engine_native_forms_respect_module_shadowing() {
                 .last(),
             Some(&SteelVal::IntV(42))
         );
+    }
+}
+
+#[test]
+fn raw_engine_module_native_bindings_follow_deferred_global_macros() {
+    for require in ["", "(require \"unused-module\")"] {
+        for body in [
+            "(ignore) (struct point (x)) (define answer (point-x (point 42)))",
+            "(begin (ignore) (struct point (x)) (define answer (point-x (point 42))))",
+            "(ignore) (define-values (x) 42) (define answer x)",
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine
+                .run("(define-syntax ignore (syntax-rules () [(ignore) 0]))")
+                .unwrap();
+            engine.register_steel_module(
+                "unused-module".into(),
+                "(provide unused) (define unused 0)".into(),
+            );
+            engine.register_steel_module(
+                "native-after-global".into(),
+                format!(
+                    "{require} (provide answer)
+                 (define-syntax x (syntax-rules () [(x) 7]))
+                 {body}"
+                ),
+            );
+            assert_eq!(
+                engine
+                    .run("(require \"native-after-global\") answer")
+                    .unwrap_or_else(|error| panic!("{require}, {body}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{require}, {body}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_deferred_imported_macros_respect_value_bindings() {
+    for body in [
+        "(begin (ignore) (define (foo) 42) (define answer (foo)))",
+        "(begin (ignore) (define (foo) 42) (ignore) (define answer (foo)))",
+        "(begin (ignore) (bind-foo foo) (ignore) (define answer (foo)))",
+        "(begin (ignore) (begin (define (foo) 42)) (define answer (foo)))",
+    ] {
+        let mut engine = Engine::new_raw_no_kernel();
+        engine
+            .run(
+                "(define-syntax ignore (syntax-rules () [(ignore) 0]))
+                 (define-syntax bind-foo (syntax-rules () [(bind-foo name) (define (name) 42)]))",
+            )
+            .unwrap();
+        engine.register_steel_module(
+            "foo-macro".into(),
+            "(provide foo) (define-syntax foo (syntax-rules () [(foo) 7]))".into(),
+        );
+        engine.register_steel_module(
+            "deferred-value-binding".into(),
+            format!("(require \"foo-macro\") (provide answer) {body}"),
+        );
+        assert_eq!(
+            engine
+                .run("(require \"deferred-value-binding\") answer")
+                .unwrap_or_else(|error| panic!("{body}: {error}"))
+                .last(),
+            Some(&SteelVal::IntV(42)),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn raw_engine_module_global_macros_respect_nested_template_bindings() {
+    for require in ["", "(require \"unused-module\")"] {
+        for name in ["struct", "define-values", "helper"] {
+            for template in [
+                format!("(let () (bind-name {name}) ({name} 42))"),
+                format!("((lambda () (bind-name {name}) ({name} 42)))"),
+                format!("(let () (begin (bind-name {name})) ({name} 42))"),
+                format!("(let () (bind-name {name}) ((lambda () ({name} 42))))"),
+                format!("(let () (bind-recursive {name}) ({name} #t))"),
+            ] {
+                let mut engine = Engine::new_raw_no_kernel();
+                engine
+                    .run(format!(
+                        "(define-syntax bind-name
+                           (syntax-rules () [(bind-name name) (define (name x) x)]))
+                         (define-syntax bind-recursive
+                           (syntax-rules ()
+                             [(bind-recursive name)
+                              (define (name again) (if again (name #f) 42))]))
+                         (define-syntax helper (syntax-rules () [(helper x) 7]))
+                         (define-syntax make-answer (syntax-rules () [(make-answer) {template}]))"
+                    ))
+                    .unwrap();
+                engine.register_steel_module(
+                    "unused-module".into(),
+                    "(provide unused) (define unused 0)".into(),
+                );
+                engine.register_steel_module(
+                    "nested-template-binding".into(),
+                    format!("{require} (provide answer) (define answer (make-answer))"),
+                );
+                assert_eq!(
+                    engine
+                        .run("(require \"nested-template-binding\") answer")
+                        .unwrap_or_else(|error| panic!("{require}, {template}: {error}"))
+                        .last(),
+                    Some(&SteelVal::IntV(42)),
+                    "{require}, {template}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_global_macros_respect_nested_template_parameters() {
+    for require in ["", "(require \"unused-module\")"] {
+        for name in ["struct", "define-values", "helper"] {
+            for template in [
+                format!("(bind-lambda {name} ({name} 42))"),
+                format!("(bind-let {name} ({name} 42))"),
+                format!("(bind-function {name} ({name} 42))"),
+            ] {
+                let mut engine = Engine::new_raw_no_kernel();
+                engine
+                    .run(format!(
+                        "(define-syntax bind-lambda
+                           (syntax-rules ()
+                             [(bind-lambda name body) ((lambda (name) body) (lambda (x) x))]))
+                         (define-syntax bind-let
+                           (syntax-rules ()
+                             [(bind-let name body) (let ((name (lambda (x) x))) body)]))
+                         (define-syntax bind-function
+                           (syntax-rules ()
+                             [(bind-function name body)
+                              (let () (define (call name) body) (call (lambda (x) x)))]))
+                         (define-syntax helper (syntax-rules () [(helper x) 7]))
+                         (define-syntax make-answer (syntax-rules () [(make-answer) {template}]))"
+                    ))
+                    .unwrap();
+                engine.register_steel_module(
+                    "unused-module".into(),
+                    "(provide unused) (define unused 0)".into(),
+                );
+                engine.register_steel_module(
+                    "nested-template-parameter".into(),
+                    format!("{require} (provide answer) (define answer (make-answer))"),
+                );
+                assert_eq!(
+                    engine
+                        .run("(require \"nested-template-parameter\") answer")
+                        .unwrap_or_else(|error| panic!("{require}, {template}: {error}"))
+                        .last(),
+                    Some(&SteelVal::IntV(42)),
+                    "{require}, {template}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_nested_template_bindings_preserve_free_references() {
+    for require in ["", "(require \"unused-module\")"] {
+        for (template, expected) in [
+            ("(let () (bind-name helper) (helper 42))", 42),
+            ("(let () (bind-name helper) (use-helper))", 7),
+            (
+                "(begin (let () (bind-name helper) (helper 42)) (helper 0))",
+                7,
+            ),
+            (
+                "(begin ((lambda () (bind-name helper) (helper 42))) (helper 0))",
+                7,
+            ),
+            ("(let () (bind-name helper) (let () (use-helper)))", 7),
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine
+                .run(format!(
+                    "(define-syntax bind-name
+                       (syntax-rules () [(bind-name name) (define (name x) x)]))
+                     (define-syntax helper (syntax-rules () [(helper x) 7]))
+                     (define-syntax use-helper (syntax-rules () [(use-helper) (helper 0)]))
+                     (define-syntax make-answer (syntax-rules () [(make-answer) {template}]))"
+                ))
+                .unwrap();
+            engine.register_steel_module(
+                "unused-module".into(),
+                "(provide unused) (define unused 0)".into(),
+            );
+            engine.register_steel_module(
+                "nested-template-free-reference".into(),
+                format!(
+                    "{require} (provide answer) (define (helper x) 1)
+                     (define answer (make-answer))"
+                ),
+            );
+            assert_eq!(
+                engine
+                    .run("(require \"nested-template-free-reference\") answer")
+                    .unwrap_or_else(|error| panic!("{require}, {template}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(expected)),
+                "{require}, {template}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_global_macros_respect_forward_macro_definitions() {
+    let declaration = "(define-syntax def (syntax-rules () [(def name) (define (name) 42)]))";
+    for (require, local_declaration) in [
+        ("", declaration),
+        ("(require \"unused-module\")", declaration),
+        ("(require \"definitions\")", ""),
+    ] {
+        for body in [
+            "(define (call) (helper)) (def helper)",
+            "(begin (define (call) (helper)) (def helper))",
+            "(ignore) (define (call) (helper)) (def helper)",
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine
+                .run(
+                    "(define-syntax helper (syntax-rules () [(helper) 7]))
+                     (define-syntax ignore (syntax-rules () [(ignore) 0]))",
+                )
+                .unwrap();
+            engine.register_steel_module(
+                "unused-module".into(),
+                "(provide unused) (define unused 0)".into(),
+            );
+            engine.register_steel_module(
+                "definitions".into(),
+                format!("(provide def) {declaration}"),
+            );
+            let source = format!("{require} {local_declaration} (provide call) {body}");
+            engine.register_steel_module("forward-macro-definition".into(), source.clone());
+            assert_eq!(
+                engine
+                    .run("(require \"forward-macro-definition\") (call)")
+                    .unwrap_or_else(|error| panic!("{source}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_global_macros_preserve_reference_scope() {
+    for require in ["", "(require \"unused-module\")"] {
+        for (expression, expected) in [
+            ("(use-helper)", 42),
+            ("(forward (use-helper))", 42),
+            ("(forward-helper)", 42),
+            (
+                "((lambda (forward) (forward-helper)) (lambda (value) 7))",
+                42,
+            ),
+            ("(add-helper helper)", 43),
+            ("(forward helper)", 1),
+            ("(use-local-helper)", 1),
+            ("(bind-helper)", 7),
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine.register_fn("add", |a: isize, b: isize| a + b);
+            engine
+                .run(
+                    "(define helper 42)
+                     (define-syntax use-helper (syntax-rules () [(use-helper) helper]))
+                     (define-syntax forward (syntax-rules () [(forward value) value]))
+                     (define-syntax forward-helper (syntax-rules () [(forward-helper) (forward helper)]))
+                     (define-syntax add-helper
+                       (syntax-rules () [(add-helper value) (add helper value)]))
+                     (define-syntax bind-helper
+                       (syntax-rules () [(bind-helper) (let ((helper 7)) helper)]))",
+                )
+                .unwrap();
+            engine.register_steel_module(
+                "unused-module".into(),
+                "(provide unused) (define unused 0)".into(),
+            );
+            engine.register_steel_module(
+                "global-macro-scope".into(),
+                format!(
+                    "{require} (provide answer) (define helper 1)
+                     (define-syntax use-local-helper
+                       (syntax-rules () [(use-local-helper) helper]))
+                     (define answer {expression})"
+                ),
+            );
+            assert_eq!(
+                engine
+                    .run("(require \"global-macro-scope\") answer")
+                    .unwrap_or_else(|error| panic!("{require}, {expression}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(expected)),
+                "{require}, {expression}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_global_macros_preserve_imported_private_helpers() {
+    for require in ["", "(require \"unused-module\")"] {
+        let mut engine = Engine::new_raw_no_kernel();
+        engine
+            .run("(define-syntax helper (syntax-rules () [(helper) 7]))")
+            .unwrap();
+        engine.register_steel_module(
+            "unused-module".into(),
+            "(provide unused) (define unused 0)".into(),
+        );
+        engine.register_steel_module(
+            "private-helper".into(),
+            "(provide make-answer)
+             (define value 42)
+             (define-syntax helper (syntax-rules () [(helper) value]))
+             (define-syntax make-answer (syntax-rules () [(make-answer) (helper)]))"
+                .into(),
+        );
+        engine.register_steel_module(
+            "imported-helper-scope".into(),
+            format!(
+                "{require} (require \"private-helper\") (provide answer)
+                 (define value 1) (define answer (make-answer))"
+            ),
+        );
+        assert_eq!(
+            engine
+                .run("(require \"imported-helper-scope\") answer")
+                .unwrap_or_else(|error| panic!("{require}: {error}"))
+                .last(),
+            Some(&SteelVal::IntV(42)),
+            "{require}"
+        );
+    }
+}
+
+#[test]
+fn raw_engine_module_global_template_references_escape_module_macros() {
+    for (module, expected) in [
+        // An imported module's private macro must not claim a global template's reference.
+        (
+            "(require \"private-foo\") (provide answer) (define (second a b) b)
+             (define answer (second (make-zero) (use-foo)))",
+            42,
+        ),
+        // A global macro name passed through another macro still resolves globally.
+        (
+            "(provide answer) (define answer (let ((helper (lambda () 1))) (outer)))",
+            42,
+        ),
+        (
+            "(require \"unused-module\") (provide answer)
+             (define answer (let ((helper (lambda () 1))) (outer)))",
+            42,
+        ),
+    ] {
+        let mut engine = Engine::new_raw_no_kernel();
+        engine
+            .run(
+                "(define (foo x) 42)
+                 (define-syntax use-foo (syntax-rules () [(use-foo) (foo 1)]))
+                 (define-syntax helper (syntax-rules () [(helper) 42]))
+                 (define-syntax call-it (syntax-rules () [(call-it f) (f)]))
+                 (define-syntax outer (syntax-rules () [(outer) (call-it helper)]))",
+            )
+            .unwrap();
+        engine.register_steel_module(
+            "unused-module".into(),
+            "(provide unused) (define unused 0)".into(),
+        );
+        engine.register_steel_module(
+            "private-foo".into(),
+            "(provide make-zero)
+             (define-syntax foo (syntax-rules () [(foo x) 7]))
+             (define-syntax make-zero (syntax-rules () [(make-zero) 0]))"
+                .into(),
+        );
+        engine.register_steel_module("template-reference-scope".into(), module.into());
+        assert_eq!(
+            engine
+                .run("(require \"template-reference-scope\") answer")
+                .unwrap_or_else(|error| panic!("{module}: {error}"))
+                .last(),
+            Some(&SteelVal::IntV(expected)),
+            "{module}"
+        );
+    }
+}
+
+#[test]
+fn raw_engine_module_macros_respect_optional_parameters() {
+    for require in ["", "(require \"unused-module\")"] {
+        for expression in [
+            "((lambda ((x 42)) x))",
+            "((lambda () (define (f (x 42)) x) (f)))",
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+            engine
+                .run("(require-builtin steel/lists as #%prim.) (require-builtin steel/meta as #%prim.)")
+                .unwrap();
+            engine.register_steel_module(
+                "unused-module".into(),
+                "(provide unused) (define unused 0)".into(),
+            );
+            engine.register_steel_module(
+                "module-optional-parameters".into(),
+                format!(
+                    "{require} (provide answer)
+                     (define-syntax x (syntax-rules () [(x) 7]))
+                     (define answer {expression})"
+                ),
+            );
+            assert_eq!(
+                engine
+                    .run("(require \"module-optional-parameters\") answer")
+                    .unwrap_or_else(|error| panic!("{require}, {expression}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{require}, {expression}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_global_macros_preserve_native_named_runtime_functions() {
+    for require in ["", "(require \"unused-module\")"] {
+        for name in ["struct", "define-values"] {
+            for template in [
+                format!("({name} 42)"),
+                format!("(begin ({name} 42))"),
+                format!("((lambda () ({name} 42)))"),
+                format!("(let () ({name} 42))"),
+            ] {
+                let mut engine = Engine::new_raw_no_kernel();
+                engine
+                    .run(format!(
+                        "(define ({name} value) value)
+                         (define-syntax make-answer (syntax-rules () [(make-answer) {template}]))"
+                    ))
+                    .unwrap();
+                engine.register_steel_module(
+                    "unused-module".into(),
+                    "(provide unused) (define unused 0)".into(),
+                );
+                engine.register_steel_module(
+                    "native-runtime-scope".into(),
+                    format!("{require} (provide answer) (define answer (make-answer))"),
+                );
+                assert_eq!(
+                    engine
+                        .run("(require \"native-runtime-scope\") answer")
+                        .unwrap_or_else(|error| panic!("{require}, {template}: {error}"))
+                        .last(),
+                    Some(&SteelVal::IntV(42)),
+                    "{require}, {template}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_global_macros_preserve_native_shaped_runtime_calls() {
+    for require in ["", "(require \"unused-module\")"] {
+        for (definitions, call, shadow) in [
+            (
+                "(define (x) 42) (define (define-values a b) a)",
+                "(define-values (x) 0)",
+                "(define (x) 1)",
+            ),
+            (
+                "(define x 42) (define (fields) 0) (define (struct a b) a)",
+                "(struct x (fields))",
+                "(define x 1)",
+            ),
+        ] {
+            for template in [
+                call.to_owned(),
+                format!("(begin {call})"),
+                format!("((lambda () {call}))"),
+                format!("(let () {call})"),
+            ] {
+                let mut engine = Engine::new_raw_no_kernel();
+                engine
+                    .run(format!(
+                        "{definitions}
+                         (define-syntax make-answer (syntax-rules () [(make-answer) {template}]))"
+                    ))
+                    .unwrap();
+                engine.register_steel_module(
+                    "unused-module".into(),
+                    "(provide unused) (define unused 0)".into(),
+                );
+                engine.register_steel_module(
+                    "native-runtime-scope".into(),
+                    format!("{require} (provide answer) {shadow} (define answer (make-answer))"),
+                );
+                assert_eq!(
+                    engine
+                        .run("(require \"native-runtime-scope\") answer")
+                        .unwrap_or_else(|error| panic!("{require}, {template}: {error}"))
+                        .last(),
+                    Some(&SteelVal::IntV(42)),
+                    "{require}, {template}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_global_macros_respect_pending_native_named_functions() {
+    for require in ["", "(require \"unused-module\")"] {
+        for (definitions, call) in [
+            ("(define (struct value) value)", "(struct 42)"),
+            ("(define (define-values value) value)", "(define-values 42)"),
+            (
+                "(define (x) 42) (define (define-values a b) a)",
+                "(define-values (x) 0)",
+            ),
+            (
+                "(define x 42) (define (fields) 0) (define (struct a b) a)",
+                "(struct x (fields))",
+            ),
+        ] {
+            for template in [
+                call.to_owned(),
+                format!("(begin {call})"),
+                format!("((lambda () {call}))"),
+                format!("(let () {call})"),
+            ] {
+                let mut engine = Engine::new_raw_no_kernel();
+                engine.register_steel_module(
+                    "unused-module".into(),
+                    "(provide unused) (define unused 0)".into(),
+                );
+                engine.register_steel_module(
+                    "pending-native-scope".into(),
+                    format!(
+                        "{require} (provide answer)
+                         (define (struct value) 1) (define (define-values value) 1)
+                         (define x 1) (define (answer) (make-answer))"
+                    ),
+                );
+                assert_eq!(
+                    engine
+                        .run(format!(
+                            "{definitions}
+                             (define-syntax make-answer
+                               (syntax-rules () [(make-answer) {template}]))
+                             (require \"pending-native-scope\") (answer)"
+                        ))
+                        .unwrap_or_else(|error| panic!("{require}, {template}: {error}"))
+                        .last(),
+                    Some(&SteelVal::IntV(42)),
+                    "{require}, {template}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_global_macros_do_not_invent_native_bindings() {
+    for require in ["", "(require \"unused-module\")"] {
+        for (name, call) in [
+            ("struct", "(struct marker ())"),
+            ("define-values", "(define-values (marker) 0)"),
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine
+                .run(format!(
+                    "(define marker 42)
+                     (define-syntax {name} (syntax-rules () [({name} a b) 0]))
+                     (define-syntax make-answer
+                       (syntax-rules () [(make-answer) (begin {call} marker)]))"
+                ))
+                .unwrap();
+            engine.register_steel_module(
+                "unused-module".into(),
+                "(provide unused) (define unused 0)".into(),
+            );
+            engine.register_steel_module(
+                "native-macro-scope".into(),
+                format!(
+                    "{require} (provide answer) (define marker 7) (define answer (make-answer))"
+                ),
+            );
+            assert_eq!(
+                engine
+                    .run("(require \"native-macro-scope\") answer")
+                    .unwrap_or_else(|error| panic!("{require}, {name}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{require}, {name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_global_macros_preserve_template_builtin_imports() {
+    for require in ["", "(require \"unused-module\")"] {
+        for (template, expected) in [
+            ("(let () (require-builtin steel/numbers) (+ 20 22))", 42),
+            (
+                "((lambda () (require-builtin steel/numbers) (+ 20 22)))",
+                42,
+            ),
+            (
+                "(let () (require-builtin steel/numbers as n:) (n:+ 20 22))",
+                42,
+            ),
+            (
+                "((lambda () (require-builtin \"steel/numbers\" as n:) (n:+ 20 22)))",
+                42,
+            ),
+            (
+                "((lambda () (define (f) (+ 20 22)) (require-builtin steel/numbers) (f)))",
+                42,
+            ),
+            (
+                "(let () (require-builtin steel/numbers) (let () (+ 20 22)))",
+                42,
+            ),
+            (
+                "(begin (let () (require-builtin steel/numbers) (+ 20 22)) (+ 20 22))",
+                7,
+            ),
+            (
+                "(begin ((lambda () (require-builtin steel/numbers) (+ 20 22))) (+ 20 22))",
+                7,
+            ),
+            (
+                "(begin (let () (require-builtin steel/numbers as n:) (n:+ 20 22)) (n:+ 20 22))",
+                7,
+            ),
+            (
+                "(let () (require-builtin steel/numbers as n:) (+ 20 22))",
+                7,
+            ),
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+            engine
+                .run(format!(
+                    "(define (+ a b) 7) (define (n:+ a b) 7)
+                     (define-syntax make-answer (syntax-rules () [(make-answer) {template}]))"
+                ))
+                .unwrap();
+            engine.register_steel_module(
+                "unused-module".into(),
+                "(provide unused) (define unused 0)".into(),
+            );
+            engine.register_steel_module(
+                "template-builtin-scope".into(),
+                format!(
+                    "{require} (provide answer) (define (+ a b) 1) (define (n:+ a b) 1)
+                     (define answer (make-answer))"
+                ),
+            );
+            assert_eq!(
+                engine
+                    .run("(require \"template-builtin-scope\") answer")
+                    .unwrap_or_else(|error| panic!("{require}, {template}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(expected)),
+                "{require}, {template}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_global_macros_preserve_template_top_level_builtin_imports() {
+    for require in ["", "(require \"unused-module\")"] {
+        let mut engine = Engine::new_raw_no_kernel();
+        crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+        engine
+            .run(
+                "(define (+ a b) 7)
+                     (define-syntax make-answer
+                       (syntax-rules ()
+                         [(make-answer result)
+                          (begin (require-builtin steel/numbers) (define result (+ 20 22)))]))",
+            )
+            .unwrap();
+        engine.register_steel_module(
+            "unused-module".into(),
+            "(provide unused) (define unused 0)".into(),
+        );
+        engine.register_steel_module(
+            "template-top-level-imports".into(),
+            format!(
+                "{require} (provide answer)
+                     (define-syntax + (syntax-rules () [(+ a b) 1]))
+                     (make-answer answer)"
+            ),
+        );
+        assert_eq!(
+            engine
+                .run("(require \"template-top-level-imports\") answer")
+                .unwrap_or_else(|error| panic!("{require}: {error}"))
+                .last(),
+            Some(&SteelVal::IntV(42)),
+            "{require}"
+        );
+    }
+}
+
+#[test]
+fn raw_engine_module_global_macros_preserve_optional_parameters() {
+    for require in ["", "(require \"unused-module\")"] {
+        for (macro_definition, default_expression, default_expected) in [
+            ("(define-syntax x (syntax-rules () [(x) 7]))", "(x)", 7),
+            (
+                "(define-syntax x (syntax-rules () [(x value) value]))",
+                "(x 42)",
+                42,
+            ),
+        ] {
+            for expression in [
+                "((lambda ((x 42)) x))",
+                "((lambda ((x 7)) x) 42)",
+                "((lambda (#:x (x 42)) x))",
+                "((lambda (#:x (x 7)) x) #:x 42)",
+                "((lambda (#:x x) x) #:x 42)",
+                "((lambda ((x (answer-value))) x))",
+                "((lambda (#:x (x (answer-value))) x))",
+                "((lambda ((x (lambda () 42))) (x)))",
+                "((lambda () (define (f (x (answer-value))) x) (f)))",
+            ] {
+                let mut engine = Engine::new_raw_no_kernel();
+                crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+                engine
+                    .run("(require-builtin steel/lists as #%prim.) (require-builtin steel/meta as #%prim.)")
+                    .unwrap();
+                engine.run(macro_definition).unwrap();
+                engine
+                    .run("(define-syntax answer-value (syntax-rules () [(answer-value) 42]))")
+                    .unwrap();
+                engine.register_steel_module(
+                    "unused-module".into(),
+                    "(provide unused) (define unused 0)".into(),
+                );
+                engine.register_steel_module(
+                    "optional-parameters".into(),
+                    format!(
+                        "{require} (provide answer default-answer) (define answer {expression})
+                         (define default-answer ((lambda ((x {default_expression})) x)))"
+                    ),
+                );
+                assert_eq!(
+                    engine
+                        .run("(require \"optional-parameters\") answer")
+                        .unwrap_or_else(|error| panic!(
+                            "{require}, {macro_definition}, {expression}: {error}"
+                        ))
+                        .last(),
+                    Some(&SteelVal::IntV(42)),
+                    "{require}, {macro_definition}, {expression}"
+                );
+                assert_eq!(
+                    engine.run("default-answer").unwrap().last(),
+                    Some(&SteelVal::IntV(default_expected)),
+                    "{require}, {macro_definition}, {default_expression}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_global_macros_preserve_template_binding_scope() {
+    for require in ["", "(require \"unused-module\")"] {
+        for (template, expected) in [
+            ("((lambda ((x 42)) x))", 42),
+            ("((lambda ((x 7)) x) 42)", 42),
+            ("((lambda (#:x (x 42)) x))", 42),
+            ("((lambda (#:x (x 7)) x) #:x 42)", 42),
+            ("((lambda (#:x x) x) #:x 42)", 42),
+            ("((lambda ((x x)) x))", 7),
+            ("((lambda (#:x (x x)) x))", 7),
+            ("((lambda ((y x) (x 1)) y))", 7),
+            ("((lambda (#:y (y x) #:x (x 1)) y))", 7),
+            ("(begin ((lambda ((x 42)) x)) x)", 7),
+            ("((lambda () (define (f (x 42)) x) (f)))", 42),
+            ("((lambda () (define x 42) x))", 42),
+            ("((lambda () (define (f) x) (define x 42) (f)))", 42),
+            ("((lambda () (define (f (y x)) y) (define x 42) (f)))", 42),
+            ("(begin ((lambda () (define x 42) x)) x)", 7),
+            ("(let ((x 42)) x)", 42),
+            ("((lambda () (struct point (x)) (point-x (point 42))))", 42),
+            ("(let () (struct point (x)) (point-x (point 42)))", 42),
+            (
+                "((lambda () (define (f) (point-x (point 42))) (struct point (x)) (f)))",
+                42,
+            ),
+            (
+                "(begin ((lambda () (struct point (x)) (point-x (point 42)))) (point-x 0))",
+                7,
+            ),
+            (
+                "(begin (let () (struct point (x)) (point-x (point 42))) (point-x 0))",
+                7,
+            ),
+            ("((lambda (x (y x)) y) 42)", 42),
+            ("((lambda (x #:y (y x)) y) 42)", 42),
+            ("(let ((x x)) x)", 7),
+            ("(begin (let ((x 42)) x) x)", 7),
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+            engine
+                .run("(require-builtin steel/lists as #%prim.) (require-builtin steel/meta as #%prim.)")
+                .unwrap();
+            engine
+                .run(format!(
+                    "(define x 7) (define (point-x value) 7)
+                     (define-syntax make-answer (syntax-rules () [(make-answer) {template}]))"
+                ))
+                .unwrap();
+            engine.register_steel_module(
+                "unused-module".into(),
+                "(provide unused) (define unused 0)".into(),
+            );
+            engine.register_steel_module(
+                "template-binding-scope".into(),
+                format!(
+                    "{require} (provide answer) (define x 1) (define (point-x value) 1)
+                     (define answer (make-answer))"
+                ),
+            );
+            assert_eq!(
+                engine
+                    .run("(require \"template-binding-scope\") answer")
+                    .unwrap_or_else(|error| panic!("{require}, {template}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(expected)),
+                "{require}, {template}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_global_macros_match_literals_against_module_bindings() {
+    for require in ["", "(require \"unused-module\")"] {
+        for binding in [
+            "(define tag 0)",
+            "(require \"tags\")",
+            "(struct tag ())",
+            "(define-values (tag) 0)",
+        ] {
+            for body in [
+                format!("{binding} (define answer (classify tag))"),
+                format!("(define (call) (classify tag)) {binding} (define answer (call))"),
+            ] {
+                let mut engine = Engine::new_raw_no_kernel();
+                engine
+                    .run(
+                        "(define-syntax classify
+                           (syntax-rules (tag) [(classify tag) 1] [(classify other) 2]))",
+                    )
+                    .unwrap();
+                engine.register_steel_module(
+                    "unused-module".into(),
+                    "(provide unused) (define unused 0)".into(),
+                );
+                engine.register_steel_module("tags".into(), "(provide tag) (define tag 0)".into());
+                engine.register_steel_module(
+                    "literal-module-bindings".into(),
+                    format!("{require} (provide answer) {body}"),
+                );
+                assert_eq!(
+                    engine
+                        .run("(require \"literal-module-bindings\") answer")
+                        .unwrap_or_else(|error| panic!("{require}, {body}: {error}"))
+                        .last(),
+                    Some(&SteelVal::IntV(2)),
+                    "{require}, {body}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_global_macros_preserve_literal_reference_scope() {
+    for require in ["", "(require \"unused-module\")"] {
+        for (expression, expected) in [
+            ("(outer)", 1),
+            ("(outer-via-forward)", 1),
+            ("(forward tag)", 2),
+            ("(let ((tag 0)) (outer))", 1),
+            ("(let ((tag 0)) (forward tag))", 2),
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine
+                .run(
+                    "(define-syntax classify
+                       (syntax-rules (tag) [(classify tag) 1] [(classify other) 2]))
+                     (define-syntax outer (syntax-rules () [(outer) (classify tag)]))
+                     (define-syntax forward
+                       (syntax-rules () [(forward value) (classify value)]))
+                     (define-syntax outer-via-forward
+                       (syntax-rules () [(outer-via-forward) (forward tag)]))",
+                )
+                .unwrap();
+            engine.register_steel_module(
+                "unused-module".into(),
+                "(provide unused) (define unused 0)".into(),
+            );
+            engine.register_steel_module(
+                "literal-reference-scope".into(),
+                format!("{require} (provide answer) (define tag 0) (define answer {expression})"),
+            );
+            assert_eq!(
+                engine
+                    .run("(require \"literal-reference-scope\") answer")
+                    .unwrap_or_else(|error| panic!("{require}, {expression}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(expected)),
+                "{require}, {expression}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_global_macros_preserve_lexical_reference_scope() {
+    for require in ["", "(require \"unused-module\")"] {
+        for (expression, expected) in [
+            ("(let ((helper 1)) (use-helper))", 42),
+            ("((lambda (helper) (use-helper)) 1)", 42),
+            ("(let ((helper 1)) (forward (use-helper)))", 42),
+            ("(let ((helper 1)) (forward helper))", 1),
+            ("(let ((helper 1)) (bind-helper))", 7),
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine
+                .run(
+                    "(define helper 42)
+                     (define-syntax use-helper (syntax-rules () [(use-helper) helper]))
+                     (define-syntax forward (syntax-rules () [(forward value) value]))
+                     (define-syntax bind-helper
+                       (syntax-rules () [(bind-helper) (let ((helper 7)) helper)]))",
+                )
+                .unwrap();
+            engine.register_steel_module(
+                "unused-module".into(),
+                "(provide unused) (define unused 0)".into(),
+            );
+            engine.register_steel_module(
+                "lexical-reference-scope".into(),
+                format!("{require} (provide answer) (define answer {expression})"),
+            );
+            assert_eq!(
+                engine
+                    .run("(require \"lexical-reference-scope\") answer")
+                    .unwrap_or_else(|error| panic!("{require}, {expression}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(expected)),
+                "{require}, {expression}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_global_macros_respect_builtin_imports() {
+    for require in ["", "(require \"unused-module\")"] {
+        for (body, expected) in [
+            ("(require-builtin steel/numbers) (define answer (+ 20 22))", 42),
+            ("(begin (require-builtin steel/numbers) (define answer (+ 20 22)))", 42),
+            ("(define answer (let () (require-builtin steel/numbers) (+ 20 22)))", 42),
+            ("(define answer ((lambda () (require-builtin steel/numbers) (+ 20 22))))", 42),
+            ("(require-builtin \"steel/numbers\") (define answer (+ 20 22))", 42),
+            ("(define answer ((lambda () (require-builtin steel/numbers as n:) (n:+ 20 22))))", 42),
+            ("(define answer (let () (require-builtin \"steel/numbers\" as n:) (n:+ 20 22)))", 42),
+            ("(let () (require-builtin steel/numbers) (+ 20 22)) (define answer (+ 20 22))", 7),
+            ("(define answer (begin ((lambda () (require-builtin steel/numbers) (+ 20 22))) (+ 20 22)))", 7),
+            ("(define answer (begin (let () (require-builtin steel/numbers) (+ 20 22)) (+ 20 22)))", 7),
+            ("(require-builtin steel/numbers as n:) (define answer (+ 20 22))", 7),
+            ("(define answer ((lambda () (import-numbers) (+ 20 22))))", 42),
+            ("(begin (require-builtin steel/numbers) (define answer (global-add)))", 7),
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+            engine
+                .run(
+                    "(define-syntax + (syntax-rules () [(+ a b) 7]))
+                     (define-syntax n:+ (syntax-rules () [(n:+ a b) 7]))
+                     (define-syntax global-add (syntax-rules () [(global-add) (+ 20 22)]))
+                     (define-syntax import-numbers
+                       (syntax-rules () [(import-numbers) (require-builtin steel/numbers)]))",
+                )
+                .unwrap();
+            engine.register_steel_module(
+                "unused-module".into(),
+                "(provide unused) (define unused 0)".into(),
+            );
+            engine.register_steel_module(
+                "builtin-import-scope".into(),
+                format!("{require} (provide answer) {body}"),
+            );
+            assert_eq!(
+                engine
+                    .run("(require \"builtin-import-scope\") answer")
+                    .unwrap_or_else(|error| panic!("{require}, {body}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(expected)),
+                "{require}, {body}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_global_macros_preserve_binding_errors() {
+    use crate::rerrs::ErrorKind::{ArityMismatch, BadSyntax};
+
+    for require in ["", "(require \"unused-module\")"] {
+        for (expression, kind, message) in [
+            (
+                "(lambda ((x 1 2)) x)",
+                BadSyntax,
+                "malformed default argument",
+            ),
+            (
+                "(lambda (#:x (x)) x)",
+                BadSyntax,
+                "Missing default argument for keyword",
+            ),
+            (
+                "(lambda (#:x) 42)",
+                BadSyntax,
+                "keyword arg missing variable name",
+            ),
+            (
+                "(lambda ((x 1) y) x)",
+                BadSyntax,
+                "positional arg without default",
+            ),
+            (
+                "(require-builtin)",
+                ArityMismatch,
+                "require-builtin malformed",
+            ),
+            (
+                "(require-builtin 42)",
+                ArityMismatch,
+                "require-builtin malformed",
+            ),
+            (
+                "(require-builtin steel/numbers as)",
+                ArityMismatch,
+                "require-builtin malformed",
+            ),
+            (
+                "(require-builtin steel/numbers as \"n:\")",
+                ArityMismatch,
+                "require-builtin malformed",
+            ),
+            (
+                "(require-builtin missing-module)",
+                BadSyntax,
+                "require-builtin: module not found: missing-module",
+            ),
+            (
+                "(require-builtin \"missing-module\" as n:)",
+                BadSyntax,
+                "require-builtin: module not found: missing-module",
+            ),
+        ] {
+            for body in [expression, "(invalid-binding)"] {
+                let mut engine = Engine::new_raw_no_kernel();
+                crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+                engine
+                    .run(format!(
+                        "(define-syntax x (syntax-rules () [(x) 7]))
+                     (define-syntax invalid-binding
+                       (syntax-rules () [(invalid-binding) {expression}]))"
+                    ))
+                    .unwrap();
+                engine.register_steel_module(
+                    "unused-module".into(),
+                    "(provide unused) (define unused 0)".into(),
+                );
+                engine.register_steel_module(
+                    "binding-errors".into(),
+                    format!("{require} (provide answer) (define answer {body})"),
+                );
+                let error = engine.run("(require \"binding-errors\")").unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    kind,
+                    "{require}, {expression}, {body}: {error}"
+                );
+                assert!(
+                    error.to_string().contains(message),
+                    "{require}, {expression}, {body}: {error}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_global_macros_preserve_native_bindings() {
+    for require in ["", "(require \"unused-module\")"] {
+        for body in [
+            "(struct point (x)) (point-x (point 42))",
+            "(define-values (x) 42) x",
+            "(define-values (x) (answer-value)) x",
+            "(let () (struct point (x)) (point-x (point 42)))",
+            "(let () (define-values (x) 42) x)",
+            "(begin (struct point (x)) (point-x (point 42)))",
+            "(begin (define-values (x) 42) x)",
+            "(define-values (x) (lambda () 42)) (x)",
+            "(let ((struct (lambda (value) value))) (struct (answer-value)))",
+            "(let ((define-values (lambda (value) value))) (define-values (answer-value)))",
+            "(make-point point x) (point-x (point 42))",
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine
+                .run(
+                    "(define-syntax x (syntax-rules () [(x) 7]))
+                     (define-syntax answer-value (syntax-rules () [(answer-value) 42]))
+                     (define-syntax make-point
+                       (syntax-rules () [(make-point name field) (struct name (field))]))",
+                )
+                .unwrap();
+            engine.register_steel_module(
+                "unused-module".into(),
+                "(provide unused) (define unused 0)".into(),
+            );
+            engine.register_steel_module(
+                "global-macro-bindings".into(),
+                format!("{require} (provide answer) (define (f) {body}) (define answer (f))"),
+            );
+            assert_eq!(
+                engine
+                    .run("(require \"global-macro-bindings\") answer")
+                    .unwrap_or_else(|error| panic!("{require}, {body}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{require}, {body}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_native_forms_preserve_value_precedence_over_global_macros() {
+    for name in ["struct", "define-values"] {
+        for definition in [
+            format!("(define ({name} x) x)"),
+            "(require \"native-functions\")".to_owned(),
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine
+                .run(format!(
+                    "(define-syntax {name} (syntax-rules () [({name} x) 1]))"
+                ))
+                .unwrap();
+            engine.register_steel_module(
+                "native-functions".into(),
+                format!("(provide {name}) (define ({name} x) x)"),
+            );
+            engine.register_steel_module(
+                "native-shadowing".into(),
+                format!(
+                    "{definition} (provide answer) ({name} 42)
+                         (define (call) ({name} 42)) (define answer (call))"
+                ),
+            );
+            assert_eq!(
+                engine
+                    .run("(require \"native-shadowing\") answer")
+                    .unwrap_or_else(|error| panic!("{name}, {definition}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{name}, {definition}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_native_forms_respect_runtime_imports() {
+    for (name, prefix, suffix) in [
+        ("struct", "st", "ruct"),
+        ("define-values", "define-", "values"),
+    ] {
+        for (exported, require) in [
+            (name, "\"native-functions\"".to_owned()),
+            (name, format!("(only-in \"native-functions\" {name})")),
+            (
+                "identity",
+                format!("(only-in \"native-functions\" (identity {name}))"),
+            ),
+            (suffix, format!("(prefix-in {prefix} \"native-functions\")")),
+            (
+                "identity",
+                format!("(prefix-in {prefix} (only-in \"native-functions\" (identity {suffix})))"),
+            ),
+        ] {
+            // Contract exports use this spec after their contract macro has expanded.
+            for provide in [
+                exported.to_owned(),
+                format!("(%require-ident-spec {exported} {exported})"),
+            ] {
+                let mut engine = Engine::new_raw_no_kernel();
+                engine.register_steel_module(
+                    "native-functions".into(),
+                    format!(
+                        "(provide {provide} unused) (define ({exported} x) x) (define unused 0)"
+                    ),
+                );
+                engine.register_steel_module(
+                    "native-imports".into(),
+                    format!(
+                        "(require {require}) (provide answer) ({name} 42)
+                             (define (call) ({name} 42)) (define answer (call))"
+                    ),
+                );
+                assert_eq!(
+                    engine
+                        .run("(require \"native-imports\") answer")
+                        .unwrap_or_else(|error| panic!("{provide}, {require}: {error}"))
+                        .last(),
+                    Some(&SteelVal::IntV(42)),
+                    "{provide}, {require}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_native_forms_ignore_unbound_import_names() {
+    for require in [
+        "(only-in \"native-functions\" unused)",
+        "(only-in \"native-functions\" (struct make-struct) (define-values make-values))",
+        "(prefix-in imported: \"native-functions\")",
+        "(only-in \"native-macro\" (struct bind-answer))",
+    ] {
+        let mut engine = Engine::new_raw_no_kernel();
+        engine.register_steel_module(
+            "native-functions".into(),
+            "(provide struct define-values unused)
+             (define (struct x) x) (define (define-values x) x) (define unused 0)"
+                .into(),
+        );
+        engine.register_steel_module(
+            "native-macro".into(),
+            "(provide struct)
+             (define-syntax struct (syntax-rules () [(struct name) (define name 1)]))"
+                .into(),
+        );
+        engine.register_steel_module(
+            "native-imports".into(),
+            format!(
+                "(require {require}) (provide answer)
+                     (struct point (x)) (define-values (answer) (point-x (point 42)))"
+            ),
+        );
+        assert_eq!(
+            engine
+                .run("(require \"native-imports\") answer")
+                .unwrap_or_else(|error| panic!("{require}: {error}"))
+                .last(),
+            Some(&SteelVal::IntV(42)),
+            "{require}"
+        );
+    }
+}
+
+#[test]
+fn raw_engine_lifted_module_macros_do_not_claim_global_template_references() {
+    for (setup, main, expected) in [
+        (
+            "(require \"lifted\")
+             (define (foo x) 42)
+             (define-syntax use-foo (syntax-rules () [(use-foo) (foo 1)]))",
+            "(require \"global-reference\") (answer)",
+            42,
+        ),
+        (
+            "",
+            "(require \"lifted\")
+             (define (foo x) 42)
+             (define-syntax use-foo (syntax-rules () [(use-foo) (foo 1)]))
+             (require \"global-reference\")
+             (answer)",
+            42,
+        ),
+        // A lifted macro's own template still reaches its module's private macros.
+        (
+            "(require \"lifted\") (define-syntax use-foo (syntax-rules () [(use-foo) (use-it)]))",
+            "(require \"global-reference\") (answer)",
+            7,
+        ),
+    ] {
+        let mut engine = Engine::new_raw_no_kernel();
+        engine.register_steel_module(
+            "lifted".into(),
+            "(provide use-it)
+             (define-syntax foo (syntax-rules () [(foo x) 7]))
+             (define-syntax use-it (syntax-rules () [(use-it) (foo 0)]))"
+                .into(),
+        );
+        engine.register_steel_module(
+            "global-reference".into(),
+            "(provide answer) (define (answer) (use-foo))".into(),
+        );
+        if !setup.is_empty() {
+            engine.run(setup).unwrap();
+        }
+        assert_eq!(
+            engine
+                .run(main)
+                .unwrap_or_else(|error| panic!("{main}: {error}"))
+                .last(),
+            Some(&SteelVal::IntV(expected)),
+            "{main}"
+        );
+    }
+}
+
+#[test]
+fn raw_engine_module_top_level_definitions_shadow_module_macros() {
+    let declaration = "(define-syntax foo (syntax-rules () [(foo) (undefined-function)]))";
+    for (require, local_declaration) in [("", declaration), ("(require \"foo-macro\")", "")] {
+        for prefix in ["", "(ignore)"] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine
+                .run("(define-syntax ignore (syntax-rules () [(ignore) 0]))")
+                .unwrap();
+            engine
+                .register_steel_module("foo-macro".into(), format!("(provide foo) {declaration}"));
+            let source = format!(
+                "{require} (provide answer) {local_declaration} {prefix}
+                 (define answer 0) (define (foo) (set! answer 42)) (foo)"
+            );
+            engine.register_steel_module("top-level-shadow".into(), source.clone());
+            assert_eq!(
+                engine
+                    .run("(require \"top-level-shadow\") answer")
+                    .unwrap_or_else(|error| panic!("{source}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_deferred_begin_definitions_shadow_macros() {
+    let declaration = "(define-syntax foo (syntax-rules () [(foo) (undefined-function)]))";
+    for (require, local_declaration) in [("", declaration), ("(require \"foo-macro\")", "")] {
+        for prefix in ["", "(ignore)"] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine
+                .run("(define-syntax ignore (syntax-rules () [(ignore) 0]))")
+                .unwrap();
+            engine
+                .register_steel_module("foo-macro".into(), format!("(provide foo) {declaration}"));
+            let source = format!(
+                "{require} (provide answer) {local_declaration} (define answer 0) {prefix}
+                 (begin (define (foo) (set! answer 42)) (foo))"
+            );
+            engine.register_steel_module("begin-shadow".into(), source.clone());
+            assert_eq!(
+                engine
+                    .run("(require \"begin-shadow\") answer")
+                    .unwrap_or_else(|error| panic!("{source}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_deferred_private_macros_stay_in_their_expansion() {
+    for definition in [
+        "(define-syntax foo (syntax-rules () [(foo x) 42]))",
+        "(define (foo x) 42)",
+    ] {
+        for prefix in ["", "(ignore)"] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine
+                .run("(define-syntax ignore (syntax-rules () [(ignore) 0]))")
+                .unwrap();
+            engine.register_steel_module(
+                "private-foo".into(),
+                "(provide use-it)
+                 (define-syntax foo (syntax-rules () [(foo x) 7]))
+                 (define-syntax use-it (syntax-rules () [(use-it) (foo 0)]))"
+                    .into(),
+            );
+            let source = format!(
+                "(require \"private-foo\") (provide answer) {definition} {prefix}
+                 (begin (use-it) (define answer (foo 1)))"
+            );
+            engine.register_steel_module("private-scope".into(), source.clone());
+            assert_eq!(
+                engine
+                    .run("(require \"private-scope\") answer")
+                    .unwrap_or_else(|error| panic!("{source}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_native_forms_ignore_runtime_bindings() {
+    for name in ["struct", "define-values"] {
+        for body in [
+            "(struct point (x)) (define answer (point-x (point 42)))",
+            "(define-values (answer) 42)",
+            "(define (f) (struct point (x)) (point-x (point 42))) (define answer (f))",
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine.run(format!("(define ({name} a b) 0)")).unwrap();
+            engine
+                .register_steel_module("runtime-shadow".into(), format!("(provide answer) {body}"));
+            assert_eq!(
+                engine
+                    .run("(require \"runtime-shadow\") answer")
+                    .unwrap_or_else(|error| panic!("{name}, {body}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{name}, {body}"
+            );
+        }
     }
 }
 

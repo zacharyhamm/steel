@@ -6,8 +6,9 @@ use crate::{
     parser::{
         ast::{Atom, Begin, Define, ExprKind, List, Quote},
         expand_visitor::{
-            expand_kernel_in_env, expand_kernel_in_env_with_change, predeclare_native_definitions,
-            prepare_native_globals, ExpanderMany, GlobalMap, RequiredMacroMap,
+            expand_kernel_in_env, expand_kernel_in_env_with_change, is_begin_head,
+            predeclare_native_definitions, prepare_native_globals, ExpanderMany, GlobalMap,
+            RequiredMacroMap,
         },
         interner::InternedString,
         kernel::Kernel,
@@ -47,7 +48,7 @@ use crate::stop;
 
 use crate::time::SystemTime;
 
-use crate::parser::expand_visitor::{expand, extract_macro_defs};
+use crate::parser::expand_visitor::{expand, expand_module_scoped, extract_macro_defs};
 
 use super::{
     compiler::KernelDefMacroSpec,
@@ -322,6 +323,7 @@ impl ModuleManager {
         kernel: &mut Option<Kernel>,
         sources: &mut Sources,
         builtin_modules: ModuleContainer,
+        global_bindings: GlobalMap,
     ) -> Result<()> {
         self.visited.clear();
 
@@ -336,6 +338,7 @@ impl ModuleManager {
             kernel,
             builtin_modules,
             global_macro_map,
+            global_bindings,
             &self.custom_builtins,
             &[],
             &self.module_resolvers,
@@ -377,6 +380,8 @@ impl ModuleManager {
         // which we do not want
         extract_macro_defs(&mut exprs, global_macro_map, global_map)?;
 
+        // Required modules expand before these definitions enter the runtime symbol map.
+        let pending_globals = collect_globals(&exprs);
         let mut module_builder = ModuleBuilder::main(
             path,
             exprs,
@@ -387,6 +392,7 @@ impl ModuleManager {
             kernel,
             builtin_modules,
             global_macro_map,
+            GlobalMap::Layered(global_map, &pending_globals),
             &self.custom_builtins,
             search_dirs,
             &self.module_resolvers,
@@ -1984,6 +1990,7 @@ struct ModuleBuilder<'a> {
     kernel: &'a mut Option<Kernel>,
     builtin_modules: ModuleContainer,
     global_macro_map: &'a FxHashMap<InternedString, SteelMacro>,
+    global_bindings: GlobalMap<'a>,
     custom_builtins: &'a HashMap<String, String>,
     search_dirs: &'a [PathBuf],
     module_resolvers: &'a [Arc<dyn SourceModuleResolver>],
@@ -2004,13 +2011,23 @@ pub struct RequiredModuleMacros {
 // binding a native form's name itself still lowers natively.
 fn predeclare_native_bindings(
     ast: &[ExprKind],
+    global_bindings: GlobalMap,
     native_heads: &FxHashSet<InternedString>,
     native_globals: &mut FxHashSet<InternedString>,
     is_macro: &dyn Fn(&InternedString) -> bool,
 ) {
-    predeclare_native_definitions(ast, native_heads, is_macro, &mut |name| {
-        native_globals.insert(name);
-    });
+    predeclare_native_definitions(
+        ast,
+        &|name| native_heads.contains(name),
+        // Module heads see only the module's bindings, and global template heads see
+        // `global_bindings`.
+        GlobalMap::Scoped(&global_bindings, &FxHashSet::default()),
+        is_macro,
+        None,
+        &mut |name| {
+            native_globals.insert(name);
+        },
+    );
 }
 
 // Prepare native heads from `ast[index]` up to the next macro call, recording their definitions
@@ -2018,15 +2035,44 @@ fn predeclare_native_bindings(
 fn prepare_native_heads(
     ast: &mut [ExprKind],
     index: usize,
+    global_bindings: GlobalMap,
     native_heads: &mut FxHashSet<InternedString>,
     native_globals: &mut FxHashSet<InternedString>,
     is_macro: &dyn Fn(&InternedString) -> bool,
 ) -> Result<usize> {
-    let count = prepare_native_globals(&mut ast[index..], None, native_heads, is_macro)?;
+    let count = prepare_native_globals(
+        &mut ast[index..],
+        GlobalMap::Scoped(&global_bindings, native_heads),
+        is_macro,
+    )?;
     collect_defines(&ast[index..index + count], &mut |name| {
+        native_heads.insert(name);
         native_globals.insert(name);
     });
     Ok(index + count)
+}
+
+// The deferred pass must process nested top-level begins in statement order too.
+fn flatten_module_begins(ast: &mut Vec<ExprKind>) -> Result<()> {
+    let mut pending = core::mem::take(ast);
+    pending.reverse();
+    while let Some(expr) = pending.pop() {
+        match expr {
+            ExprKind::Begin(begin) if !begin.exprs.is_empty() => {
+                pending.extend(begin.exprs.into_iter().rev());
+            }
+            ExprKind::List(list) if list.len() > 1 && list.first().is_some_and(is_begin_head) => {
+                pending.extend(
+                    list.args_proper(TokenType::Begin)?
+                        .into_iter()
+                        .skip(1)
+                        .rev(),
+                );
+            }
+            expr => ast.push(expr),
+        }
+    }
+    Ok(())
 }
 
 impl<'a> ModuleBuilder<'a> {
@@ -2042,6 +2088,7 @@ impl<'a> ModuleBuilder<'a> {
         kernel: &'a mut Option<Kernel>,
         builtin_modules: ModuleContainer,
         global_macro_map: &'a FxHashMap<InternedString, SteelMacro>,
+        global_bindings: GlobalMap<'a>,
         custom_builtins: &'a HashMap<String, String>,
         search_dirs: &'a [PathBuf],
         module_resolvers: &'a [Arc<dyn SourceModuleResolver>],
@@ -2077,6 +2124,7 @@ impl<'a> ModuleBuilder<'a> {
             kernel,
             builtin_modules,
             global_macro_map,
+            global_bindings,
             custom_builtins,
             search_dirs,
             module_resolvers,
@@ -2209,6 +2257,7 @@ impl<'a> ModuleBuilder<'a> {
                     self.kernel,
                     self.builtin_modules.clone(),
                     self.global_macro_map,
+                    self.global_bindings,
                     self.custom_builtins,
                     self.module_resolvers,
                     self.prelude_string,
@@ -2322,6 +2371,7 @@ impl<'a> ModuleBuilder<'a> {
                     self.kernel,
                     self.builtin_modules.clone(),
                     self.global_macro_map,
+                    self.global_bindings,
                     self.custom_builtins,
                     self.search_dirs,
                     self.module_resolvers,
@@ -2380,19 +2430,69 @@ impl<'a> ModuleBuilder<'a> {
         let loaded_syntax_transformers = prev_length != ast.len();
 
         // Native heads see only the definitions before them, while bodies see every definition.
+        // Only native forms without a kernel need the imported bindings.
         let mut native_heads = FxHashSet::default();
-        let mut native_globals = FxHashSet::default();
-        if self.kernel.is_none()
-            && (self.macro_map.contains_key(&"define-values".into())
-                || self.global_macro_map.contains_key(&"define-values".into()))
-        {
-            native_heads.insert("define-values".into());
-            native_globals.insert("define-values".into());
+        let native_requires = match self.kernel {
+            None => self.require_objects.as_slice(),
+            Some(_) => &[],
+        };
+        for require in native_requires {
+            let explicit_imports = require
+                .idents_to_import
+                .iter()
+                .map(|ident| {
+                    let (from, to) = match ident {
+                        MaybeRenamed::Normal(name) => (name, name),
+                        MaybeRenamed::Renamed(from, to) => (from, to),
+                    };
+                    (
+                        *from.atom_identifier().unwrap(),
+                        *to.atom_identifier().unwrap(),
+                    )
+                })
+                .collect::<FxHashMap<_, _>>();
+            let module = self
+                .compiled_modules
+                .compiled_modules
+                .get(require.path.get_path().as_ref())
+                .unwrap();
+            for provide in module
+                .provides
+                .iter()
+                .flat_map(|expr| &expr.list().unwrap().args[1..])
+            {
+                let name = match provide {
+                    ExprKind::Atom(_) => provide.atom_identifier(),
+                    ExprKind::List(list)
+                        if list.first_ident() == Some(&*REQUIRE_IDENT_SPEC)
+                            && !module.macro_map.contains_key(&*REQUIRE_IDENT_SPEC) =>
+                    {
+                        list.second_ident()
+                    }
+                    _ => None,
+                };
+                let Some(name) = name.filter(|name| !module.macro_map.contains_key(name)) else {
+                    continue;
+                };
+                let imported = if explicit_imports.is_empty() {
+                    *name
+                } else {
+                    let Some(imported) = explicit_imports.get(name) else {
+                        continue;
+                    };
+                    *imported
+                };
+                let imported = match &require.prefix {
+                    Some(prefix) => (prefix.clone() + imported.resolve()).into(),
+                    None => imported,
+                };
+                native_heads.insert(imported);
+            }
         }
-        collect_defines(&ast, &mut |name| {
-            native_globals.insert(name);
-        });
         let global_defs = collect_globals(&ast);
+        let mut native_globals = global_defs.clone();
+        native_globals.extend(native_heads.iter().copied());
+        let imported_bindings = native_heads.clone();
         let globals = GlobalMap::Set(&global_defs);
 
         // TODO: Revisit if caching is something we want here
@@ -2423,59 +2523,20 @@ impl<'a> ModuleBuilder<'a> {
         // And it also seems like it needs to happen at the same time. So the lookups
         // should happen together.
 
-        if self.require_objects.is_empty() {
-            let is_macro = |name: &InternedString| self.macro_map.contains_key(name);
-            if self.kernel.is_none() {
-                predeclare_native_bindings(&ast, &native_heads, &mut native_globals, &is_macro);
-            }
-            let mut prepared = 0;
-            for index in 0..ast.len() {
-                if self.kernel.is_none() && index >= prepared {
-                    prepared = prepare_native_heads(
-                        &mut ast,
-                        index,
-                        &mut native_heads,
-                        &mut native_globals,
-                        &is_macro,
-                    )?;
-                }
-                let expr = &mut ast[index];
-                // println!("GETTING HERE: {}", expr);
-
-                // Remove from the local macros?
+        if self.require_objects.is_empty() && self.kernel.is_some() {
+            for expr in &mut ast {
                 expand(expr, &self.macro_map, globals)?;
-
-                // A macro call stopped preparation, so prepare its expansion.
-                if self.kernel.is_none() && index >= prepared {
-                    prepared = prepare_native_heads(
-                        &mut ast,
-                        index,
-                        &mut native_heads,
-                        &mut native_globals,
-                        &is_macro,
-                    )?;
-                }
-                let expr = &mut ast[index];
-
-                // for item in found.iter() {
-                //     // Remove from the list?
-                //     Arc::make_mut(&mut self.macro_map).remove(item);
-                // }
-
                 expand_kernel_in_env(
                     expr,
                     self.kernel.as_mut(),
                     self.builtin_modules.clone(),
-                    // Expanding macros in the environment?
                     self.name.to_str().unwrap(),
-                    GlobalMap::Set(&native_globals),
+                    GlobalMap::Scoped(&self.global_bindings, &native_globals),
                 )?;
                 collect_defines(std::slice::from_ref(expr), &mut |name| {
-                    native_heads.insert(name);
                     native_globals.insert(name);
                 });
-
-                expand(expr, &self.macro_map, globals)?;
+                expand_module_scoped(expr, &self.macro_map, globals)?;
             }
         }
 
@@ -2490,7 +2551,7 @@ impl<'a> ModuleBuilder<'a> {
                 self.builtin_modules.clone(),
                 // Expanding macros in the environment?
                 self.name.to_str().unwrap(),
-                GlobalMap::Set(&native_globals),
+                GlobalMap::Scoped(&self.global_bindings, &native_globals),
             )?;
             // })
         }
@@ -2551,17 +2612,6 @@ impl<'a> ModuleBuilder<'a> {
             }
         }
 
-        if self.kernel.is_none()
-            && required_macros.iter().any(|required| {
-                required
-                    .in_scope_macros
-                    .contains_key(&"define-values".into())
-            })
-        {
-            native_heads.insert("define-values".into());
-            native_globals.insert("define-values".into());
-        }
-
         let overlays = required_macros
             .iter_mut()
             .map(|x| RequiredMacroMap {
@@ -2573,37 +2623,44 @@ impl<'a> ModuleBuilder<'a> {
         let mut many_expander = ExpanderMany::new(macro_map, overlays, globals);
         let is_macro = |expander: &ExpanderMany, name: &InternedString| {
             expander.map.contains_key(name)
+                || self.global_macro_map.contains_key(name)
                 || expander
                     .overlays
                     .iter()
                     .any(|overlay| overlay.map.in_scope_macros.contains_key(name))
         };
 
-        // Without requires, the loop above already prepared every native head.
-        let prepare_heads = self.kernel.is_none() && !self.require_objects.is_empty();
-        if prepare_heads {
-            predeclare_native_bindings(&ast, &native_heads, &mut native_globals, &|name| {
-                is_macro(&many_expander, name)
-            });
-        }
+        // Without a kernel, `native_globals` is first read by the deferred pass below, which
+        // predeclares native definitions once module macros have expanded.
+        let prepare_heads = self.kernel.is_none();
         let mut prepared = 0;
+        // Top-level definitions shadow module and imported macros in the deferred statements after
+        // them, as they do in the deferred pass.
+        let mut top_level_definitions = FxHashSet::default();
         for index in 0..ast.len() {
-            if prepare_heads && index >= prepared {
+            if prepare_heads && index == prepared {
                 prepared = prepare_native_heads(
                     &mut ast,
                     index,
+                    self.global_bindings,
                     &mut native_heads,
                     &mut native_globals,
                     &|name| is_macro(&many_expander, name),
                 )?;
             }
-            many_expander.expand(&mut ast[index])?;
+            let defer_body = prepare_heads && index >= prepared;
+            if defer_body {
+                many_expander.expand_top_level(&mut ast[index], &mut top_level_definitions)?;
+            } else {
+                many_expander.expand(&mut ast[index])?;
+            }
 
             // A macro call stopped preparation, so prepare its expansion.
-            if prepare_heads && index >= prepared {
+            if prepare_heads && index == prepared {
                 prepared = prepare_native_heads(
                     &mut ast,
                     index,
+                    self.global_bindings,
                     &mut native_heads,
                     &mut native_globals,
                     &|name| is_macro(&many_expander, name),
@@ -2611,20 +2668,25 @@ impl<'a> ModuleBuilder<'a> {
             }
             let expr = &mut ast[index];
 
-            expand_kernel_in_env(
-                expr,
-                self.kernel.as_mut(),
-                self.builtin_modules.clone(),
-                // Expanding macros in the environment?
-                self.name.to_str().unwrap(),
-                GlobalMap::Set(&native_globals),
-            )?;
+            if self.kernel.is_some() {
+                expand_kernel_in_env(
+                    expr,
+                    self.kernel.as_mut(),
+                    self.builtin_modules.clone(),
+                    // Expanding macros in the environment?
+                    self.name.to_str().unwrap(),
+                    GlobalMap::Scoped(&self.global_bindings, &native_globals),
+                )?;
+            }
             collect_defines(std::slice::from_ref(expr), &mut |name| {
                 native_heads.insert(name);
                 native_globals.insert(name);
+                top_level_definitions.insert(name);
             });
 
-            expand(expr, &many_expander.map, globals)?;
+            if !defer_body {
+                expand_module_scoped(expr, &many_expander.map, globals)?;
+            }
 
             for RequiredMacroMap {
                 changed,
@@ -2632,17 +2694,18 @@ impl<'a> ModuleBuilder<'a> {
             } in many_expander.overlays.iter_mut()
             {
                 if *changed {
-                    expand(expr, &req_macro.module_macros, globals)?;
+                    expand_module_scoped(expr, &req_macro.module_macros, globals)?;
 
                     // Expanding the kernel with only these macros...
-                    let local_changed = expand_kernel_in_env_with_change(
-                        expr,
-                        self.kernel.as_mut(),
-                        // We don't need to expand those here
-                        ModuleContainer::default(),
-                        &req_macro.module_name,
-                        GlobalMap::Set(&native_globals),
-                    )?;
+                    let local_changed = self.kernel.is_some()
+                        && expand_kernel_in_env_with_change(
+                            expr,
+                            self.kernel.as_mut(),
+                            // We don't need to expand those here
+                            ModuleContainer::default(),
+                            &req_macro.module_name,
+                            GlobalMap::Scoped(&self.global_bindings, &native_globals),
+                        )?;
                     collect_defines(std::slice::from_ref(expr), &mut |name| {
                         native_heads.insert(name);
                         native_globals.insert(name);
@@ -2654,6 +2717,79 @@ impl<'a> ModuleBuilder<'a> {
 
                     *changed = false;
                 }
+            }
+        }
+
+        if self.kernel.is_none() {
+            flatten_module_begins(&mut ast)?;
+            many_expander.in_scope_values.clear_all();
+            for name in &imported_bindings {
+                many_expander.in_scope_values.define(*name);
+                many_expander.map.remove(name);
+            }
+            // Later module and imported macros can define names that shadow global macros.
+            collect_defines(&ast, &mut |name| {
+                native_globals.insert(name);
+            });
+            let mut native_heads = imported_bindings;
+            let is_macro = |name: &InternedString| self.global_macro_map.contains_key(name);
+            predeclare_native_bindings(
+                &ast,
+                self.global_bindings,
+                &native_heads,
+                &mut native_globals,
+                &is_macro,
+            );
+            let mut prepared = 0;
+            for index in 0..ast.len() {
+                if index >= prepared {
+                    prepared = prepare_native_heads(
+                        &mut ast,
+                        index,
+                        self.global_bindings,
+                        &mut native_heads,
+                        &mut native_globals,
+                        &is_macro,
+                    )?;
+                }
+                // Flattened statements still share their preceding value bindings.
+                many_expander.expand_in_scope(&mut ast[index])?;
+                for overlay in &mut many_expander.overlays {
+                    if overlay.changed {
+                        expand_module_scoped(&mut ast[index], &overlay.map.module_macros, globals)?;
+                        overlay.changed = false;
+                    }
+                }
+                Expander::expand_global_macros(
+                    &mut ast[index],
+                    self.global_macro_map,
+                    self.global_bindings,
+                    &mut native_globals,
+                    &self.builtin_modules,
+                )?;
+                if index >= prepared {
+                    prepared = prepare_native_heads(
+                        &mut ast,
+                        index,
+                        self.global_bindings,
+                        &mut native_heads,
+                        &mut native_globals,
+                        &is_macro,
+                    )?;
+                }
+                expand_kernel_in_env(
+                    &mut ast[index],
+                    None,
+                    self.builtin_modules.clone(),
+                    self.name.to_str().unwrap(),
+                    GlobalMap::Scoped(&self.global_bindings, &native_globals),
+                )?;
+                collect_defines(std::slice::from_ref(&ast[index]), &mut |name| {
+                    native_heads.insert(name);
+                    native_globals.insert(name);
+                    many_expander.in_scope_values.define(name);
+                    many_expander.map.remove(&name);
+                });
             }
         }
 
@@ -2688,7 +2824,7 @@ impl<'a> ModuleBuilder<'a> {
                 self.kernel.as_mut(),
                 self.builtin_modules.clone(),
                 self.name.to_str().unwrap(),
-                GlobalMap::Set(&native_globals),
+                GlobalMap::Scoped(&self.global_bindings, &native_globals),
             )?;
             collect_defines(std::slice::from_ref(expr), &mut |name| {
                 native_globals.insert(name);
@@ -3310,6 +3446,7 @@ impl<'a> ModuleBuilder<'a> {
         kernel: &'a mut Option<Kernel>,
         builtin_modules: ModuleContainer,
         global_macro_map: &'a FxHashMap<InternedString, SteelMacro>,
+        global_bindings: GlobalMap<'a>,
         custom_builtins: &'a HashMap<String, String>,
         module_resolvers: &'a [Arc<dyn SourceModuleResolver>],
         prelude_string: &'a str,
@@ -3323,6 +3460,7 @@ impl<'a> ModuleBuilder<'a> {
             kernel,
             builtin_modules,
             global_macro_map,
+            global_bindings,
             custom_builtins,
             &[],
             module_resolvers,
@@ -3341,6 +3479,7 @@ impl<'a> ModuleBuilder<'a> {
         kernel: &'a mut Option<Kernel>,
         builtin_modules: ModuleContainer,
         global_macro_map: &'a FxHashMap<InternedString, SteelMacro>,
+        global_bindings: GlobalMap<'a>,
         custom_builtins: &'a HashMap<String, String>,
         search_dirs: &'a [PathBuf],
         module_resolvers: &'a [Arc<dyn SourceModuleResolver>],
@@ -3355,6 +3494,7 @@ impl<'a> ModuleBuilder<'a> {
             kernel,
             builtin_modules,
             global_macro_map,
+            global_bindings,
             custom_builtins,
             search_dirs,
             module_resolvers,
@@ -3373,6 +3513,7 @@ impl<'a> ModuleBuilder<'a> {
         kernel: &'a mut Option<Kernel>,
         builtin_modules: ModuleContainer,
         global_macro_map: &'a FxHashMap<InternedString, SteelMacro>,
+        global_bindings: GlobalMap<'a>,
         custom_builtins: &'a HashMap<String, String>,
         search_dirs: &'a [PathBuf],
         module_resolvers: &'a [Arc<dyn SourceModuleResolver>],
@@ -3404,6 +3545,7 @@ impl<'a> ModuleBuilder<'a> {
             kernel,
             builtin_modules,
             global_macro_map,
+            global_bindings,
             custom_builtins,
             search_dirs,
             module_resolvers,
