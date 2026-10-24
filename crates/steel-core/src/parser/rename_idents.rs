@@ -57,14 +57,14 @@ impl TemplateBindings {
     }
 }
 
-pub(crate) fn resolve_template_bindings(exprs: &mut [ExprKind], expanded: usize) {
+pub(crate) fn resolve_template_bindings(exprs: &mut [ExprKind], expanded: std::ops::Range<usize>) {
     let mut bindings = TemplateBindings::default();
-    collect_define_syntax(std::slice::from_ref(&exprs[expanded]), &mut |name, syn| {
+    collect_define_syntax(&exprs[expanded], &mut |name, syn| {
         if syn.mark.is_template() {
             bindings.0.insert((name, syn.mark));
         }
     });
-    // A nested macro can bind an identifier previously classified as a free template reference.
+    // Expansion and native lowering can bind previously free template references.
     for expr in exprs {
         bindings.resolve(expr);
     }

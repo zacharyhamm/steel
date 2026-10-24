@@ -538,6 +538,9 @@ impl MacroCase {
                     impl VisitorMutRefUnit for MarkTemplateIdentifiers {
                         fn visit_atom(&mut self, a: &mut Atom) {
                             if let TokenType::Identifier(_) = a.syn.ty {
+                                if !a.syn.mark.is_template() {
+                                    a.syn.template_source = a.syn.span.source_id();
+                                }
                                 a.syn.mark = self.0;
                             }
                         }

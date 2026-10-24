@@ -12,7 +12,7 @@ use crate::{
     },
     parser::{
         ast::{self, Atom, ExprKind},
-        parser::{ExpansionMark, SyntaxObject},
+        parser::{ExpansionMark, SourceId, SyntaxObject},
         span::Span,
         tokens::TokenType,
     },
@@ -736,6 +736,7 @@ impl ast::TryFromSteelValVisitorForExprKind {
             SymbolV(x) => {
                 let mut syn = SyntaxObject::new(TokenType::Identifier(x.as_str().into()), span);
                 syn.mark = value.mark;
+                syn.template_source = value.template_source;
                 Ok(ExprKind::Atom(Atom::new(syn)))
             }
 
@@ -805,6 +806,7 @@ pub struct Syntax {
     pub(crate) syntax: SteelVal,
     span: Span,
     mark: ExpansionMark,
+    template_source: Option<SourceId>,
 }
 
 impl Syntax {
@@ -814,6 +816,7 @@ impl Syntax {
             syntax,
             span,
             mark: ExpansionMark::UNKNOWN,
+            template_source: None,
         }
     }
 
@@ -823,11 +826,17 @@ impl Syntax {
             syntax,
             span,
             mark: ExpansionMark::UNKNOWN,
+            template_source: None,
         }
     }
 
-    pub(crate) fn with_mark(mut self, mark: ExpansionMark) -> Syntax {
+    pub(crate) fn with_mark(
+        mut self,
+        mark: ExpansionMark,
+        template_source: Option<SourceId>,
+    ) -> Syntax {
         self.mark = mark;
+        self.template_source = template_source;
         self
     }
 
@@ -841,6 +850,7 @@ impl Syntax {
             syntax,
             span,
             mark: ExpansionMark::UNKNOWN,
+            template_source: None,
         }
     }
 
@@ -927,6 +937,7 @@ impl Syntax {
             SymbolV(x) => {
                 let mut syn = SyntaxObject::new(TokenType::Identifier(x.as_str().into()), span);
                 syn.mark = self.mark;
+                syn.template_source = self.template_source;
                 Ok(ExprKind::Atom(Atom::new(syn)))
             }
             ListV(l) => {

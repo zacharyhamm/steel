@@ -21,7 +21,11 @@ use crate::{
         parser::{lower_entire_ast, lower_macro_and_require_definitions, SourcesCollector},
     },
     rvals::{AsRefSteelVal, SteelString},
-    steel_vm::{cache::MemoizationTable, engine::ModuleContainer, primitives::constant_primitives},
+    steel_vm::{
+        cache::MemoizationTable,
+        engine::{default_prelude_macros, ModuleContainer},
+        primitives::constant_primitives,
+    },
     LambdaMetadataTable,
 };
 use crate::{
@@ -875,6 +879,16 @@ impl Compiler {
         exprs: Vec<ExprKind>,
         path: Option<PathBuf>,
     ) -> Result<Vec<ExprKind>> {
+        self.expand_main(exprs, path)
+            .map(|(statements, _)| statements)
+    }
+
+    // Also return the compiled module prefix length, before main's import bindings and body.
+    fn expand_main(
+        &mut self,
+        exprs: Vec<ExprKind>,
+        path: Option<PathBuf>,
+    ) -> Result<(Vec<ExprKind>, usize)> {
         // #[cfg(feature = "modules")]
         self.module_manager.compile_main(
             &mut self.macro_env,
@@ -979,31 +993,22 @@ impl Compiler {
         Ok(native_globals)
     }
 
-    // TODO: Compare this to the lower_expressions_impl and merge the behavior
-    fn expand_ast(&mut self, exprs: Vec<ExprKind>, path: Option<PathBuf>) -> Result<Vec<ExprKind>> {
-        let mut expanded_statements = self.expand_expressions(exprs, path)?;
+    // Expand the remaining macros without exposing main's macro environment to compiled modules.
+    fn expand_top_level_statements(
+        &mut self,
+        statements: &mut [ExprKind],
+        compiled_module_count: usize,
+    ) -> Result<()> {
+        let mut native_globals = self.native_globals(statements)?;
+        let prelude_macros = self.kernel.is_some().then(default_prelude_macros);
 
-        log::debug!(target: "expansion-phase", "Expanding macros -> phase 1");
-
-        if let Some(kernel) = self.kernel.as_mut() {
-            // Label anything at the top as well - top level
-            kernel.load_syntax_transformers(&mut expanded_statements, "top-level".to_string())?;
-        }
-
-        // for expr in expanded_statements.iter_mut() {
-        //     expand_kernel_in_env(
-        //         expr,
-        //         self.kernel.as_mut(),
-        //         self.builtin_modules.clone(),
-        //         "top-level",
-        //     )?;
-
-        //     crate::parser::expand_visitor::expand(expr, &self.macro_env)?;
-        // }
-
-        let mut native_globals = self.native_globals(&mut expanded_statements)?;
-
-        for expr in expanded_statements.iter_mut() {
+        for (index, expr) in statements.iter_mut().enumerate() {
+            // Without a kernel, module-scoped expansion is already complete.
+            let macro_env = if index < compiled_module_count {
+                prelude_macros.as_deref()
+            } else {
+                Some(&self.macro_env)
+            };
             expand_kernel_in_env(
                 expr,
                 self.kernel.as_mut(),
@@ -1011,13 +1016,17 @@ impl Compiler {
                 "top-level",
                 GlobalMap::Layered(self.symbol_map.map(), &native_globals),
             )?;
-            crate::parser::expand_visitor::expand(
-                expr,
-                &self.macro_env,
-                GlobalMap::Map(self.symbol_map.map()),
-            )?;
+            if let Some(macro_env) = macro_env {
+                crate::parser::expand_visitor::expand(
+                    expr,
+                    macro_env,
+                    GlobalMap::Map(self.symbol_map.map()),
+                )?;
+            }
             lower_entire_ast(expr)?;
 
+            // Lifted templates can leave private macro references even in compiled code; this
+            // pass only expands references originating in the macro's defining module.
             for (module, shadowed_vars) in &self.lifted_macro_environments {
                 if let Some(macro_env) = self.modules().get(module).map(|x| &x.macro_map) {
                     let source_id = self.sources.get_source_id(module).unwrap();
@@ -1056,11 +1065,13 @@ impl Compiler {
             )?;
 
             // TODO: If we have this, then we have to lower all of the expressions again
-            crate::parser::expand_visitor::expand(
-                expr,
-                &self.macro_env,
-                GlobalMap::Map(self.symbol_map.map()),
-            )?;
+            if let Some(macro_env) = macro_env {
+                crate::parser::expand_visitor::expand(
+                    expr,
+                    macro_env,
+                    GlobalMap::Map(self.symbol_map.map()),
+                )?;
+            }
 
             // for expr in expanded_statements.iter_mut() {
             lower_entire_ast(expr)?;
@@ -1070,6 +1081,32 @@ impl Compiler {
             });
             ResolveExpansionMarks::resolve(expr);
         }
+
+        Ok(())
+    }
+
+    fn expand_ast(&mut self, exprs: Vec<ExprKind>, path: Option<PathBuf>) -> Result<Vec<ExprKind>> {
+        let (mut expanded_statements, compiled_module_count) = self.expand_main(exprs, path)?;
+
+        log::debug!(target: "expansion-phase", "Expanding macros -> phase 1");
+
+        if let Some(kernel) = self.kernel.as_mut() {
+            // Label anything at the top as well - top level
+            kernel.load_syntax_transformers(&mut expanded_statements, "top-level".to_string())?;
+        }
+
+        // for expr in expanded_statements.iter_mut() {
+        //     expand_kernel_in_env(
+        //         expr,
+        //         self.kernel.as_mut(),
+        //         self.builtin_modules.clone(),
+        //         "top-level",
+        //     )?;
+
+        //     crate::parser::expand_visitor::expand(expr, &self.macro_env)?;
+        // }
+
+        self.expand_top_level_statements(&mut expanded_statements, compiled_module_count)?;
 
         // @Matt 11/15/2024
         // TODO: At this point, we'll want to remove
@@ -1180,7 +1217,7 @@ impl Compiler {
         #[cfg(feature = "profiling")]
         let now = Instant::now();
 
-        let mut expanded_statements = self.expand_expressions(exprs, path)?;
+        let (mut expanded_statements, compiled_module_count) = self.expand_main(exprs, path)?;
 
         // println!("---- Post expansion ----");
         // expanded_statements.pretty_print();
@@ -1199,77 +1236,7 @@ impl Compiler {
             kernel.load_syntax_transformers(&mut expanded_statements, "top-level".to_string())?;
         }
 
-        let mut native_globals = self.native_globals(&mut expanded_statements)?;
-
-        for expr in expanded_statements.iter_mut() {
-            expand_kernel_in_env(
-                expr,
-                self.kernel.as_mut(),
-                self.builtin_modules.clone(),
-                "top-level",
-                GlobalMap::Layered(self.symbol_map.map(), &native_globals),
-            )?;
-            crate::parser::expand_visitor::expand(
-                expr,
-                &self.macro_env,
-                GlobalMap::Map(self.symbol_map.map()),
-            )?;
-            lower_entire_ast(expr)?;
-
-            for (module, shadowed_vars) in &self.lifted_macro_environments {
-                if let Some(macro_env) = self.modules().get(module).map(|x| &x.macro_map) {
-                    // If this was recently shadowed, then we don't want it any more.
-
-                    let source_id = self.sources.get_source_id(module).unwrap();
-
-                    crate::parser::expand_visitor::expand_with_source_id(
-                        expr,
-                        macro_env,
-                        &shadowed_vars,
-                        Some(source_id),
-                        GlobalMap::Map(self.symbol_map.map()),
-                    )?;
-                }
-            }
-
-            // Lift all of the kernel macros as well?
-            for (module, lifted_env) in &mut self.lifted_kernel_environments {
-                let changed = expand_kernel_in_env_with_change(
-                    expr,
-                    self.kernel.as_mut(),
-                    self.builtin_modules.clone(),
-                    module,
-                    GlobalMap::Layered(self.symbol_map.map(), &native_globals),
-                )?;
-
-                if changed {
-                    lifted_env.name_mangler.visit(expr);
-                }
-            }
-
-            expand_kernel_in_env(
-                expr,
-                self.kernel.as_mut(),
-                self.builtin_modules.clone(),
-                "top-level",
-                GlobalMap::Layered(self.symbol_map.map(), &native_globals),
-            )?;
-
-            // TODO: If we have this, then we have to lower all of the expressions again
-            crate::parser::expand_visitor::expand(
-                expr,
-                &self.macro_env,
-                GlobalMap::Map(self.symbol_map.map()),
-            )?;
-
-            // for expr in expanded_statements.iter_mut() {
-            lower_entire_ast(expr)?;
-
-            collect_defines(std::slice::from_ref(expr), &mut |name| {
-                native_globals.insert(name);
-            });
-            ResolveExpansionMarks::resolve(expr);
-        }
+        self.expand_top_level_statements(&mut expanded_statements, compiled_module_count)?;
 
         // TODO: Check that defines are in legal positions, post expansion.
 

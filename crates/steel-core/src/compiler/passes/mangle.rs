@@ -29,7 +29,8 @@ Steps for doing having scoped macros
 
 pub fn collect_globals(exprs: &[ExprKind]) -> FxHashSet<InternedString> {
     let mut global_defs = FxHashSet::default();
-    collect_definitions(exprs, true, &mut |name, _| {
+    // Native forms contribute definitions only after expansion resolves their heads.
+    collect_defines(exprs, &mut |name| {
         global_defs.insert(name);
     });
     global_defs
@@ -43,14 +44,6 @@ pub(crate) fn collect_define_syntax(
     exprs: &[ExprKind],
     define: &mut impl FnMut(InternedString, &SyntaxObject),
 ) {
-    collect_definitions(exprs, false, define);
-}
-
-fn collect_definitions(
-    exprs: &[ExprKind],
-    include_define_values: bool,
-    define: &mut impl FnMut(InternedString, &SyntaxObject),
-) {
     for expr in exprs {
         match expr {
             ExprKind::Define(d) => {
@@ -59,20 +52,6 @@ fn collect_definitions(
                         continue;
                     }
                     define(*name, d.name.atom_syntax_object().unwrap());
-                }
-            }
-            // Global prelude macros expand after modules are named; preserve their exported bindings.
-            ExprKind::List(l)
-                if include_define_values
-                    && l.first_ident()
-                        .is_some_and(|name| name.resolve() == "define-values") =>
-            {
-                if let Some(ExprKind::List(bindings)) = l.get(1) {
-                    for binding in &bindings.args {
-                        if let Some(name) = binding.atom_identifier() {
-                            define(*name, binding.atom_syntax_object().unwrap());
-                        }
-                    }
                 }
             }
             ExprKind::List(l)
@@ -114,13 +93,13 @@ fn collect_definitions(
                         .unwrap_or_default() =>
             {
                 if l.len() > 1 {
-                    collect_definitions(&l[1..], include_define_values, define);
+                    collect_define_syntax(&l[1..], define);
                 }
 
                 // let collected_defs =collect_globals(&l[])
             }
             ExprKind::Begin(b) => {
-                collect_definitions(&b.exprs, include_define_values, define);
+                collect_define_syntax(&b.exprs, define);
             }
             _ => {}
         }
@@ -313,7 +292,7 @@ mod name_mangling_tests {
                 definitions,
                 ["function".into(), "value".into()].into_iter().collect()
             );
-            assert!(collect_globals(&ast).contains(&"generated".into()));
+            assert_eq!(collect_globals(&ast), definitions);
         }
     }
 

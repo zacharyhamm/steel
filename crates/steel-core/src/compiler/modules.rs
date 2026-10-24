@@ -367,7 +367,7 @@ impl ModuleManager {
         lifted_macro_environments: &mut HashMap<PathBuf, HashSet<InternedString>>,
         search_dirs: &[PathBuf],
         global_map: &FxHashMap<InternedString, usize>,
-    ) -> Result<Vec<ExprKind>> {
+    ) -> Result<(Vec<ExprKind>, usize)> {
         // Wipe the visited set on entry
         self.visited.clear();
 
@@ -381,7 +381,20 @@ impl ModuleManager {
         extract_macro_defs(&mut exprs, global_macro_map, global_map)?;
 
         // Required modules expand before these definitions enter the runtime symbol map.
-        let pending_globals = collect_globals(&exprs);
+        let mut pending_globals = collect_globals(&exprs);
+        let no_kernel = kernel.is_none();
+        if no_kernel {
+            predeclare_native_definitions(
+                &exprs,
+                &|_| false,
+                GlobalMap::Map(global_map),
+                &|name| global_macro_map.contains_key(name),
+                Some(&builtin_modules),
+                &mut |name| {
+                    pending_globals.insert(name);
+                },
+            );
+        }
         let mut module_builder = ModuleBuilder::main(
             path,
             exprs,
@@ -400,6 +413,7 @@ impl ModuleManager {
         )?;
 
         let mut module_statements = module_builder.compile()?;
+        let compiled_module_count = module_statements.len();
 
         module_builder.collect_provides()?;
 
@@ -708,13 +722,18 @@ impl ModuleManager {
         // Include the defines from the modules now imported
         module_statements.append(&mut require_defines);
 
-        // The next two lines here expand _all_ of the source code with the top level macros
-        // This is necessary because of the std library macros, although this should be able to be
-        // solved with scoped imports of the standard library explicitly
         module_statements.append(&mut ast);
 
         time!("Top level macro evaluation time", {
-            for expr in module_statements.iter_mut() {
+            // Kernel-backed modules may still need prelude macros, but must not see main's macros.
+            if !no_kernel {
+                let prelude_macros = default_prelude_macros();
+                for expr in &mut module_statements[..compiled_module_count] {
+                    expand(expr, &prelude_macros, GlobalMap::Map(global_map))?;
+                }
+            }
+
+            for expr in &mut module_statements[compiled_module_count..] {
                 let found_in_scope = expand(expr, global_macro_map, GlobalMap::Map(global_map))?;
 
                 for item in found_in_scope.iter() {
@@ -728,7 +747,7 @@ impl ModuleManager {
             }
         });
 
-        Ok(module_statements)
+        Ok((module_statements, compiled_module_count))
     }
 
     fn find_in_scope_macros<'a>(
@@ -2015,6 +2034,7 @@ fn predeclare_native_bindings(
     native_heads: &FxHashSet<InternedString>,
     native_globals: &mut FxHashSet<InternedString>,
     is_macro: &dyn Fn(&InternedString) -> bool,
+    builtin_modules: &ModuleContainer,
 ) {
     predeclare_native_definitions(
         ast,
@@ -2023,7 +2043,7 @@ fn predeclare_native_bindings(
         // `global_bindings`.
         GlobalMap::Scoped(&global_bindings, &FxHashSet::default()),
         is_macro,
-        None,
+        Some(builtin_modules),
         &mut |name| {
             native_globals.insert(name);
         },
@@ -2489,7 +2509,23 @@ impl<'a> ModuleBuilder<'a> {
                 native_heads.insert(imported);
             }
         }
-        let global_defs = collect_globals(&ast);
+        let mut global_defs = collect_globals(&ast);
+        // Native definitions are module globals too, so module macro templates can reference
+        // them, unless an import or an earlier definition shadows their head.
+        let no_kernel = self.kernel.is_none();
+        predeclare_native_definitions(
+            &ast,
+            &|name| native_heads.contains(name),
+            GlobalMap::Set(&FxHashSet::default()),
+            &|name| {
+                self.macro_map.contains_key(name)
+                    || no_kernel && self.global_macro_map.contains_key(name)
+            },
+            None,
+            &mut |name| {
+                global_defs.insert(name);
+            },
+        );
         let mut native_globals = global_defs.clone();
         native_globals.extend(native_heads.iter().copied());
         let imported_bindings = native_heads.clone();
@@ -2739,6 +2775,7 @@ impl<'a> ModuleBuilder<'a> {
                 &native_heads,
                 &mut native_globals,
                 &is_macro,
+                &self.builtin_modules,
             );
             let mut prepared = 0;
             for index in 0..ast.len() {

@@ -331,7 +331,7 @@ fn convert_location(s: &SyntaxObject) -> Result<SteelVal> {
     let atom = SteelVal::try_from(s.clone())?;
 
     Ok(Syntax::proto(atom.clone(), atom, span)
-        .with_mark(s.mark)
+        .with_mark(s.mark, s.template_source)
         .into())
 }
 
@@ -467,7 +467,7 @@ impl VisitorMut for SyntaxObjectFromExprKindRef {
         let atom = SteelVal::try_from(a.syn.ty.clone()).map_err(|e| e.with_span(span))?;
 
         Ok(Syntax::proto(atom.clone(), atom, span)
-            .with_mark(a.syn.mark)
+            .with_mark(a.syn.mark, a.syn.template_source)
             .into())
     }
 
@@ -744,11 +744,12 @@ impl ConsumingVisitor for SyntaxObjectFromExprKind {
     fn visit_atom(&mut self, a: Atom) -> Self::Output {
         let span = a.syn.span;
         let mark = a.syn.mark;
+        let template_source = a.syn.template_source;
 
         let atom = SteelVal::try_from(a.syn)?;
 
         Ok(Syntax::proto(atom.clone(), atom, span)
-            .with_mark(mark)
+            .with_mark(mark, template_source)
             .into())
     }
 
@@ -914,6 +915,33 @@ mod tests {
     use super::*;
 
     use thin_vec::thin_vec;
+
+    #[test]
+    fn syntax_converters_preserve_template_sources_and_call_site_spans() {
+        use steel_parser::parser::{ExpansionMark, SourceId};
+
+        let span = Span::new(10, 20, Some(SourceId::fresh()));
+        let mark = ExpansionMark::fresh();
+        for template_source in [None, Some(SourceId::fresh())] {
+            let mut syn = SyntaxObject::new(TokenType::Identifier("helper".into()), span);
+            syn.mark = mark;
+            syn.template_source = template_source;
+            let expr = ExprKind::Atom(Atom::new(syn));
+            for converted in [
+                SyntaxObjectFromExprKind::try_from_expr_kind(expr.clone()).unwrap(),
+                SyntaxObjectFromExprKindRef::try_from_expr_kind_ref(&expr).unwrap(),
+            ] {
+                let SteelVal::SyntaxObject(syntax) = converted else {
+                    panic!("expected a syntax object");
+                };
+                let restored = syntax.to_exprkind().unwrap();
+                let syn = restored.atom_syntax_object().unwrap();
+                assert_eq!(syn.template_source, template_source);
+                assert_eq!(syn.mark, mark);
+                assert_eq!(syn.span, span);
+            }
+        }
+    }
 
     #[test]
     fn syntax_converters_restore_lowered_lets_with_spans() {

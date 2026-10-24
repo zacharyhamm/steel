@@ -486,6 +486,12 @@ impl<'a> Expander<'a> {
                 .is_some_and(|globals| globals.contains(name))
     }
 
+    // Whether an identifier from `source` can see `m`. An expansion restricted to one module's
+    // source sees that module's macros only from identifiers originating there.
+    fn visible(&self, source: Option<SourceId>, m: &SteelMacro) -> bool {
+        self.source_id.is_none() || source == m.location.source_id()
+    }
+
     // A nested macro can bind a global template's free reference as a parameter, which then names
     // that parameter within its scope rather than a global binding. Only global macro expansion
     // classifies free references, so other expansions have nothing to resolve.
@@ -501,6 +507,7 @@ impl<'a> Expander<'a> {
 
     fn visit_body(&mut self, exprs: &mut [ExprKind]) -> Result<()> {
         if self.module_globals.is_none() {
+            collect_defines(exprs, &mut |name| self.in_scope_values.define(name));
             return exprs.iter_mut().try_for_each(|expr| self.visit(expr));
         }
         // Bodies see later definitions, but statement heads retain their sequential scope.
@@ -534,7 +541,7 @@ impl<'a> Expander<'a> {
                 });
             }
             self.visit_with_native_heads(&mut exprs[index], Some(heads))?;
-            resolve_template_bindings(exprs, index);
+            resolve_template_bindings(exprs, index..index + 1);
             collect_defines(std::slice::from_ref(&exprs[index]), &mut |name| {
                 heads.define(name);
             });
@@ -565,8 +572,23 @@ impl<'a> Expander<'a> {
             ExprKind::Macro(m) => self.visit_macro(m),
             ExprKind::Atom(a) => self.visit_atom(a),
             ExprKind::List(l) => {
+                let source_id = l
+                    .args
+                    .first()
+                    .and_then(ExprKind::atom_syntax_object)
+                    .and_then(|syn| {
+                        if syn.mark.is_template() {
+                            syn.template_source
+                        } else {
+                            syn.span.source_id()
+                        }
+                    });
                 restore_hygienic_macro_head(l, &self.in_scope_values, |name| {
-                    self.map.contains_key(name) && !self.excluded(name)
+                    !self.excluded(name)
+                        && self
+                            .map
+                            .get(name)
+                            .is_some_and(|m| self.visible(source_id, m))
                 });
 
                 if self.module_globals.is_some() {
@@ -851,15 +873,12 @@ impl<'a> Expander<'a> {
                             let global_template_reference =
                                 *global_reference && self.module_globals.is_some();
                             if applies {
-                                // If this macro has been overwritten by any local value, respect
-                                // the local binding and do not expand the macro, unless the
-                                // identifier came from a macro template
-                                let visible = self.source_id.is_none()
-                                    || sp.source_id() == m.location.source_id();
-
-                                if global_template_reference
-                                    || *unresolved
-                                    || visible && !self.in_scope_values.contains(s)
+                                // Template references can bypass local shadowing only when their
+                                // source can see this macro.
+                                if self.visible(source_id, m)
+                                    && (global_template_reference
+                                        || *unresolved
+                                        || !self.in_scope_values.contains(s))
                                 {
                                     let span = *sp;
 
@@ -882,7 +901,7 @@ impl<'a> Expander<'a> {
 
                                     resolve_template_bindings(
                                         std::slice::from_mut(&mut expanded),
-                                        0,
+                                        0..1,
                                     );
                                     self.visit_with_native_heads(&mut expanded, native_heads)?;
 
@@ -1964,6 +1983,7 @@ fn lower_native_definitions(
     is_macro: &dyn Fn(&InternedString) -> bool,
 ) -> Result<(bool, usize)> {
     let mut changed = false;
+    let mut count = exprs.len();
     for (index, expr) in exprs.iter_mut().enumerate() {
         match expr {
             ExprKind::Begin(begin) => {
@@ -1971,7 +1991,8 @@ fn lower_native_definitions(
                     lower_native_definitions(&mut begin.exprs, globals, scope, is_macro)?;
                 changed |= nested_changed;
                 if prepared < begin.exprs.len() {
-                    return Ok((changed, index));
+                    count = index;
+                    break;
                 }
                 continue;
             }
@@ -1980,14 +2001,16 @@ fn lower_native_definitions(
                     lower_native_definitions(&mut list.args[1..], globals, scope, is_macro)?;
                 changed |= nested_changed;
                 if prepared < list.args.len() - 1 {
-                    return Ok((changed, index));
+                    count = index;
+                    break;
                 }
                 continue;
             }
             ExprKind::List(list) => {
                 // Macros take precedence over native forms of the same name.
                 if list.first_ident().is_some_and(is_macro) {
-                    return Ok((changed, index));
+                    count = index;
+                    break;
                 }
                 // Leave the producer and field accessors for normal expansion.
                 if let Some(lowered) =
@@ -2003,7 +2026,11 @@ fn lower_native_definitions(
             scope.define(name);
         });
     }
-    Ok((changed, exprs.len()))
+    // Statements prepared before a stop can still bind free template references.
+    if changed {
+        resolve_template_bindings(exprs, 0..count);
+    }
+    Ok((changed, count))
 }
 
 // Lower `list` when it is headed by a native `define-values` or `struct` that `is_bound` does not
@@ -2254,7 +2281,13 @@ fn expand_immutable_struct(list: &List) -> Result<ExprKind> {
                 field.span(),
             )
         }));
-    for (index, binding) in names.enumerate() {
+    // Generated predicates and accessors share the struct name's template scope.
+    let name_syntax = list.args[1].atom_syntax_object().unwrap();
+    for (index, mut binding) in names.enumerate() {
+        let binding_syntax = binding.atom_syntax_object_mut().unwrap();
+        binding_syntax.mark = name_syntax.mark;
+        binding_syntax.template_source = name_syntax.template_source;
+        binding_syntax.introduced_via_macro = name_syntax.introduced_via_macro;
         definitions.push(ExprKind::Define(Box::new(Define::new(
             binding,
             expr_list![temporary.clone(), expr_usize(index)],
