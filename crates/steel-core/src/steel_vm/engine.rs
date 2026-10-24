@@ -3000,6 +3000,159 @@ fn engine_bootstrap_preserves_struct_macro() {
 }
 
 #[test]
+fn raw_engine_internal_definition_scope_before_folding() {
+    for body in [
+        "(define f (if #t (lambda () x) #f)) (define x 42) (f)",
+        "(define f (if #f #f (lambda () x))) (define x 42) (f)",
+        "(define f ((lambda (value) value) (lambda () x))) (define x 42) (f)",
+        "(define f (if #t (lambda () x) #f))
+         (define x ((lambda () (set! effect 40) effect)))
+         (set! effect 41)
+         (define y ((lambda () (set! effect (+ effect 1)) effect)))
+         (+ (f) (- y 40))",
+    ] {
+        for source in [format!("((lambda () {body}))"), format!("(let () {body})")] {
+            let mut engine = Engine::new_raw_no_kernel();
+            crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+            engine.run("(require-builtin steel/numbers)").unwrap();
+            engine.run("(define effect 0)").unwrap();
+            assert_eq!(
+                engine
+                    .run(source.clone())
+                    .unwrap_or_else(|error| panic!("{source}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_native_binding_lists_are_not_macro_calls() {
+    for body in [
+        "(define-values (x) (answer)) x",
+        "(struct point (x)) (point-x (point (answer)))",
+    ] {
+        for source in [
+            body.to_owned(),
+            format!("(begin {body})"),
+            format!("((lambda () {body}))"),
+            format!("(let () {body})"),
+            format!("(define-syntax make-answer (syntax-rules () [(make-answer) (begin {body})])) (make-answer)"),
+        ] {
+            for imported in [false, true] {
+                let mut engine = Engine::new_raw_no_kernel();
+                let macros = "(define-syntax x (syntax-rules () [(x) 0]))
+                              (define-syntax hidden-answer (syntax-rules () [(hidden-answer) 42]))
+                              (define-syntax answer (syntax-rules () [(answer) (hidden-answer)]))";
+                engine.register_steel_module(
+                    "binding-list-macros".into(),
+                    format!("(provide x answer) {macros}"),
+                );
+                let prefix = if imported {
+                    "(require \"binding-list-macros\")"
+                } else {
+                    macros
+                };
+                assert_eq!(
+                    engine
+                        .run(format!("{prefix} {source}"))
+                        .unwrap_or_else(|error| panic!("{prefix}, {source}: {error}"))
+                        .last(),
+                    Some(&SteelVal::IntV(42)),
+                    "{prefix}, {source}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_native_expansion_preserves_macro_binding_order() {
+    let mut engine = Engine::new_raw_no_kernel();
+    assert_eq!(
+        engine
+            .run(
+                "(define-syntax x (syntax-rules () [(x) 40]))
+                 (define before (x))
+                 (define-values (x) 42)
+                 before",
+            )
+            .unwrap()
+            .last(),
+        Some(&SteelVal::IntV(40))
+    );
+    assert_eq!(engine.run("x").unwrap().last(), Some(&SteelVal::IntV(42)));
+
+    for name in ["struct", "define-values"] {
+        let mut engine = Engine::new_raw_no_kernel();
+        assert_eq!(
+            engine
+                .run(format!(
+                    "(define-syntax bind-name
+                       (syntax-rules () [(bind-name name) (define (name x) x)]))
+                     (define (call) ({name} 42))
+                     (bind-name {name})
+                     (call)"
+                ))
+                .unwrap_or_else(|error| panic!("{name}: {error}"))
+                .last(),
+            Some(&SteelVal::IntV(42))
+        );
+    }
+
+    for source in [
+        "(define (struct tag value) value) (define tag 0) (struct tag (answer))",
+        "(define (define-values value ignored) value) (define-values (answer) #f)",
+    ] {
+        let mut engine = Engine::new_raw_no_kernel();
+        assert_eq!(
+            engine
+                .run(format!(
+                    "(define-syntax answer (syntax-rules () [(answer) 42])) {source}"
+                ))
+                .unwrap_or_else(|error| panic!("{source}: {error}"))
+                .last(),
+            Some(&SteelVal::IntV(42))
+        );
+    }
+}
+
+#[test]
+fn raw_engine_native_named_optional_parameters() {
+    for name in ["struct", "define-values"] {
+        for source in [
+            format!("((lambda (({name} (lambda (x) x))) ({name} 42)))"),
+            format!("((lambda (#:value ({name} (lambda (x) x))) ({name} 42)))"),
+            format!("((lambda (({name} #f)) ({name} 42)) (lambda (x) x))"),
+            format!("((lambda (#:value ({name} #f)) ({name} 42)) #:value (lambda (x) x))"),
+            format!("((lambda (#:value {name}) ({name} 42)) #:value (lambda (x) x))"),
+            format!("((lambda (({name} (identity))) ({name} 42)))"),
+            format!("((lambda (#:value ({name} (identity))) ({name} 42)))"),
+            format!("((lambda () (define (f ({name} (identity))) ({name} 42)) (f)))"),
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+            engine
+                .run("(require-builtin steel/lists as #%prim.) (require-builtin steel/meta as #%prim.)")
+                .unwrap();
+            engine
+                .run("(define-syntax identity (syntax-rules () [(identity) (lambda (x) x)]))")
+                .unwrap();
+            assert_eq!(
+                engine
+                    .run(source.clone())
+                    .unwrap_or_else(|error| panic!("{source}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
 fn raw_engine_native_forms_respect_lexical_shadowing() {
     let mut engine = Engine::new_raw_no_kernel();
     for name in ["struct", "define-values"] {

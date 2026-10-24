@@ -1020,7 +1020,7 @@ impl Compiler {
                 crate::parser::expand_visitor::expand(
                     expr,
                     macro_env,
-                    GlobalMap::Map(self.symbol_map.map()),
+                    GlobalMap::Layered(self.symbol_map.map(), &native_globals),
                 )?;
             }
             lower_entire_ast(expr)?;
@@ -1036,7 +1036,7 @@ impl Compiler {
                         macro_env,
                         &shadowed_vars,
                         Some(source_id),
-                        GlobalMap::Map(self.symbol_map.map()),
+                        GlobalMap::Layered(self.symbol_map.map(), &native_globals),
                     )?
                 }
             }
@@ -1069,7 +1069,7 @@ impl Compiler {
                 crate::parser::expand_visitor::expand(
                     expr,
                     macro_env,
-                    GlobalMap::Map(self.symbol_map.map()),
+                    GlobalMap::Layered(self.symbol_map.map(), &native_globals),
                 )?;
             }
 

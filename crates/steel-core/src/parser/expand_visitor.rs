@@ -616,6 +616,21 @@ impl<'a> Expander<'a> {
                     }
                 }
 
+                // Native binding lists are data; their lowering waits until macros are expanded.
+                if let Some(name) = l.first_ident().copied().filter(|name| {
+                    matches!(name.resolve(), "struct" | "define-values")
+                        && !self.map.contains_key(name)
+                        && !self.in_scope_values.contains(name)
+                        && !self.globals.actually_contains(name)
+                }) {
+                    if name.resolve() == "define-values" {
+                        for producer in l.args.iter_mut().skip(2) {
+                            self.visit(producer)?;
+                        }
+                    }
+                    return Ok(());
+                }
+
                 match l.first() {
                     // TODO: Come back to this?
                     Some(ExprKind::Atom(
@@ -2336,15 +2351,7 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
         {
             self.in_scope_values.push_layer();
 
-            for value in &lambda_function.args {
-                if let Some(ident) = value.atom_identifier() {
-                    self.in_scope_values.define(*ident);
-                }
-            }
-
-            for value in &mut lambda_function.args {
-                self.visit(value)?;
-            }
+            visit_parameters(self, |v| &mut v.in_scope_values, &mut lambda_function.args)?;
 
             // Without a kernel, `visit_body` records the body's definitions in order.
             if self.map.is_some() {

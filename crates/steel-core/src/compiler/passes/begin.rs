@@ -482,10 +482,11 @@ fn convert_exprs_to_let(begin: Box<Begin>) -> ExprKind {
         return ExprKind::Begin(begin);
     }
 
-    if !expression_types.iter().any(|x| {
+    // Nonconstant initializers can return closures that capture later definitions.
+    if expression_types.iter().all(|x| {
         matches!(
             x,
-            ExpressionType::DefineFunction(_) | ExpressionType::DefineValues(_)
+            ExpressionType::DefineConst(_) | ExpressionType::Expression
         )
     }) {
         return begin
@@ -570,12 +571,6 @@ fn convert_exprs_to_let(begin: Box<Begin>) -> ExprKind {
     let mut new_args = ThinVec::with_capacity(idx + 1);
 
     // println!("{:#?}", expression_types);
-
-    // TODO:
-    // If there are functions at all, go through this weird path
-    // Otherwise, we should do the following transformation:
-    //
-    // If there are no functions at all, just do a series of lets, similar to let*
 
     // TODO: Move this up so we don't have to use raw_exprs anymore
 
