@@ -10,7 +10,7 @@ use steel_parser::parser::SourceId;
 use steel_parser::tokens::NumberLiteral;
 
 use crate::compiler::modules::RequiredModuleMacros;
-use crate::compiler::passes::mangle::collect_defines;
+use crate::compiler::passes::mangle::{collect_define_syntax, collect_defines};
 use crate::compiler::program::{BEGIN, LAMBDA, LAMBDA_SYMBOL, LET};
 use crate::parser::ast::ExprKind;
 use crate::parser::parser::SyntaxObject;
@@ -2037,8 +2037,8 @@ fn lower_native_definitions(
             }
             _ => {}
         }
-        collect_defines(std::slice::from_ref(expr), &mut |name| {
-            scope.define(name);
+        collect_define_syntax(std::slice::from_ref(expr), &mut |name, syntax| {
+            scope.define(native_binding_name(name, syntax));
         });
     }
     // Statements prepared before a stop can still bind free template references.
@@ -2055,12 +2055,9 @@ fn lower_native_form(
     globals: GlobalMap,
     is_bound: impl Fn(&InternedString) -> bool,
 ) -> Result<Option<ExprKind>> {
+    let head = list.first().and_then(ExprKind::atom_syntax_object);
     let is_bound = |name| {
-        if list
-            .first()
-            .and_then(ExprKind::atom_syntax_object)
-            .is_some_and(|syntax| syntax.global_reference)
-        {
+        if head.is_some_and(|syntax| syntax.global_reference) {
             // Global template heads resolve at their definition site, outside module bindings.
             match globals {
                 GlobalMap::Map(_) | GlobalMap::Layered(_, _) => globals.actually_contains(name),
@@ -2068,7 +2065,9 @@ fn lower_native_form(
                 GlobalMap::Scoped(globals, _) => globals.actually_contains(name),
             }
         } else {
-            is_bound(name) || globals.actually_contains(name)
+            is_bound(&head.map_or(*name, |syntax| native_binding_name(*name, syntax)))
+                || (head.is_some_and(|syntax| !syntax.unresolved) && is_bound(name))
+                || globals.actually_contains(name)
         }
     };
     // Check the head's name before its bindings, since nearly every list is neither form.
@@ -2080,6 +2079,15 @@ fn lower_native_form(
             expand_immutable_struct(list).map(Some)
         }
         _ => Ok(None),
+    }
+}
+
+// Native bindings have not passed through hygienic renaming yet.
+fn native_binding_name(name: InternedString, syntax: &SyntaxObject) -> InternedString {
+    if syntax.mark.is_template() {
+        format!("##{}#{}", name.resolve(), syntax.mark.0).into()
+    } else {
+        name
     }
 }
 
@@ -2142,9 +2150,10 @@ pub(crate) fn predeclare_native_definitions(
                 }
                 _ => None,
             };
-            collect_defines(
+            collect_define_syntax(
                 std::slice::from_ref(lowered.as_ref().unwrap_or(expr)),
-                &mut |name| {
+                &mut |name, syntax| {
+                    let name = native_binding_name(name, syntax);
                     scope.define(name);
                     define(name);
                 },
@@ -2178,7 +2187,7 @@ fn expand_define_values(list: &List) -> Result<ExprKind> {
         let Some(name) = binding.atom_identifier() else {
             stop!(BadSyntax => "define-values binding must be an identifier"; binding.span())
         };
-        if !seen.insert(*name) {
+        if !seen.insert((*name, binding.atom_syntax_object().unwrap().mark)) {
             stop!(BadSyntax => "duplicate define-values binding"; binding.span())
         }
     }
@@ -2333,7 +2342,10 @@ impl<'a> VisitorMutRef for KernelExpander<'a> {
             }
         }
         if let Some(ident) = define.name.atom_identifier() {
-            self.in_scope_values.define(*ident);
+            self.in_scope_values.define(native_binding_name(
+                *ident,
+                define.name.atom_syntax_object().unwrap(),
+            ));
         }
         self.define_context = Some(define.name.clone());
         self.visit(&mut define.body)?;

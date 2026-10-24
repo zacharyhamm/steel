@@ -4265,6 +4265,28 @@ fn raw_engine_module_global_macros_respect_pending_native_named_functions() {
     for require in ["", "(require \"unused-module\")"] {
         for (definitions, call) in [
             ("(define (struct value) value)", "(struct 42)"),
+            (
+                "(define-syntax make (syntax-rules () [(make name) (define (name value) value)])) (make struct)",
+                "(struct 42)",
+            ),
+            (
+                "(define-syntax make (syntax-rules () [(make name) (define (name value) value)])) (make define-values)",
+                "(define-values 42)",
+            ),
+            ("(require \"native-functions\")", "(struct 42)"),
+            ("(require \"native-functions\")", "(define-values 42)"),
+            (
+                "(require \"pending-native-scope\") (require \"native-functions\")",
+                "(struct 42)",
+            ),
+            (
+                "(require (only-in \"native-functions\" (identity struct)))",
+                "(struct 42)",
+            ),
+            (
+                "(require (only-in \"native-functions\" (identity define-values)))",
+                "(define-values 42)",
+            ),
             ("(define (define-values value) value)", "(define-values 42)"),
             (
                 "(define-values (define-values) (lambda (value) value))",
@@ -4287,6 +4309,10 @@ fn raw_engine_module_global_macros_respect_pending_native_named_functions() {
             ] {
                 let mut engine = Engine::new_raw_no_kernel();
                 engine.register_steel_module(
+                    "native-functions".into(),
+                    "(provide struct define-values identity) (define (identity value) value) (define (struct value) value) (define (define-values value) value)".into(),
+                );
+                engine.register_steel_module(
                     "unused-module".into(),
                     "(provide unused) (define unused 0)".into(),
                 );
@@ -4306,13 +4332,69 @@ fn raw_engine_module_global_macros_respect_pending_native_named_functions() {
                                (syntax-rules () [(make-answer) {template}]))
                              (require \"pending-native-scope\") (answer)"
                         ))
-                        .unwrap_or_else(|error| panic!("{require}, {template}: {error}"))
+                        .unwrap_or_else(|error| panic!("{definitions}, {require}, {template}: {error}"))
                         .last(),
                     Some(&SteelVal::IntV(42)),
                     "{require}, {template}"
                 );
             }
         }
+    }
+}
+
+#[test]
+fn raw_engine_pending_bindings_preserve_imported_macro_precedence() {
+    let mut engine = Engine::new_raw_no_kernel();
+    engine.register_steel_module(
+        "pending-macro".into(),
+        "(provide m) (define-syntax m (syntax-rules () [(m) 42]))".into(),
+    );
+    assert_eq!(
+        engine
+            .run("(define-syntax m (syntax-rules () [(m) 1])) (require \"pending-macro\") (m)")
+            .unwrap()
+            .last(),
+        Some(&SteelVal::IntV(42)),
+    );
+}
+
+#[test]
+fn raw_engine_pending_file_imports_preserve_cache_invalidation() {
+    let mut engine = Engine::new_raw_no_kernel();
+    engine.register_steel_module(
+        "pending-file-consumer".into(),
+        "(provide answer) (define (answer) (make-answer))".into(),
+    );
+    let path = std::env::temp_dir().join(format!(
+        "steel-pending-import-{}-{}.scm",
+        std::process::id(),
+        u32::from(crate::parser::parser::SyntaxObjectId::fresh()),
+    ));
+    let source = format!(
+        "(define-syntax make-answer (syntax-rules () [(make-answer) (struct 0)]))
+         (require \"pending-file-consumer\") (require \"{}\") (answer) (struct 0)",
+        path.display().to_string().replace('\\', "\\\\"),
+    );
+    for expected in [41, 42] {
+        std::fs::write(
+            &path,
+            format!("(provide struct) (define (struct value) {expected})"),
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(expected))
+            .unwrap();
+        let result = engine.run(source.clone());
+        if expected == 42 || result.is_err() {
+            std::fs::remove_file(&path).unwrap();
+        }
+        assert_eq!(
+            result.unwrap().last(),
+            Some(&SteelVal::IntV(expected as isize))
+        );
     }
 }
 
@@ -5742,6 +5824,102 @@ fn raw_engine_native_template_bindings_resolve_without_modules() {
                 "{template}"
             );
         }
+    }
+}
+
+#[test]
+fn raw_engine_native_bindings_preserve_expansion_identity() {
+    for (macros, expression, expected) in [
+        (
+            "(define-syntax m (syntax-rules () [(m out) (begin (define-values (tmp out) '(1 42)) tmp)]))",
+            "(m tmp)", 1,
+        ),
+        (
+            "(define-syntax m (syntax-rules () [(m out) (begin (define-values (tmp out) '(1 42)) tmp)]))",
+            "(let () (m tmp))", 1,
+        ),
+        (
+            "(define-syntax m (syntax-rules () [(m out) (begin (define-values (tmp out) '(1 42)) tmp)]))",
+            "(let () (m tmp) tmp)", 42,
+        ),
+        (
+            "(define-syntax bind (syntax-rules () [(bind) (define-values (struct) #f)]))",
+            "(let () (bind) (struct p (x)) (p-x (p 42)))", 42,
+        ),
+        (
+            "(define-syntax bind (syntax-rules () [(bind) (define-values (struct) #f)]))",
+            "(let () (bind) (let () (struct p (x)) (p-x (p 42))))", 42,
+        ),
+        (
+            "(define-syntax bind (syntax-rules () [(bind) (define-values (define-values) #f)]))",
+            "(let () (bind) (define-values (answer) 42) answer)", 42,
+        ),
+    ] {
+        for scope in ["main", "module", "global-macro"] {
+            let mut engine = Engine::new_raw_no_kernel();
+            let source = match scope {
+                "main" => format!("{macros} {expression}"),
+                _ => {
+                    let module_macros = if scope == "global-macro" {
+                        engine.run(macros).unwrap();
+                        ""
+                    } else { macros };
+                    engine.register_steel_module(
+                        "native-hygiene".into(),
+                        format!("{module_macros} (provide answer) (define answer {expression})"),
+                    );
+                    "(require \"native-hygiene\") answer".to_owned()
+                }
+            };
+            assert_eq!(
+                engine.run(source).unwrap_or_else(|error| panic!("{scope}, {expression}: {error}")).last(),
+                Some(&SteelVal::IntV(expected)),
+                "{scope}, {expression}"
+            );
+        }
+    }
+    for bindings in ["tmp tmp", "out out"] {
+        let mut engine = Engine::new_raw_no_kernel();
+        let source = format!(
+            "(define-syntax m (syntax-rules () [(m out) (define-values ({bindings}) '(1 42))]))
+             (let () (m tmp))"
+        );
+        let error = engine.run(source).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate define-values binding"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn raw_engine_native_template_heads_escape_caller_bindings() {
+    for (name, body) in [
+        ("define-values", "(define-values (x) 42) x"),
+        ("struct", "(struct p (x)) (p-x (p 42))"),
+    ] {
+        let mut engine = Engine::new_raw_no_kernel();
+        let source = format!(
+            "(define-syntax m (syntax-rules () [(m) (begin {body})]))
+             (let (({name} #f)) (m))"
+        );
+        assert_eq!(
+            engine
+                .run(source)
+                .unwrap_or_else(|error| panic!("{name}: {error}"))
+                .last(),
+            Some(&SteelVal::IntV(42)),
+            "{name}"
+        );
+        let mut engine = Engine::new_raw_no_kernel();
+        let error = engine
+            .run(format!(
+                "(define-syntax m (syntax-rules () [(m) (|##{name}| 42)])) (m)"
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains(&format!("##{name}")), "{error}");
     }
 }
 

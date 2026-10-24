@@ -671,6 +671,8 @@ impl<'a> VisitorMutRef for ReplaceExpressions<'a> {
                         && !a.syn.global_reference
                         && !a.syn.introduced_via_macro
                         && !self.globals.actually_contains(s)
+                        // Native lowering resolves marked heads without capturing caller bindings.
+                        && !matches!(s.resolve(), "struct" | "define-values")
                     {
                         *s = ("##".to_string() + s.resolve()).into();
                     }

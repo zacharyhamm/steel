@@ -39,7 +39,9 @@ impl ResolveExpansionMarks {
     pub fn resolve(expr: &mut ExprKind) {
         let mut pass = Self::default();
 
+        pass.bind_internal_defines(expr);
         pass.visit(expr);
+        pass.exit_scope(0);
 
         if pass.conflicts.is_empty() {
             return;
@@ -47,6 +49,7 @@ impl ResolveExpansionMarks {
 
         pass.renaming = true;
         pass.next_id = 0;
+        pass.bind_internal_defines(expr);
         pass.visit(expr);
     }
 
@@ -143,10 +146,11 @@ impl VisitorMutRefUnit for ResolveExpansionMarks {
         self.exit_scope(depth);
     }
 
-    // Internal define names are bound in `visit_body`. Top level defines are
-    // globals, which this pass doesn't touch.
+    // Define names are bound by the containing body, including a top-level expansion.
     fn visit_define(&mut self, define: &mut Define) {
-        self.visit(&mut define.body);
+        let depth = self.scope.len();
+        self.visit_body(&mut define.body);
+        self.exit_scope(depth);
     }
 
     fn visit_quote(&mut self, _quote: &mut Quote) {}

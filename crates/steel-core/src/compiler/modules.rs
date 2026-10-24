@@ -380,21 +380,9 @@ impl ModuleManager {
         // which we do not want
         extract_macro_defs(&mut exprs, global_macro_map, global_map)?;
 
-        // Required modules expand before these definitions enter the runtime symbol map.
-        let mut pending_globals = collect_globals(&exprs);
         let no_kernel = kernel.is_none();
-        if no_kernel {
-            predeclare_native_definitions(
-                &exprs,
-                &|_| false,
-                GlobalMap::Map(global_map),
-                &|name| global_macro_map.contains_key(name),
-                Some(&builtin_modules),
-                &mut |name| {
-                    pending_globals.insert(name);
-                },
-            );
-        }
+        let mut pending_globals = collect_globals(&exprs);
+        let module_macro_map;
         let mut module_builder = ModuleBuilder::main(
             path,
             exprs,
@@ -405,13 +393,48 @@ impl ModuleManager {
             kernel,
             builtin_modules,
             global_macro_map,
-            GlobalMap::Layered(global_map, &pending_globals),
+            GlobalMap::Map(global_map),
             &self.custom_builtins,
             search_dirs,
             &self.module_resolvers,
             &self.prelude_string,
         )?;
 
+        if no_kernel {
+            module_builder.collect_requires()?;
+            if !module_builder.require_objects.is_empty() {
+                let mut exclusions = HashSet::new();
+                module_builder.predeclare_imports(&mut pending_globals, &mut exclusions)?;
+                let mut shadowed = FxHashSet::default();
+                // Keep these expansions: required modules must see the bindings they introduce.
+                for expr in &mut module_builder.source_ast {
+                    Expander::new(global_macro_map, &exclusions, GlobalMap::Map(global_map))
+                        .expand(expr)?;
+                    collect_defines(std::slice::from_ref(expr), &mut |name| {
+                        pending_globals.insert(name);
+                        shadowed.insert(name);
+                        exclusions.insert(name);
+                    });
+                }
+                module_macro_map = global_macro_map
+                    .iter()
+                    .filter(|(name, _)| !shadowed.contains(name))
+                    .map(|(name, value)| (*name, value.clone()))
+                    .collect();
+                module_builder.global_macro_map = &module_macro_map;
+                predeclare_native_definitions(
+                    &module_builder.source_ast,
+                    &|_| false,
+                    GlobalMap::Map(global_map),
+                    &|name| module_macro_map.contains_key(name),
+                    Some(&module_builder.builtin_modules),
+                    &mut |name| {
+                        pending_globals.insert(name);
+                    },
+                );
+            }
+        }
+        module_builder.global_bindings = GlobalMap::Layered(global_map, &pending_globals);
         let mut module_statements = module_builder.compile()?;
         let compiled_module_count = module_statements.len();
 
@@ -2014,6 +2037,7 @@ struct ModuleBuilder<'a> {
     search_dirs: &'a [PathBuf],
     module_resolvers: &'a [Arc<dyn SourceModuleResolver>],
     prelude_string: &'a str,
+    parsed_requires: FxHashMap<PathBuf, (Vec<ExprKind>, Option<SystemTime>)>,
 }
 
 #[derive(Debug)]
@@ -2023,6 +2047,59 @@ pub struct RequiredModuleMacros {
     pub module_macros: Arc<FxHashMap<InternedString, SteelMacro>>,
     pub in_scope_macros: FxHashMap<InternedString, SteelMacro>,
     pub name_mangler: NameMangler,
+}
+
+fn imported_bindings(
+    require: &RequireObject,
+    provides: &[ExprKind],
+    macros: &FxHashMap<InternedString, SteelMacro>,
+    mut define: impl FnMut(InternedString, bool),
+) {
+    let explicit_imports = require
+        .idents_to_import
+        .iter()
+        .map(|ident| {
+            let (from, to) = match ident {
+                MaybeRenamed::Normal(name) => (name, name),
+                MaybeRenamed::Renamed(from, to) => (from, to),
+            };
+            (
+                *from.atom_identifier().unwrap(),
+                *to.atom_identifier().unwrap(),
+            )
+        })
+        .collect::<FxHashMap<_, _>>();
+    for provide in provides
+        .iter()
+        .flat_map(|expr| &expr.list().unwrap().args[1..])
+    {
+        let name = match provide {
+            ExprKind::Atom(_) => provide.atom_identifier(),
+            ExprKind::List(list)
+                if list.first_ident() == Some(&*REQUIRE_IDENT_SPEC)
+                    && !macros.contains_key(&*REQUIRE_IDENT_SPEC) =>
+            {
+                list.second_ident()
+            }
+            _ => None,
+        };
+        let Some(name) = name else {
+            continue;
+        };
+        let imported = if explicit_imports.is_empty() {
+            *name
+        } else {
+            let Some(imported) = explicit_imports.get(name) else {
+                continue;
+            };
+            *imported
+        };
+        let imported = match &require.prefix {
+            Some(prefix) => (prefix.clone() + imported.resolve()).into(),
+            None => imported,
+        };
+        define(imported, macros.contains_key(name));
+    }
 }
 
 // Bodies can expand before a native definition after a macro call is prepared, so predeclare the
@@ -2149,7 +2226,126 @@ impl<'a> ModuleBuilder<'a> {
             search_dirs,
             module_resolvers,
             prelude_string,
+            parsed_requires: FxHashMap::default(),
         })
+    }
+
+    // Discover main's imported values before compiling any module bodies.
+    fn predeclare_imports(
+        &mut self,
+        globals: &mut FxHashSet<InternedString>,
+        imports: &mut HashSet<InternedString>,
+    ) -> Result<()> {
+        for require in self.require_objects.clone() {
+            let path = require.path.get_path().into_owned();
+            if matches!(require.path, PathOrBuiltIn::BuiltIn(_)) {
+                if let Some(module) = self.compiled_modules.compiled_modules.get(&path) {
+                    imported_bindings(
+                        &require,
+                        &module.provides,
+                        &module.macro_map,
+                        |name, is_macro| {
+                            imports.insert(name);
+                            if !is_macro {
+                                globals.insert(name);
+                            }
+                        },
+                    );
+                    continue;
+                }
+            }
+            let previous_metadata = self.file_metadata.get(&path).copied();
+            let mut module = self.load_required(&require.path)?;
+            let metadata = module.file_metadata.get(&path).copied();
+            let ast = module.source_ast.clone();
+            module.collect_provides()?;
+            module.extract_macro_defs()?;
+            imported_bindings(
+                &require,
+                &module.provides,
+                &module.macro_map,
+                |name, is_macro| {
+                    imports.insert(name);
+                    if !is_macro {
+                        globals.insert(name);
+                    }
+                },
+            );
+            // Keep parsing's metadata update from hiding changes to cached file modules.
+            match previous_metadata {
+                Some(previous) => {
+                    self.file_metadata.insert(path.clone(), previous);
+                }
+                None => {
+                    self.file_metadata.remove(&path);
+                }
+            }
+            self.parsed_requires.insert(path, (ast, metadata));
+        }
+        Ok(())
+    }
+
+    fn load_required(&mut self, path: &PathOrBuiltIn) -> Result<ModuleBuilder<'_>> {
+        let name = path.get_path().into_owned();
+        let parsed = self.parsed_requires.remove(&name);
+        let mut module = ModuleBuilder::raw(
+            name.clone(),
+            self.compiled_modules,
+            self.visited,
+            self.file_metadata,
+            self.sources,
+            self.kernel,
+            self.builtin_modules.clone(),
+            self.global_macro_map,
+            self.global_bindings,
+            self.custom_builtins,
+            if matches!(path, PathOrBuiltIn::Path(_)) {
+                self.search_dirs
+            } else {
+                &[]
+            },
+            self.module_resolvers,
+            matches!(path, PathOrBuiltIn::Path(_)),
+            self.prelude_string,
+        );
+        if let Some((ast, metadata)) = parsed {
+            module.source_ast = ast;
+            if let Some(metadata) = metadata {
+                module.file_metadata.insert(name, metadata);
+            }
+            return Ok(module);
+        }
+        if matches!(path, PathOrBuiltIn::Path(_)) {
+            return module.parse_from_path();
+        }
+        let module_name = name;
+        let input = BUILT_INS
+            .iter()
+            .find(|x| x.0 == module_name.to_str().unwrap())
+            .map(|x| Cow::Borrowed(x.1))
+            .or_else(|| {
+                module
+                    .custom_builtins
+                    .get(module_name.to_str().unwrap())
+                    .map(|x| Cow::Owned(x.to_string()))
+            })
+            .or_else(|| {
+                module
+                    .module_resolvers
+                    .iter()
+                    .find_map(|x| x.resolve(module_name.to_str().unwrap()))
+                    // Insert the prelude
+                    .map(|mut x| {
+                        x.insert_str(0, module.prelude_string);
+                        x
+                    })
+                    .map(Cow::Owned)
+            })
+            .ok_or_else(
+                crate::throw!(Generic => "Unable to find builtin module: {:?}", module_name),
+            )?;
+
+        module.parse_builtin(input)
     }
 
     fn compile(&mut self) -> Result<Vec<ExprKind>> {
@@ -2224,8 +2420,8 @@ impl<'a> ModuleBuilder<'a> {
             new_exprs.push(self.compile_module()?);
         } else {
             // TODO come back for parsing built ins
-            for module in self
-                .require_objects
+            let requires = self.require_objects.clone();
+            for module in requires
                 .iter()
                 .filter(|x| matches!(x.path, PathOrBuiltIn::BuiltIn(_)))
                 .map(|x| x.path.get_path())
@@ -2242,46 +2438,9 @@ impl<'a> ModuleBuilder<'a> {
                     continue;
                 }
 
-                // TODO this is some bad crap here don't do this
-                let input = BUILT_INS
-                    .iter()
-                    .find(|x| x.0 == module.to_str().unwrap())
-                    .map(|x| Cow::Borrowed(x.1))
-                    .or_else(|| {
-                        self.custom_builtins
-                            .get(module.to_str().unwrap())
-                            .map(|x| Cow::Owned(x.to_string()))
-                    })
-                    .or_else(|| {
-                        self.module_resolvers
-                            .iter()
-                            .find_map(|x| x.resolve(module.to_str().unwrap()))
-                            // Insert the prelude
-                            .map(|mut x| {
-                                x.insert_str(0, self.prelude_string);
-                                x
-                            })
-                            .map(Cow::Owned)
-                    })
-                    .ok_or_else(
-                        crate::throw!(Generic => "Unable to find builtin module: {:?}", module),
-                    )?;
-
-                let mut new_module = ModuleBuilder::new_built_in(
-                    module.into_owned(),
-                    input,
-                    self.compiled_modules,
-                    self.visited,
-                    self.file_metadata,
-                    self.sources,
-                    self.kernel,
-                    self.builtin_modules.clone(),
-                    self.global_macro_map,
-                    self.global_bindings,
-                    self.custom_builtins,
-                    self.module_resolvers,
-                    self.prelude_string,
-                )?;
+                let mut new_module = self.load_required(&PathOrBuiltIn::BuiltIn(
+                    module.to_str().unwrap().to_owned().into(),
+                ))?;
 
                 // Walk the tree and compile any dependencies
                 // This will eventually put the module in the cache
@@ -2303,8 +2462,7 @@ impl<'a> ModuleBuilder<'a> {
 
             // At this point, requires should be fully qualified (absolute) paths
 
-            for (module, require_statement_span) in self
-                .require_objects
+            for (module, require_statement_span) in requires
                 .iter()
                 .filter(|x| matches!(x.path, PathOrBuiltIn::Path(_)))
                 .map(|x| (x.path.get_path(), x.span))
@@ -2382,21 +2540,8 @@ impl<'a> ModuleBuilder<'a> {
                 // There is quite the opportunity to parallelize a chunk
                 // of the compilation.
 
-                let mut new_module = ModuleBuilder::new_from_path(
-                    module.into_owned(),
-                    self.compiled_modules,
-                    self.visited,
-                    self.file_metadata,
-                    self.sources,
-                    self.kernel,
-                    self.builtin_modules.clone(),
-                    self.global_macro_map,
-                    self.global_bindings,
-                    self.custom_builtins,
-                    self.search_dirs,
-                    self.module_resolvers,
-                    self.prelude_string,
-                )?;
+                let mut new_module =
+                    self.load_required(&PathOrBuiltIn::Path(module.into_owned()))?;
 
                 // Walk the tree and compile any dependencies
                 // This will eventually put the module in the cache
@@ -2457,57 +2602,21 @@ impl<'a> ModuleBuilder<'a> {
             Some(_) => &[],
         };
         for require in native_requires {
-            let explicit_imports = require
-                .idents_to_import
-                .iter()
-                .map(|ident| {
-                    let (from, to) = match ident {
-                        MaybeRenamed::Normal(name) => (name, name),
-                        MaybeRenamed::Renamed(from, to) => (from, to),
-                    };
-                    (
-                        *from.atom_identifier().unwrap(),
-                        *to.atom_identifier().unwrap(),
-                    )
-                })
-                .collect::<FxHashMap<_, _>>();
             let module = self
                 .compiled_modules
                 .compiled_modules
                 .get(require.path.get_path().as_ref())
                 .unwrap();
-            for provide in module
-                .provides
-                .iter()
-                .flat_map(|expr| &expr.list().unwrap().args[1..])
-            {
-                let name = match provide {
-                    ExprKind::Atom(_) => provide.atom_identifier(),
-                    ExprKind::List(list)
-                        if list.first_ident() == Some(&*REQUIRE_IDENT_SPEC)
-                            && !module.macro_map.contains_key(&*REQUIRE_IDENT_SPEC) =>
-                    {
-                        list.second_ident()
+            imported_bindings(
+                require,
+                &module.provides,
+                &module.macro_map,
+                |name, is_macro| {
+                    if !is_macro {
+                        native_heads.insert(name);
                     }
-                    _ => None,
-                };
-                let Some(name) = name.filter(|name| !module.macro_map.contains_key(name)) else {
-                    continue;
-                };
-                let imported = if explicit_imports.is_empty() {
-                    *name
-                } else {
-                    let Some(imported) = explicit_imports.get(name) else {
-                        continue;
-                    };
-                    *imported
-                };
-                let imported = match &require.prefix {
-                    Some(prefix) => (prefix.clone() + imported.resolve()).into(),
-                    None => imported,
-                };
-                native_heads.insert(imported);
-            }
+                },
+            );
         }
         let mut global_defs = collect_globals(&ast);
         // Native definitions are module globals too, so module macro templates can reference
@@ -3472,41 +3581,6 @@ impl<'a> ModuleBuilder<'a> {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn new_built_in(
-        name: PathBuf,
-        input: Cow<'static, str>,
-        compiled_modules: &'a mut CompiledModuleCache,
-        visited: &'a mut FxHashSet<PathBuf>,
-        file_metadata: &'a mut crate::HashMap<PathBuf, SystemTime>,
-        sources: &'a mut Sources,
-        kernel: &'a mut Option<Kernel>,
-        builtin_modules: ModuleContainer,
-        global_macro_map: &'a FxHashMap<InternedString, SteelMacro>,
-        global_bindings: GlobalMap<'a>,
-        custom_builtins: &'a HashMap<String, String>,
-        module_resolvers: &'a [Arc<dyn SourceModuleResolver>],
-        prelude_string: &'a str,
-    ) -> Result<Self> {
-        ModuleBuilder::raw(
-            name,
-            compiled_modules,
-            visited,
-            file_metadata,
-            sources,
-            kernel,
-            builtin_modules,
-            global_macro_map,
-            global_bindings,
-            custom_builtins,
-            &[],
-            module_resolvers,
-            false,
-            prelude_string,
-        )
-        .parse_builtin(input)
-    }
-
     fn new_from_path(
         name: PathBuf,
         compiled_modules: &'a mut CompiledModuleCache,
@@ -3587,6 +3661,7 @@ impl<'a> ModuleBuilder<'a> {
             search_dirs,
             module_resolvers,
             prelude_string,
+            parsed_requires: FxHashMap::default(),
         }
     }
 
