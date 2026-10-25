@@ -175,6 +175,9 @@ pub struct RawSyntaxObject<T> {
     // Free reference from a global macro expanded before module names are mangled.
     #[serde(skip)]
     pub global_reference: bool,
+    // Source spelling for derived names when a native struct constructor is renamed.
+    #[serde(default)]
+    pub original_name: Option<InternedString>,
 }
 
 impl<T: Clone> Clone for RawSyntaxObject<T> {
@@ -188,6 +191,7 @@ impl<T: Clone> Clone for RawSyntaxObject<T> {
             mark: self.mark,
             template_source: self.template_source,
             global_reference: self.global_reference,
+            original_name: self.original_name,
         }
     }
 }
@@ -230,6 +234,7 @@ impl SyntaxObject {
             mark: ExpansionMark::NONE,
             template_source: None,
             global_reference: false,
+            original_name: None,
         }
     }
 
@@ -244,6 +249,7 @@ impl SyntaxObject {
             mark: ExpansionMark::NONE,
             template_source: None,
             global_reference: false,
+            original_name: None,
         }
     }
 
@@ -264,6 +270,7 @@ impl SyntaxObject {
             mark: ExpansionMark::NONE,
             template_source: None,
             global_reference: false,
+            original_name: None,
         }
     }
 }

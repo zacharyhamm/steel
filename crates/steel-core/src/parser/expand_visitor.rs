@@ -2280,6 +2280,8 @@ fn expand_immutable_struct(list: &List) -> Result<ExprKind> {
     let Some(name) = list.args[1].atom_identifier() else {
         stop!(BadSyntax => "struct expects an identifier for its name"; list.args[1].span())
     };
+    let name_syntax = list.args[1].atom_syntax_object().unwrap();
+    let name = name_syntax.original_name.unwrap_or(*name);
     let ExprKind::List(fields) = &list.args[2] else {
         stop!(BadSyntax => "struct expects a list of field identifiers"; list.args[2].span())
     };
@@ -2339,7 +2341,6 @@ fn expand_immutable_struct(list: &List) -> Result<ExprKind> {
             )
         }));
     // Generated predicates and accessors share the struct name's template scope.
-    let name_syntax = list.args[1].atom_syntax_object().unwrap();
     for (index, mut binding) in names.enumerate() {
         let binding_syntax = binding.atom_syntax_object_mut().unwrap();
         binding_syntax.mark = name_syntax.mark;

@@ -433,7 +433,20 @@ impl<'a> VisitorMutRef for RenameIdentifiersVisitor<'a> {
                     && l.first_ident() == Some(&*STRUCT_KEYWORD)
                     && !self.is_gensym(&STRUCT_KEYWORD);
                 for (index, expr) in l.args.iter_mut().enumerate() {
-                    if native_struct && index == 2 {
+                    if native_struct && index == 1 {
+                        let original_name = expr
+                            .atom_identifier()
+                            .copied()
+                            .filter(|name| !self.pattern_variables.contains(name));
+                        self.visit(expr);
+                        if let Some(name) = original_name {
+                            let syntax = expr.atom_syntax_object_mut().unwrap();
+                            // Leave later call-site renaming intact when this template didn't rename the name.
+                            if syntax.ty != TokenType::Identifier(name) {
+                                syntax.original_name.get_or_insert(name);
+                            }
+                        }
+                    } else if native_struct && index == 2 {
                         // Field names are data; only pattern variables need renaming.
                         self.preserved_struct_fields = true;
                         self.visit_data(expr, None);

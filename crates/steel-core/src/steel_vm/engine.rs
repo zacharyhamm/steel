@@ -6101,6 +6101,70 @@ fn raw_engine_struct_macro_fields_preserve_names() {
 }
 
 #[test]
+fn raw_engine_struct_macro_names_preserve_source_spelling() {
+    for (pattern, name, actual_name) in [
+        ("(m)", "p", "p"),
+        ("(m)", "|##p|", "##p"),
+        ("(m name read)", "name", "p"),
+        ("(m name read)", "name", "##p"),
+    ] {
+        for (suffix, expected) in [("-x", SteelVal::IntV(42)), ("?", SteelVal::BoolV(true))] {
+            let (call, read) = if pattern == "(m)" {
+                ("(m)".to_owned(), format!("|{actual_name}{suffix}|"))
+            } else {
+                (
+                    format!("(m |{actual_name}| |{actual_name}{suffix}|)"),
+                    "read".to_owned(),
+                )
+            };
+            let result = format!("({read} ({name} 42))");
+            for scope in ["main", "module", "imported-macro", "serialized-macro"] {
+                let mut engine = Engine::new_raw_no_kernel();
+                let definition = format!(
+                    "(define-syntax m
+                       (syntax-rules () [{pattern}
+                         (let (({name} #f)) (struct {name} (x)) {result})]))"
+                );
+                let source = match scope {
+                    "main" => format!("{definition} {call}"),
+                    "module" => {
+                        engine.register_steel_module(
+                            "struct-names".into(),
+                            format!("{definition} (provide answer) (define answer {call})"),
+                        );
+                        "(require \"struct-names\") answer".to_owned()
+                    }
+                    "imported-macro" => {
+                        engine.register_steel_module(
+                            "struct-names".into(),
+                            format!("{definition} (provide m)"),
+                        );
+                        format!("(require \"struct-names\") {call}")
+                    }
+                    _ => {
+                        engine.run(definition).unwrap();
+                        let mut compiler = engine.virtual_machine.compiler.write();
+                        let bytes = bincode::serialize(&compiler.macro_env).unwrap();
+                        compiler.macro_env = bincode::deserialize(&bytes).unwrap();
+                        call.clone()
+                    }
+                };
+                assert_eq!(
+                    engine
+                        .run(source)
+                        .unwrap_or_else(|error| panic!(
+                            "{scope}, {pattern}, {name}, {result}: {error}"
+                        ))
+                        .last(),
+                    Some(&expected),
+                    "{scope}, {pattern}, {name}, {result}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn raw_engine_struct_macro_fields_do_not_capture_runtime_arguments() {
     for definition in [
         "(define (struct name value) value) (define p #f)",
