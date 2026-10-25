@@ -1,3 +1,4 @@
+use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 use steel_parser::{
     ast::{Define, If, Let, Macro, Quote, Require, Return, SyntaxRules, Vector},
@@ -533,6 +534,17 @@ fn convert_exprs_to_let(begin: Box<Begin>) -> ExprKind {
         // return todo!();
     }
 
+    let mut defined_names = FxHashSet::default();
+    let mut redefined_names = FxHashSet::default();
+    for expr in &begin.exprs {
+        if let ExprKind::Define(d) = expr {
+            let name = *d.name.atom_identifier().unwrap();
+            if !defined_names.insert(name) {
+                redefined_names.insert(name);
+            }
+        }
+    }
+
     let mut exprs = begin.exprs;
 
     // let mut last_expression = expression_types.len();
@@ -614,7 +626,7 @@ fn convert_exprs_to_let(begin: Box<Begin>) -> ExprKind {
 
                 // let name = Atom::new(SyntaxObject::new)
             }
-            ExpressionType::DefineConst(_name) => {
+            ExpressionType::DefineConst(name) if !redefined_names.contains(name) => {
                 if let ExprKind::Define(d) = &exprs[i] {
                     top_level_dummy_args.push(arg);
                     top_level_arguments.push(d.name.clone());
@@ -627,10 +639,11 @@ fn convert_exprs_to_let(begin: Box<Begin>) -> ExprKind {
                     panic!("expected define, found: {}", &exprs[i]);
                 };
             }
-            // Evaluate nonconstant initializers in body order, after earlier effects.
+            // Repeated constants must also initialize in body order, after earlier effects.
             ExpressionType::DefineFlat(_)
             | ExpressionType::DefineFlatStar(_)
-            | ExpressionType::DefineValues(_) => {
+            | ExpressionType::DefineValues(_)
+            | ExpressionType::DefineConst(_) => {
                 if let ExprKind::Define(d) = &exprs[i] {
                     top_level_arguments.push(d.name.clone());
                     top_level_dummy_args.push(ExprKind::Atom(Atom::new(SyntaxObject::default(

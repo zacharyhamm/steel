@@ -450,13 +450,30 @@ impl ModuleManager {
                     expander.deferred_macros = Some(&imported_macros);
                     expander.literal_globals = GlobalMap::Layered(global_map, &literal_globals);
                     let expr = &mut module_builder.source_ast[index];
+                    let is_macro = |name: &InternedString| {
+                        global_macro_map.contains_key(name) || imported_macros.contains(name)
+                    };
+                    let previous_bindings = collect_main_literal_bindings(
+                        std::slice::from_ref(expr),
+                        global_map,
+                        &pending_globals,
+                        &is_macro,
+                        &builtin_modules,
+                    );
                     expander.expand(expr)?;
-                    refresh_literals = expander.changed;
+                    refresh_literals = previous_bindings
+                        != collect_main_literal_bindings(
+                            std::slice::from_ref(expr),
+                            global_map,
+                            &pending_globals,
+                            &is_macro,
+                            &builtin_modules,
+                        );
                     collect_defines(std::slice::from_ref(expr), &mut |name| {
-                        pending_globals.insert(name);
+                        refresh_literals |= pending_globals.insert(name);
                         shadowed.insert(name);
                         exclusions.insert(name);
-                        imported_macros.remove(&name);
+                        refresh_literals |= imported_macros.remove(&name);
                     });
                 }
             }
@@ -826,12 +843,21 @@ impl ModuleManager {
                     );
                 }
                 let expr = &mut module_statements[index];
+                let previous_bindings = no_kernel.then(|| {
+                    collect_main_literal_bindings(
+                        std::slice::from_ref(expr),
+                        global_map,
+                        &pending_globals,
+                        &|name| global_macro_map.contains_key(name),
+                        &builtin_modules,
+                    )
+                });
                 let globals = if no_kernel {
                     GlobalMap::Layered(global_map, &pending_globals)
                 } else {
                     GlobalMap::Map(global_map)
                 };
-                let (found_in_scope, changed) = expand_with_literal_globals(
+                let (found_in_scope, _) = expand_with_literal_globals(
                     expr,
                     global_macro_map,
                     globals,
@@ -841,15 +867,23 @@ impl ModuleManager {
                         globals
                     },
                 )?;
-                refresh_literals = changed;
+                refresh_literals = false;
 
-                if no_kernel {
+                if let Some(previous_bindings) = previous_bindings {
+                    refresh_literals = previous_bindings
+                        != collect_main_literal_bindings(
+                            std::slice::from_ref(expr),
+                            global_map,
+                            &pending_globals,
+                            &|name| global_macro_map.contains_key(name),
+                            &builtin_modules,
+                        );
                     collect_defines(std::slice::from_ref(expr), &mut |name| {
-                        pending_globals.insert(name);
+                        refresh_literals |= pending_globals.insert(name);
                     });
                 }
                 for item in found_in_scope.iter() {
-                    global_macro_map.remove(item);
+                    refresh_literals |= global_macro_map.remove(item).is_some();
 
                     for (_, shadowed_vars) in lifted_macro_environments.iter_mut() {
                         // If this was recently shadowed, then we don't want it any more.
@@ -2179,6 +2213,32 @@ fn imported_bindings(
     }
 }
 
+fn collect_main_literal_bindings(
+    ast: &[ExprKind],
+    global_map: &FxHashMap<InternedString, usize>,
+    pending_globals: &FxHashSet<InternedString>,
+    is_macro: &dyn Fn(&InternedString) -> bool,
+    builtin_modules: &ModuleContainer,
+) -> FxHashSet<InternedString> {
+    let mut bindings = FxHashSet::default();
+    predeclare_native_definitions(
+        ast,
+        &|name| pending_globals.contains(name),
+        GlobalMap::Map(global_map),
+        is_macro,
+        Some(builtin_modules),
+        &mut |name| {
+            bindings.insert(name);
+        },
+    );
+    bindings
+}
+
+#[cfg(test)]
+thread_local! {
+    static MAIN_LITERAL_REFRESH_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn refresh_main_literals(
     ast: &[ExprKind],
     macros: &mut FxHashMap<InternedString, SteelMacro>,
@@ -2188,24 +2248,53 @@ fn refresh_main_literals(
     deferred_macros: &FxHashSet<InternedString>,
     builtin_modules: &ModuleContainer,
 ) -> FxHashSet<InternedString> {
+    #[cfg(test)]
+    MAIN_LITERAL_REFRESH_COUNT.with(|count| count.set(count.get() + 1));
+
     // Rebuild speculative bindings: an earlier expansion can turn a native form into a call.
-    let mut literal_globals = pending_globals.clone();
-    predeclare_native_definitions(
+    let mut literal_globals = collect_main_literal_bindings(
         ast,
-        &|name| pending_globals.contains(name),
-        GlobalMap::Map(global_map),
+        global_map,
+        pending_globals,
         &|name| macros.contains_key(name) || deferred_macros.contains(name),
-        Some(builtin_modules),
-        &mut |name| {
-            literal_globals.insert(name);
-        },
+        builtin_modules,
     );
+    literal_globals.extend(pending_globals.iter().copied());
     for name in program_macros {
         if let Some(smacro) = macros.get_mut(name) {
             smacro.bind_global_literals(GlobalMap::Layered(global_map, &literal_globals));
         }
     }
     literal_globals
+}
+
+#[test]
+fn raw_engine_binding_free_expansions_do_not_refresh_main_literals() {
+    use crate::{steel_vm::engine::Engine, SteelVal};
+
+    // With an import the early loop expands `m`; otherwise the final loop does.
+    for require in ["", "(require \"unused-module\")"] {
+        let refresh_counts = [1, 32].map(|calls| {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine.register_steel_module(
+                "unused-module".into(),
+                "(provide unused) (define unused 0)".into(),
+            );
+            MAIN_LITERAL_REFRESH_COUNT.with(|count| count.set(0));
+            assert_eq!(
+                engine
+                    .run(format!(
+                        "{require} (define-syntax m (syntax-rules () [(m) 42])) {}",
+                        "(m)\n".repeat(calls)
+                    ))
+                    .unwrap()
+                    .last(),
+                Some(&SteelVal::IntV(42))
+            );
+            MAIN_LITERAL_REFRESH_COUNT.with(|count| count.get())
+        });
+        assert_eq!(refresh_counts[0], refresh_counts[1], "{require}");
+    }
 }
 
 // Bodies can expand before a native definition after a macro call is prepared, so predeclare the

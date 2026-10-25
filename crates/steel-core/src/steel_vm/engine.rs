@@ -3029,6 +3029,34 @@ fn raw_engine_internal_definition_scope_before_folding() {
 }
 
 #[test]
+fn raw_engine_recursive_internal_redefinitions_stay_in_source_order() {
+    for body in [
+        "(define x ((lambda () 1))) (set! before x) (define x 3) x",
+        "(define x 1) (set! before x) (define x ((lambda () 2))) (define x 3) x",
+        "(define x 1) (define read (if #t (lambda () x) #f))
+         (set! before (read)) (define x 3) (read)",
+    ] {
+        for source in [format!("((lambda () {body}))"), format!("(let () {body})")] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine.run("(define before 0)").unwrap();
+            assert_eq!(
+                engine
+                    .run(source.clone())
+                    .unwrap_or_else(|error| panic!("{source}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(3)),
+                "{source}"
+            );
+            assert_eq!(
+                engine.run("before").unwrap().last(),
+                Some(&SteelVal::IntV(1)),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
 fn raw_engine_internal_definitions_without_closures_stay_sequential() {
     for (body, expected) in [
         ("(define a b) (define b (+ 0 1)) a", Err("b")),
@@ -5817,6 +5845,38 @@ fn raw_engine_macro_literals_refresh_after_generated_native_head_bindings() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn raw_engine_macro_literals_refresh_after_generated_builtin_imports() {
+    for require in ["", "(require \"unused-module\")"] {
+        let mut engine = Engine::new_raw_no_kernel();
+        crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+        engine.register_steel_module(
+            "unused-module".into(),
+            "(provide unused) (define unused 0)".into(),
+        );
+        engine
+            .run(
+                "(define-syntax classify
+                   (syntax-rules (car) [(classify car) 1] [(classify other) 2]))",
+            )
+            .unwrap();
+        assert_eq!(
+            engine
+                .run(format!(
+                    "{require}
+                     (define-syntax import-lists
+                       (syntax-rules () [(import-lists) (require-builtin steel/lists)]))
+                     (import-lists)
+                     (classify car)"
+                ))
+                .unwrap()
+                .last(),
+            Some(&SteelVal::IntV(2)),
+            "{require}"
+        );
     }
 }
 
