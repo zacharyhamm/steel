@@ -1,6 +1,6 @@
 use steel_parser::ast::{
     Atom, LAMBDA, LAMBDA_FN, PLAIN_LET, QUASIQUOTE, RAW_QUOTE, RAW_UNQUOTE, RAW_UNQUOTE_SPLICING,
-    UNQUOTE, UNQUOTE_COMMA, UNQUOTE_SPLICING,
+    STRUCT_KEYWORD, UNQUOTE, UNQUOTE_COMMA, UNQUOTE_SPLICING,
 };
 
 use crate::compiler::passes::mangle::{collect_define_syntax, collect_defines};
@@ -74,6 +74,8 @@ pub struct RenameIdentifiersVisitor<'a> {
     introduced_identifiers: ScopeSet<InternedString, FxBuildHasher>,
     pattern_variables: &'a [InternedString],
     syntax: &'a [InternedString],
+    preserve_struct_fields: bool,
+    preserved_struct_fields: bool,
     global_scope: Option<(
         &'a FxHashMap<InternedString, SteelMacro>,
         &'a ModuleContainer,
@@ -87,6 +89,8 @@ impl<'a> RenameIdentifiersVisitor<'a> {
             introduced_identifiers: ScopeSet::default(),
             pattern_variables,
             syntax,
+            preserve_struct_fields: false,
+            preserved_struct_fields: false,
             global_scope: None,
         }
     }
@@ -101,6 +105,12 @@ impl<'a> RenameIdentifiersVisitor<'a> {
 
     pub fn rename_identifiers(&mut self, expr: &mut ExprKind) {
         self.visit_body(std::slice::from_mut(expr));
+    }
+
+    pub(crate) fn rename_native_struct_template(&mut self, expr: &mut ExprKind) -> bool {
+        self.preserve_struct_fields = true;
+        self.rename_identifiers(expr);
+        self.preserved_struct_fields
     }
 
     pub(crate) fn mark_global_references(
@@ -419,8 +429,17 @@ impl<'a> VisitorMutRef for RenameIdentifiersVisitor<'a> {
             }
 
             _ => {
-                for expr in &mut l.args {
-                    self.visit(expr);
+                let native_struct = self.preserve_struct_fields
+                    && l.first_ident() == Some(&*STRUCT_KEYWORD)
+                    && !self.is_gensym(&STRUCT_KEYWORD);
+                for (index, expr) in l.args.iter_mut().enumerate() {
+                    if native_struct && index == 2 {
+                        // Field names are data; only pattern variables need renaming.
+                        self.preserved_struct_fields = true;
+                        self.visit_data(expr, None);
+                    } else {
+                        self.visit(expr);
+                    }
                 }
             }
         }

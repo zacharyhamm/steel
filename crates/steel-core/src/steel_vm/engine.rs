@@ -4436,6 +4436,129 @@ fn raw_engine_transformed_exports_shadow_global_macros() {
 }
 
 #[test]
+fn raw_engine_imported_provide_transformers_shadow_global_macros() {
+    for (require, imported) in [
+        ("\"imports\"", "f"),
+        ("(only-in \"imports\" (f g))", "g"),
+        ("(prefix-in imported: \"imports\")", "imported:f"),
+        (
+            "(prefix-in imported: (only-in \"imports\" (f g)))",
+            "imported:g",
+        ),
+    ] {
+        for transformer_import in [
+            "(require \"exports\")",
+            "(require (only-in \"exports\" (export-name export)))",
+            "(require (prefix-in e: \"exports\"))",
+        ] {
+            let transformer = if transformer_import.contains("only-in") {
+                "export"
+            } else if transformer_import.contains("prefix-in") {
+                "e:export-name"
+            } else {
+                "export-name"
+            };
+            let mut engine = Engine::new_raw_no_kernel();
+            engine.register_steel_module(
+                "export-helper".into(),
+                "(provide export-transformer)
+                 (define-syntax export-transformer
+                   (syntax-rules () [(export-transformer name) name]))"
+                    .into(),
+            );
+            engine.register_steel_module(
+                "exports".into(),
+                "(require \"export-helper\") (provide (export-transformer export-name))
+                 (define-syntax identity (syntax-rules () [(identity name) name]))
+                 (define-syntax export-name (syntax-rules () [(export-name name) (identity name)]))"
+                    .into(),
+            );
+            engine.register_steel_module(
+                "imports".into(),
+                format!("{transformer_import} (provide ({transformer} f)) (define (f x) x)"),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    engine
+                        .run(format!(
+                            "(define-syntax {imported} (syntax-rules () [({imported} x) 7]))
+                             (require {require}) ({imported} 42)"
+                        ))
+                        .unwrap_or_else(|error| panic!("{require}, {transformer_import}: {error}"))
+                        .last(),
+                    Some(&SteelVal::IntV(42)),
+                    "{require}, {transformer_import}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_provide_discovery_detects_cycles() {
+    let mut engine = Engine::new_raw_no_kernel();
+    engine.register_steel_module("cycle-a".into(), "(require \"cycle-b\")".into());
+    engine.register_steel_module("cycle-b".into(), "(require \"cycle-a\")".into());
+    let error = engine.run("(require \"cycle-a\")").unwrap_err();
+    assert!(error.to_string().contains("circular dependency"), "{error}");
+    engine.register_steel_module("cycle-b".into(), "(provide x) (define x 42)".into());
+    assert_eq!(
+        engine.run("(require \"cycle-a\") 42").unwrap().last(),
+        Some(&SteelVal::IntV(42))
+    );
+}
+
+#[test]
+fn raw_engine_imported_provide_transformer_cache_invalidation() {
+    let directory = std::env::temp_dir().join(format!(
+        "steel-provide-transformer-{}-{}",
+        std::process::id(),
+        u32::from(crate::parser::parser::SyntaxObjectId::fresh()),
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let transformer = directory.join("exports.scm");
+    let imports = directory.join("imports.scm");
+    std::fs::write(
+        &imports,
+        "(require \"exports.scm\") (provide (export-name f g))
+         (define (f x) x) (define (g x) x)",
+    )
+    .unwrap();
+    let mut engine = Engine::new_raw_no_kernel();
+    let result = (|| {
+        for (index, name) in ["f", "g"].into_iter().enumerate() {
+            std::fs::write(
+                &transformer,
+                format!(
+                    "(provide export-name)
+                         (define-syntax export-name (syntax-rules () [(export-name f g) {name}]))"
+                ),
+            )
+            .unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&transformer)
+                .unwrap()
+                .set_modified(
+                    std::time::SystemTime::now() + std::time::Duration::from_secs(index as u64 + 1),
+                )
+                .unwrap();
+            for _ in 0..2 {
+                let result = engine.run(format!(
+                    "(define-syntax {name} (syntax-rules () [({name} x) 7]))
+                     (require \"{}\") ({name} 42)",
+                    imports.display().to_string().replace('\\', "\\\\"),
+                ))?;
+                assert_eq!(result.last(), Some(&SteelVal::IntV(42)), "{name}");
+            }
+        }
+        crate::rvals::Result::Ok(())
+    })();
+    std::fs::remove_dir_all(directory).unwrap();
+    result.unwrap();
+}
+
+#[test]
 fn raw_engine_imported_macro_arguments_expand_after_import() {
     for (source, expected) in [
         ("(quote-it (g))", "(g)"),
@@ -5941,7 +6064,8 @@ fn raw_engine_struct_macro_fields_preserve_names() {
             let mut engine = Engine::new_raw_no_kernel();
             let definition = format!(
                 "(define-syntax m
-                   (syntax-rules () [{pattern} (begin (struct p {fields}) {access})]))"
+                   (syntax-rules () [{pattern}
+                     (let ((x #f) (y #f)) (struct p {fields}) {access})]))"
             );
             let expression = format!("(let ((x #f) (y #f) (field #f) (struct #f)) {call})");
             let source = match scope {
@@ -5996,6 +6120,41 @@ fn raw_engine_struct_macro_fields_do_not_capture_runtime_arguments() {
             "{definition}: {error}"
         );
     }
+}
+
+#[test]
+fn raw_engine_struct_macro_template_shadowing_preserves_expressions() {
+    for definition in [
+        "(define (struct name value) value)",
+        "(define-syntax struct (syntax-rules () [(struct name value) value]))",
+    ] {
+        let mut engine = Engine::new_raw_no_kernel();
+        assert_eq!(
+            engine
+                .run(format!(
+                    "{definition} (define p #f)
+                 (define-syntax m
+                   (syntax-rules () [(m) (let ((x (lambda () 42))) (struct p (x)))]))
+                 (m)"
+                ))
+                .unwrap()
+                .last(),
+            Some(&SteelVal::IntV(42)),
+        );
+    }
+    let mut engine = Engine::new_raw_no_kernel();
+    assert_eq!(
+        engine
+            .run(
+                "(define-syntax m
+           (syntax-rules () [(m)
+             (let ((struct (lambda (name value) value)) (x (lambda () 42)))
+               (struct #f (x)))])) (m)"
+            )
+            .unwrap()
+            .last(),
+        Some(&SteelVal::IntV(42))
+    );
 }
 
 #[test]

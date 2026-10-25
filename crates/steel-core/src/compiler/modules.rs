@@ -413,8 +413,11 @@ impl ModuleManager {
                 let mut shadowed = FxHashSet::default();
                 // Keep these expansions: required modules must see the bindings they introduce.
                 for expr in &mut module_builder.source_ast {
-                    let mut expander =
-                        Expander::new(global_macro_map, &exclusions, GlobalMap::Map(global_map));
+                    let mut expander = Expander::new(
+                        global_macro_map,
+                        &exclusions,
+                        GlobalMap::Layered(global_map, &pending_globals),
+                    );
                     // Imported macros expand later and may quote or bind their arguments.
                     expander.deferred_macros = Some(&imported_macros);
                     expander.expand(expr)?;
@@ -766,7 +769,12 @@ impl ModuleManager {
             }
 
             for expr in &mut module_statements[compiled_module_count..] {
-                let found_in_scope = expand(expr, global_macro_map, GlobalMap::Map(global_map))?;
+                let globals = if no_kernel {
+                    GlobalMap::Layered(global_map, &pending_globals)
+                } else {
+                    GlobalMap::Map(global_map)
+                };
+                let found_in_scope = expand(expr, global_macro_map, globals)?;
 
                 for item in found_in_scope.iter() {
                     global_macro_map.remove(item);
@@ -2046,7 +2054,19 @@ struct ModuleBuilder<'a> {
     search_dirs: &'a [PathBuf],
     module_resolvers: &'a [Arc<dyn SourceModuleResolver>],
     prelude_string: &'a str,
-    parsed_requires: FxHashMap<PathBuf, (Vec<ExprKind>, Option<SystemTime>)>,
+    parsed_requires: FxHashMap<PathBuf, ParsedModule>,
+}
+
+struct ParsedModule {
+    ast: Vec<ExprKind>,
+    metadata: Option<SystemTime>,
+    requires: FxHashMap<PathBuf, ParsedModule>,
+}
+
+#[derive(Clone)]
+struct ModuleExports {
+    provides: Vec<ExprKind>,
+    macros: Arc<FxHashMap<InternedString, SteelMacro>>,
 }
 
 #[derive(Debug)]
@@ -2062,7 +2082,7 @@ fn imported_bindings(
     require: &RequireObject,
     provides: &[ExprKind],
     macros: &FxHashMap<InternedString, SteelMacro>,
-    mut define: impl FnMut(InternedString, bool),
+    mut define: impl FnMut(InternedString, Option<&SteelMacro>),
 ) {
     let explicit_imports = require
         .idents_to_import
@@ -2107,7 +2127,7 @@ fn imported_bindings(
             Some(prefix) => (prefix.clone() + imported.resolve()).into(),
             None => imported,
         };
-        define(imported, macros.contains_key(name));
+        define(imported, macros.get(name));
     }
 }
 
@@ -2246,58 +2266,131 @@ impl<'a> ModuleBuilder<'a> {
         imports: &mut HashSet<InternedString>,
         macros: &mut FxHashSet<InternedString>,
     ) -> Result<()> {
-        let mut record = |name, is_macro| {
+        let mut record = |name, smacro: Option<&SteelMacro>| {
             imports.insert(name);
-            if is_macro {
+            if smacro.is_some() {
                 macros.insert(name);
             } else {
                 globals.insert(name);
             }
         };
+        let mut discovered = FxHashMap::default();
         for require in self.require_objects.clone() {
-            let path = require.path.get_path().into_owned();
-            // A file module's provides depend only on its own source.
-            let unchanged = match &require.path {
-                PathOrBuiltIn::BuiltIn(_) => true,
-                PathOrBuiltIn::Path(_) => std::fs::metadata(&path)
-                    .and_then(|metadata| metadata.modified())
-                    .is_ok_and(|modified| self.file_metadata.get(&path) == Some(&modified)),
-            };
-            if let Some(module) = self
-                .compiled_modules
-                .compiled_modules
-                .get(&path)
-                .filter(|_| unchanged)
-            {
-                imported_bindings(&require, &module.provides, &module.macro_map, &mut record);
-                continue;
-            }
-            let previous_metadata = self.file_metadata.get(&path).copied();
-            let parsed = self.load_required(&require.path).and_then(|mut module| {
-                let metadata = module.file_metadata.get(&path).copied();
-                let ast = module.source_ast.clone();
-                module.collect_provides()?;
-                module.extract_macro_defs()?;
-                let module_globals = collect_globals(&module.source_ast);
-                for provide in &mut module.provides {
-                    expand(provide, &module.macro_map, GlobalMap::Set(&module_globals))?;
-                }
-                imported_bindings(&require, &module.provides, &module.macro_map, &mut record);
-                Ok((ast, metadata))
-            });
-            // Keep parsing's metadata update, even a failed one, from hiding changes to cached
-            // file modules.
-            match previous_metadata {
-                Some(previous) => {
-                    self.file_metadata.insert(path.clone(), previous);
-                }
-                None => {
-                    self.file_metadata.remove(&path);
-                }
-            }
-            self.parsed_requires.insert(path, parsed?);
+            let exports = self.discover_exports(&require.path, &mut discovered)?;
+            imported_bindings(&require, &exports.provides, &exports.macros, &mut record);
         }
         Ok(())
+    }
+
+    fn cached_exports_are_current(&self, path: &PathOrBuiltIn) -> bool {
+        let mut pending = vec![path.clone()];
+        let mut checked = FxHashSet::default();
+        while let Some(path) = pending.pop() {
+            let name = path.get_path();
+            if !checked.insert(name.clone().into_owned()) {
+                continue;
+            }
+            if matches!(path, PathOrBuiltIn::Path(_))
+                && !std::fs::metadata(name.as_ref())
+                    .and_then(|metadata| metadata.modified())
+                    .is_ok_and(|modified| self.file_metadata.get(name.as_ref()) == Some(&modified))
+            {
+                return false;
+            }
+            let Some(module) = self.compiled_modules.compiled_modules.get(name.as_ref()) else {
+                return false;
+            };
+            pending.extend(
+                module
+                    .require_objects
+                    .iter()
+                    .map(|require| require.path.clone()),
+            );
+        }
+        true
+    }
+
+    fn discover_exports(
+        &mut self,
+        required: &PathOrBuiltIn,
+        discovered: &mut FxHashMap<PathBuf, ModuleExports>,
+    ) -> Result<ModuleExports> {
+        let path = required.get_path().into_owned();
+        if let Some(exports) = discovered.get(&path) {
+            return Ok(exports.clone());
+        }
+        if self.cached_exports_are_current(required) {
+            let module = &self.compiled_modules.compiled_modules[&path];
+            let exports = ModuleExports {
+                provides: module.provides.clone(),
+                macros: module.macro_map.clone(),
+            };
+            discovered.insert(path, exports.clone());
+            return Ok(exports);
+        }
+        if !self.visited.insert(path.clone()) {
+            stop!(Generic => format!("circular dependency found during module resolution with: {:?}", path));
+        }
+        let previous_metadata = self.file_metadata.get(&path).copied();
+        let result = self.load_required(required).and_then(|mut module| {
+            let mut parsed = ParsedModule {
+                ast: module.source_ast.clone(),
+                metadata: module.file_metadata.get(&path).copied(),
+                requires: FxHashMap::default(),
+            };
+            module.collect_requires()?;
+            module.collect_provides()?;
+            module.extract_macro_defs()?;
+            let module_globals = collect_globals(&module.source_ast);
+            let globals = GlobalMap::Set(&module_globals);
+            for provide in &mut module.provides {
+                expand(provide, &module.macro_map, globals)?;
+            }
+            for require in module.require_objects.clone() {
+                let exports = module.discover_exports(&require.path, discovered)?;
+                let mut imported_macros = FxHashMap::default();
+                imported_bindings(
+                    &require,
+                    &exports.provides,
+                    &exports.macros,
+                    |name, smacro| {
+                        if let Some(smacro) = smacro {
+                            imported_macros.insert(name, smacro.clone());
+                        }
+                    },
+                );
+                for provide in &mut module.provides {
+                    let exclusions = HashSet::new();
+                    let mut expander = Expander::new(&imported_macros, &exclusions, globals);
+                    expander.expand(provide)?;
+                    if expander.changed {
+                        expand(provide, &exports.macros, globals)?;
+                    }
+                }
+            }
+            parsed.requires = module.parsed_requires;
+            Ok((
+                parsed,
+                ModuleExports {
+                    provides: module.provides,
+                    macros: module.macro_map,
+                },
+            ))
+        });
+        // Discovery must not make compilation mistake a changed module for a cached one.
+        match previous_metadata {
+            Some(previous) => {
+                self.file_metadata.insert(path.clone(), previous);
+            }
+            None => {
+                self.file_metadata.remove(&path);
+            }
+        }
+        self.visited.remove(&path);
+        let (parsed, exports) = result?;
+        self.parsed_requires.insert(path.clone(), parsed);
+        discovered.insert(path, exports.clone());
+        Ok(exports)
     }
 
     fn load_required(&mut self, path: &PathOrBuiltIn) -> Result<ModuleBuilder<'_>> {
@@ -2323,9 +2416,10 @@ impl<'a> ModuleBuilder<'a> {
             matches!(path, PathOrBuiltIn::Path(_)),
             self.prelude_string,
         );
-        if let Some((ast, metadata)) = parsed {
-            module.source_ast = ast;
-            if let Some(metadata) = metadata {
+        if let Some(parsed) = parsed {
+            module.source_ast = parsed.ast;
+            module.parsed_requires = parsed.requires;
+            if let Some(metadata) = parsed.metadata {
                 module.file_metadata.insert(name, metadata);
             }
             return Ok(module);
@@ -2626,8 +2720,8 @@ impl<'a> ModuleBuilder<'a> {
                 require,
                 &module.provides,
                 &module.macro_map,
-                |name, is_macro| {
-                    if !is_macro {
+                |name, smacro| {
+                    if smacro.is_none() {
                         native_heads.insert(name);
                     }
                 },

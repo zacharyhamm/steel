@@ -189,11 +189,15 @@ impl SteelMacro {
     }
 
     pub fn exprs_mut(&mut self) -> impl Iterator<Item = &mut ExprKind> {
-        self.cases.iter_mut().map(|x| &mut x.body)
+        self.cases
+            .iter_mut()
+            .flat_map(|x| std::iter::once(&mut x.body).chain(x.native_struct_body.iter_mut()))
     }
 
     pub fn exprs(&self) -> impl Iterator<Item = &ExprKind> {
-        self.cases.iter().map(|x| &x.body)
+        self.cases
+            .iter()
+            .flat_map(|x| std::iter::once(&x.body).chain(x.native_struct_body.iter()))
     }
 
     pub fn mark_mangled(&mut self) {
@@ -356,6 +360,8 @@ pub struct MacroCase {
     args: PatternList,
 
     pub(crate) body: ExprKind,
+    // Whether `struct` is native is only known when the macro expands.
+    native_struct_body: Option<ExprKind>,
 }
 
 struct PatternContext<'a> {
@@ -368,7 +374,11 @@ struct PatternContext<'a> {
 impl MacroCase {
     #[cfg(test)]
     pub fn new(args: PatternList, body: ExprKind) -> Self {
-        MacroCase { args, body }
+        MacroCase {
+            args,
+            body,
+            native_struct_body: None,
+        }
     }
 
     pub fn all_bindings(&self) -> Vec<String> {
@@ -431,6 +441,9 @@ impl MacroCase {
         let template_parser = MacroTemplate::new(ctx.bindings);
         template_parser.verify(&body)?;
 
+        let mut native_struct_body = body.clone();
+        let has_native_struct = RenameIdentifiersVisitor::new(&args_str, special_forms)
+            .rename_native_struct_template(&mut native_struct_body);
         RenameIdentifiersVisitor::new(&args_str, special_forms).rename_identifiers(&mut body);
 
         args.iter_mut().for_each(|x| x.mangle(special_forms));
@@ -441,6 +454,7 @@ impl MacroCase {
         Ok(MacroCase {
             args: PatternList::new(args).with_improper(improper),
             body,
+            native_struct_body: has_native_struct.then_some(native_struct_body),
         })
     }
 
@@ -532,7 +546,14 @@ impl MacroCase {
                         IntroducedByMacro.visit(v);
                     }
 
-                    let mut body = self.body.clone();
+                    let mut body = if native_struct
+                        && !globals.actually_contains(&steel_parser::ast::STRUCT_KEYWORD)
+                    {
+                        self.native_struct_body.as_ref().unwrap_or(&self.body)
+                    } else {
+                        &self.body
+                    }
+                    .clone();
 
                     // Give the identifiers in the template a mark unique to this expansion.
                     // This happens before the pattern variables are substituted, so only
@@ -1905,6 +1926,7 @@ mod macro_case_expand_test {
     #[test]
     fn test_basic_expansion() {
         let case = MacroCase {
+            native_struct_body: None,
             args: PatternList::new(vec![
                 MacroPattern::Syntax("test".into(), false),
                 MacroPattern::Single("a".into()),
