@@ -464,6 +464,15 @@ impl ExpressionType {
     }
 }
 
+// Whether evaluating an expression can create a closure.
+struct CreatesClosure(bool);
+
+impl VisitorMutUnit for CreatesClosure {
+    fn visit_lambda_function(&mut self, _lambda_function: &LambdaFunction) {
+        self.0 = true;
+    }
+}
+
 fn set(var: ExprKind, expr: ExprKind) -> ExprKind {
     ExprKind::Set(Box::new(Set::new(
         var,
@@ -482,13 +491,21 @@ fn convert_exprs_to_let(begin: Box<Begin>) -> ExprKind {
         return ExprKind::Begin(begin);
     }
 
-    // Nonconstant initializers can return closures that capture later definitions.
-    if expression_types.iter().all(|x| {
-        matches!(
-            x,
-            ExpressionType::DefineConst(_) | ExpressionType::Expression
-        )
-    }) {
+    // A closure created up to the last definition can capture a later one, which needs every
+    // definition bound first. Otherwise, a forward reference stays an unbound identifier.
+    let last_definition = expression_types
+        .iter()
+        .rposition(|x| !x.is_expression())
+        .unwrap();
+    if !expression_types
+        .iter()
+        .any(|x| matches!(x, ExpressionType::DefineValues(_)))
+        && !begin.exprs[..=last_definition].iter().any(|expr| {
+            let mut closures = CreatesClosure(false);
+            closures.visit(expr);
+            closures.0
+        })
+    {
         return begin
             .exprs
             .into_iter()

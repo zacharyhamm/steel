@@ -4,7 +4,7 @@ use smallvec::SmallVec;
 use thin_vec::ThinVec;
 
 use crate::compiler::passes::{VisitorMutControlFlow, VisitorMutRefUnit};
-use crate::compiler::program::{ELLIPSES_SYMBOL, SYNTAX_SPAN};
+use crate::compiler::program::{ELLIPSES_SYMBOL, STRUCT_KEYWORD, SYNTAX_SPAN};
 use crate::parser::expand_visitor::GlobalMap;
 use crate::parser::parser::{ExpansionMark, SyntaxObject};
 use crate::parser::span::Span;
@@ -32,14 +32,17 @@ pub fn replace_identifiers(
     in_scope: &ScopeSet<InternedString, FxBuildHasher>,
     globals: GlobalMap,
     span: Span,
+    native_struct: bool,
 ) -> Result<()> {
     // let mut rewrite_spans = expr;
 
     RewriteSpan::new(span).visit(expr);
 
     // TODO: Replace this here!
-    ReplaceExpressions::new(bindings, binding_kind, fallback_bindings, in_scope, globals)
-        .visit(expr)
+    let mut replacement =
+        ReplaceExpressions::new(bindings, binding_kind, fallback_bindings, in_scope, globals);
+    replacement.native_struct = native_struct;
+    replacement.visit(expr)
 }
 
 pub fn expand_template_pair(
@@ -106,6 +109,7 @@ pub struct ReplaceExpressions<'a> {
     in_scope: &'a ScopeSet<InternedString, FxBuildHasher>,
     globals: GlobalMap<'a>,
     wildcard: InternedString,
+    pub(crate) native_struct: bool,
 }
 
 fn check_ellipses(expr: &ExprKind) -> bool {
@@ -194,6 +198,7 @@ impl<'a> ReplaceExpressions<'a> {
             in_scope,
             globals,
             wildcard: InternedString::from_static("_"),
+            native_struct: true,
         }
     }
 
@@ -712,8 +717,24 @@ impl<'a> VisitorMutRef for ReplaceExpressions<'a> {
 
                 self.expand_ellipses(&mut l.args)?;
 
-                for expr in l.args.iter_mut() {
-                    self.visit(expr)?;
+                let native_struct = self.native_struct
+                    && l.first_ident().is_some_and(|name| {
+                        *name == *STRUCT_KEYWORD && !self.globals.actually_contains(name)
+                    });
+                for (index, expr) in l.args.iter_mut().enumerate() {
+                    if native_struct && index == 2 {
+                        // Fields are data, but still substitute pattern variables and ellipses.
+                        ReplaceExpressions::new(
+                            self.bindings,
+                            self.binding_kind,
+                            self.fallback_bindings,
+                            &ScopeSet::default(),
+                            self.globals,
+                        )
+                        .visit(expr)?;
+                    } else {
+                        self.visit(expr)?;
+                    }
                 }
 
                 if l.improper {

@@ -3029,6 +3029,40 @@ fn raw_engine_internal_definition_scope_before_folding() {
 }
 
 #[test]
+fn raw_engine_internal_definitions_without_closures_stay_sequential() {
+    for (body, expected) in [
+        ("(define a b) (define b (+ 0 1)) a", Err("b")),
+        (
+            "(define x 1) (define y (+ x 1)) (define x (+ y 5)) x",
+            Ok(7),
+        ),
+    ] {
+        for source in [format!("((lambda () {body}))"), format!("(let () {body})")] {
+            let mut engine = Engine::new_raw_no_kernel();
+            crate::steel_vm::primitives::register_builtin_modules(&mut engine, true);
+            engine.run("(require-builtin steel/numbers)").unwrap();
+            let result = engine.run(source.clone());
+            match expected {
+                Ok(value) => assert_eq!(
+                    result
+                        .unwrap_or_else(|error| panic!("{source}: {error}"))
+                        .last(),
+                    Some(&SteelVal::IntV(value)),
+                    "{source}"
+                ),
+                Err(name) => {
+                    let message = result.unwrap_err().to_string();
+                    assert!(
+                        message.contains("FreeIdentifier") && message.trim_end().ends_with(name),
+                        "{source}: {message}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn raw_engine_native_binding_lists_are_not_macro_calls() {
     for body in [
         "(define-values (x) (answer)) x",
@@ -4359,6 +4393,74 @@ fn raw_engine_pending_bindings_preserve_imported_macro_precedence() {
 }
 
 #[test]
+fn raw_engine_transformed_exports_shadow_global_macros() {
+    for (require, imported) in [
+        ("\"transformed-export\"", "foo"),
+        ("(only-in \"transformed-export\" (foo bar))", "bar"),
+        (
+            "(prefix-in imported: \"transformed-export\")",
+            "imported:foo",
+        ),
+        (
+            "(prefix-in imported: (only-in \"transformed-export\" (foo bar)))",
+            "imported:bar",
+        ),
+    ] {
+        for definition in [
+            "(define (foo) 42)",
+            "(define-syntax foo (syntax-rules () [(foo) 42]))",
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine.register_steel_module(
+                "transformed-export".into(),
+                format!(
+                    "(define-syntax export (syntax-rules () [(export name) name]))
+                     (provide (export foo)) {definition}"
+                ),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    engine
+                        .run(format!(
+                            "(define-syntax {imported} (syntax-rules () [({imported}) 7]))
+                             (require {require}) ({imported})"
+                        ))
+                        .unwrap_or_else(|error| panic!("{require}, {definition}: {error}"))
+                        .last(),
+                    Some(&SteelVal::IntV(42)),
+                    "{require}, {definition}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_imported_macro_arguments_expand_after_import() {
+    for (source, expected) in [
+        ("(quote-it (g))", "(g)"),
+        ("(my-let ((g (lambda () 42))) (g))", "42"),
+    ] {
+        let mut engine = Engine::new_raw_no_kernel();
+        engine.register_steel_module(
+            "argument-macros".into(),
+            "(provide quote-it my-let)
+             (define-syntax quote-it (syntax-rules () [(quote-it e) 'e]))
+             (define-syntax my-let
+               (syntax-rules () [(my-let ((n v)) body) ((lambda (n) body) v)]))"
+                .into(),
+        );
+        let result = engine
+            .run(format!(
+                "(define-syntax g (syntax-rules () [(g) 1]))
+                 (require \"argument-macros\") {source}"
+            ))
+            .unwrap_or_else(|error| panic!("{source}: {error}"));
+        assert_eq!(result.last().unwrap().to_string(), expected, "{source}");
+    }
+}
+
+#[test]
 fn raw_engine_pending_file_imports_preserve_cache_invalidation() {
     let mut engine = Engine::new_raw_no_kernel();
     engine.register_steel_module(
@@ -4388,9 +4490,8 @@ fn raw_engine_pending_file_imports_preserve_cache_invalidation() {
             .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(expected))
             .unwrap();
         let result = engine.run(source.clone());
-        if expected == 42 || result.is_err() {
-            std::fs::remove_file(&path).unwrap();
-        }
+        // Each iteration rewrites the module, so remove it before any assertion can fail.
+        std::fs::remove_file(&path).unwrap();
         assert_eq!(
             result.unwrap().last(),
             Some(&SteelVal::IntV(expected as isize))
@@ -5824,6 +5925,76 @@ fn raw_engine_native_template_bindings_resolve_without_modules() {
                 "{template}"
             );
         }
+    }
+}
+
+#[test]
+fn raw_engine_struct_macro_fields_preserve_names() {
+    for (pattern, fields, call, access) in [
+        ("(m)", "(x)", "(m)", "(p-x (p 42))"),
+        ("(m field)", "(field)", "(m x)", "(p-x (p 42))"),
+        ("(m fields)", "fields", "(m (x))", "(p-x (p 42))"),
+        ("(m field ...)", "(field ...)", "(m x y)", "(p-y (p 0 42))"),
+        ("(m)", "(|##x|)", "(m)", "(p-##x (p 42))"),
+    ] {
+        for scope in ["main", "module", "imported-macro"] {
+            let mut engine = Engine::new_raw_no_kernel();
+            let definition = format!(
+                "(define-syntax m
+                   (syntax-rules () [{pattern} (begin (struct p {fields}) {access})]))"
+            );
+            let expression = format!("(let ((x #f) (y #f) (field #f) (struct #f)) {call})");
+            let source = match scope {
+                "main" => {
+                    engine.run(definition).unwrap();
+                    expression
+                }
+                "module" => {
+                    engine.register_steel_module(
+                        "struct-fields".into(),
+                        format!("{definition} (provide answer) (define answer {expression})"),
+                    );
+                    "(require \"struct-fields\") answer".to_owned()
+                }
+                _ => {
+                    engine.register_steel_module(
+                        "struct-fields".into(),
+                        format!("{definition} (provide m)"),
+                    );
+                    format!("(require \"struct-fields\") {expression}")
+                }
+            };
+            assert_eq!(
+                engine
+                    .run(source)
+                    .unwrap_or_else(|error| panic!("{scope}, {pattern}, {fields}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{scope}, {pattern}, {fields}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_struct_macro_fields_do_not_capture_runtime_arguments() {
+    for definition in [
+        "(define (struct name value) value) (define p #f)",
+        "(define-syntax struct (syntax-rules () [(struct name value) value]))",
+    ] {
+        let mut engine = Engine::new_raw_no_kernel();
+        engine
+            .run(format!(
+                "{definition}
+                 (define-syntax m (syntax-rules () [(m) (struct p (x))]))"
+            ))
+            .unwrap();
+        let error = engine.run("(let ((x (lambda () 7))) (m))").unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("FreeIdentifier") && message.trim_end().ends_with('x'),
+            "{definition}: {error}"
+        );
     }
 }
 

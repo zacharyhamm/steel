@@ -404,16 +404,25 @@ impl ModuleManager {
             module_builder.collect_requires()?;
             if !module_builder.require_objects.is_empty() {
                 let mut exclusions = HashSet::new();
-                module_builder.predeclare_imports(&mut pending_globals, &mut exclusions)?;
+                let mut imported_macros = FxHashSet::default();
+                module_builder.predeclare_imports(
+                    &mut pending_globals,
+                    &mut exclusions,
+                    &mut imported_macros,
+                )?;
                 let mut shadowed = FxHashSet::default();
                 // Keep these expansions: required modules must see the bindings they introduce.
                 for expr in &mut module_builder.source_ast {
-                    Expander::new(global_macro_map, &exclusions, GlobalMap::Map(global_map))
-                        .expand(expr)?;
+                    let mut expander =
+                        Expander::new(global_macro_map, &exclusions, GlobalMap::Map(global_map));
+                    // Imported macros expand later and may quote or bind their arguments.
+                    expander.deferred_macros = Some(&imported_macros);
+                    expander.expand(expr)?;
                     collect_defines(std::slice::from_ref(expr), &mut |name| {
                         pending_globals.insert(name);
                         shadowed.insert(name);
                         exclusions.insert(name);
+                        imported_macros.remove(&name);
                     });
                 }
                 module_macro_map = global_macro_map
@@ -2230,48 +2239,54 @@ impl<'a> ModuleBuilder<'a> {
         })
     }
 
-    // Discover main's imported values before compiling any module bodies.
+    // Discover main's imported values and macros before compiling any module bodies.
     fn predeclare_imports(
         &mut self,
         globals: &mut FxHashSet<InternedString>,
         imports: &mut HashSet<InternedString>,
+        macros: &mut FxHashSet<InternedString>,
     ) -> Result<()> {
+        let mut record = |name, is_macro| {
+            imports.insert(name);
+            if is_macro {
+                macros.insert(name);
+            } else {
+                globals.insert(name);
+            }
+        };
         for require in self.require_objects.clone() {
             let path = require.path.get_path().into_owned();
-            if matches!(require.path, PathOrBuiltIn::BuiltIn(_)) {
-                if let Some(module) = self.compiled_modules.compiled_modules.get(&path) {
-                    imported_bindings(
-                        &require,
-                        &module.provides,
-                        &module.macro_map,
-                        |name, is_macro| {
-                            imports.insert(name);
-                            if !is_macro {
-                                globals.insert(name);
-                            }
-                        },
-                    );
-                    continue;
-                }
+            // A file module's provides depend only on its own source.
+            let unchanged = match &require.path {
+                PathOrBuiltIn::BuiltIn(_) => true,
+                PathOrBuiltIn::Path(_) => std::fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .is_ok_and(|modified| self.file_metadata.get(&path) == Some(&modified)),
+            };
+            if let Some(module) = self
+                .compiled_modules
+                .compiled_modules
+                .get(&path)
+                .filter(|_| unchanged)
+            {
+                imported_bindings(&require, &module.provides, &module.macro_map, &mut record);
+                continue;
             }
             let previous_metadata = self.file_metadata.get(&path).copied();
-            let mut module = self.load_required(&require.path)?;
-            let metadata = module.file_metadata.get(&path).copied();
-            let ast = module.source_ast.clone();
-            module.collect_provides()?;
-            module.extract_macro_defs()?;
-            imported_bindings(
-                &require,
-                &module.provides,
-                &module.macro_map,
-                |name, is_macro| {
-                    imports.insert(name);
-                    if !is_macro {
-                        globals.insert(name);
-                    }
-                },
-            );
-            // Keep parsing's metadata update from hiding changes to cached file modules.
+            let parsed = self.load_required(&require.path).and_then(|mut module| {
+                let metadata = module.file_metadata.get(&path).copied();
+                let ast = module.source_ast.clone();
+                module.collect_provides()?;
+                module.extract_macro_defs()?;
+                let module_globals = collect_globals(&module.source_ast);
+                for provide in &mut module.provides {
+                    expand(provide, &module.macro_map, GlobalMap::Set(&module_globals))?;
+                }
+                imported_bindings(&require, &module.provides, &module.macro_map, &mut record);
+                Ok((ast, metadata))
+            });
+            // Keep parsing's metadata update, even a failed one, from hiding changes to cached
+            // file modules.
             match previous_metadata {
                 Some(previous) => {
                     self.file_metadata.insert(path.clone(), previous);
@@ -2280,7 +2295,7 @@ impl<'a> ModuleBuilder<'a> {
                     self.file_metadata.remove(&path);
                 }
             }
-            self.parsed_requires.insert(path, (ast, metadata));
+            self.parsed_requires.insert(path, parsed?);
         }
         Ok(())
     }

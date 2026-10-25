@@ -299,7 +299,7 @@ impl SteelMacro {
         in_scope: &ScopeSet<InternedString, FxBuildHasher>,
         globals: GlobalMap,
     ) -> Result<ExprKind> {
-        self.expand_with_global_scope(expr, span, in_scope, globals, None)
+        self.expand_with_global_scope(expr, span, in_scope, globals, None, true)
     }
 
     pub(crate) fn expand_with_global_scope(
@@ -313,9 +313,11 @@ impl SteelMacro {
             &ModuleContainer,
             GlobalMap,
         )>,
+        native_struct: bool,
     ) -> Result<ExprKind> {
         let case_to_expand = self.match_case(&expr, in_scope, globals)?;
-        let expanded_expr = case_to_expand.expand(expr, span, in_scope, globals, global_scope)?;
+        let expanded_expr =
+            case_to_expand.expand(expr, span, in_scope, globals, global_scope, native_struct)?;
 
         Ok(expanded_expr)
     }
@@ -489,6 +491,7 @@ impl MacroCase {
             &ModuleContainer,
             GlobalMap,
         )>,
+        native_struct: bool,
     ) -> Result<ExprKind> {
         thread_local! {
             static BINDINGS: RefCell<FxHashMap<InternedString, ExprKind>> = RefCell::new(FxHashMap::default());
@@ -570,6 +573,7 @@ impl MacroCase {
                         in_scope,
                         globals,
                         span,
+                        native_struct,
                     )?;
 
                     Ok(body)
@@ -1940,6 +1944,7 @@ mod macro_case_expand_test {
                 &ScopeSet::default(),
                 GlobalMap::Map(&Default::default()),
                 None,
+                true,
             )
             .unwrap();
 

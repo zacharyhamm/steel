@@ -24,6 +24,11 @@ struct Binder {
     id: usize,
 }
 
+// The name a template binder takes when resolving it by name would pick another binder.
+pub(crate) fn marked_binding_name(name: InternedString, mark: ExpansionMark) -> InternedString {
+    format!("##{}#{}", name.resolve(), mark.0).into()
+}
+
 #[derive(Default)]
 pub struct ResolveExpansionMarks {
     scope: Vec<Binder>,
@@ -74,7 +79,7 @@ impl ResolveExpansionMarks {
         });
 
         if self.renaming && self.conflicts.contains(&id) {
-            let fresh: InternedString = format!("##{}#{}", name.resolve(), mark.0).into();
+            let fresh = marked_binding_name(*name, mark);
             *name = fresh;
             self.renamed.insert(id, fresh);
         }

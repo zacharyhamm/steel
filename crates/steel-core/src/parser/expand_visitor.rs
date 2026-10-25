@@ -11,7 +11,7 @@ use steel_parser::tokens::NumberLiteral;
 
 use crate::compiler::modules::RequiredModuleMacros;
 use crate::compiler::passes::mangle::{collect_define_syntax, collect_defines};
-use crate::compiler::program::{BEGIN, LAMBDA, LAMBDA_SYMBOL, LET};
+use crate::compiler::program::{BEGIN, LAMBDA, LAMBDA_SYMBOL, LET, STRUCT_KEYWORD};
 use crate::parser::ast::ExprKind;
 use crate::parser::parser::SyntaxObject;
 use crate::parser::rename_idents::{resolve_template_bindings, TemplateBindings};
@@ -133,6 +133,7 @@ pub fn expand(
         module_globals: None,
         builtin_modules: None,
         module_scoped: false,
+        deferred_macros: None,
     };
     expander.visit(expr)?;
 
@@ -170,6 +171,7 @@ pub fn expand_with_source_id(
         module_globals: None,
         builtin_modules: None,
         module_scoped: false,
+        deferred_macros: None,
     };
 
     expander.visit(expr)
@@ -313,6 +315,9 @@ pub struct Expander<'a> {
     builtin_modules: Option<&'a ModuleContainer>,
     // Expands a module's own or imported macros, which never claim global template references.
     module_scoped: bool,
+    // Macros that expand in a later pass. Their arguments are not expressions yet, so they are
+    // left untouched.
+    pub(crate) deferred_macros: Option<&'a FxHashSet<InternedString>>,
     pub(crate) changed: bool,
     // We're going to actually check if the macro is in scope
     in_scope_values: ScopeSet<InternedString, FxBuildHasher>,
@@ -448,6 +453,7 @@ impl<'a> Expander<'a> {
             module_globals: None,
             builtin_modules: None,
             module_scoped: false,
+            deferred_macros: None,
         }
     }
 
@@ -590,6 +596,20 @@ impl<'a> Expander<'a> {
                             .get(name)
                             .is_some_and(|m| self.visible(source_id, m))
                 });
+
+                if let Some(deferred) = self.deferred_macros {
+                    if l.first()
+                        .and_then(ExprKind::atom_syntax_object)
+                        .is_some_and(|syntax| {
+                            syntax.ty.identifier().is_some_and(|name| {
+                                deferred.contains(name)
+                                    && (syntax.unresolved || !self.in_scope_values.contains(name))
+                            })
+                        })
+                    {
+                        return Ok(());
+                    }
+                }
 
                 if self.module_globals.is_some() {
                     if !l
@@ -909,6 +929,7 @@ impl<'a> Expander<'a> {
                                             .unwrap_or(self.globals),
                                         self.builtin_modules
                                             .map(|modules| (self.map, modules, self.globals)),
+                                        !self.map.contains_key(&*STRUCT_KEYWORD),
                                     )?;
                                     self.changed = true;
 
@@ -1319,7 +1340,17 @@ impl<'a> VisitorMutRef for ExpanderMany<'a> {
 
                                 // println!("Expanding many: {}", l);
 
-                                let mut expanded = m.expand(
+                                let native_struct = !self.map.contains_key(&*STRUCT_KEYWORD)
+                                    && !self.overlays.iter().any(|overlay| {
+                                        overlay.map.in_scope_macros.contains_key(&*STRUCT_KEYWORD)
+                                    })
+                                    && !found_index.is_some_and(|index| {
+                                        self.overlays[index]
+                                            .map
+                                            .module_macros
+                                            .contains_key(&*STRUCT_KEYWORD)
+                                    });
+                                let mut expanded = m.expand_with_global_scope(
                                     List::new_maybe_improper(
                                         core::mem::take(&mut l.args),
                                         l.improper,
@@ -1327,6 +1358,8 @@ impl<'a> VisitorMutRef for ExpanderMany<'a> {
                                     span,
                                     &self.in_scope_values,
                                     self.globals,
+                                    None,
+                                    native_struct,
                                 )?;
 
                                 if let Some(index) = found_index {
@@ -2085,7 +2118,7 @@ fn lower_native_form(
 // Native bindings have not passed through hygienic renaming yet.
 fn native_binding_name(name: InternedString, syntax: &SyntaxObject) -> InternedString {
     if syntax.mark.is_template() {
-        format!("##{}#{}", name.resolve(), syntax.mark.0).into()
+        crate::compiler::passes::hygiene::marked_binding_name(name, syntax.mark)
     } else {
         name
     }
