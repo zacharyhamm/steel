@@ -134,6 +134,8 @@ pub fn expand(
         builtin_modules: None,
         module_scoped: false,
         deferred_macros: None,
+        top_level_only: false,
+        native_struct_templates: true,
     };
     expander.visit(expr)?;
 
@@ -172,6 +174,8 @@ pub fn expand_with_source_id(
         builtin_modules: None,
         module_scoped: false,
         deferred_macros: None,
+        top_level_only: false,
+        native_struct_templates: true,
     };
 
     expander.visit(expr)
@@ -318,6 +322,9 @@ pub struct Expander<'a> {
     // Macros that expand in a later pass. Their arguments are not expressions yet, so they are
     // left untouched.
     pub(crate) deferred_macros: Option<&'a FxHashSet<InternedString>>,
+    // Export discovery must leave ordinary bodies for compilation with main's pending bindings.
+    top_level_only: bool,
+    pub(crate) native_struct_templates: bool,
     pub(crate) changed: bool,
     // We're going to actually check if the macro is in scope
     in_scope_values: ScopeSet<InternedString, FxBuildHasher>,
@@ -334,6 +341,7 @@ pub struct RequiredMacroMap<'a> {
 pub struct ExpanderMany<'a> {
     // Base map, but then also we want to include _all_
     pub(crate) map: &'a mut FxHashMap<InternedString, SteelMacro>,
+    pub(crate) global_macro_map: Option<&'a FxHashMap<InternedString, SteelMacro>>,
 
     pub(crate) overlays: Vec<RequiredMacroMap<'a>>,
 
@@ -353,6 +361,7 @@ impl<'a> ExpanderMany<'a> {
     ) -> Self {
         Self {
             map,
+            global_macro_map: None,
             overlays,
             in_scope_values: ScopeSet::default(),
             source_id: SourceId::none(),
@@ -382,6 +391,23 @@ impl<'a> ExpanderMany<'a> {
             self.map.remove(&name);
         });
         Ok(())
+    }
+
+    pub(crate) fn reset_for_replay(
+        &mut self,
+        macros: &FxHashMap<InternedString, SteelMacro>,
+        imports: &FxHashSet<InternedString>,
+    ) {
+        // Later definitions must not erase transformers used by earlier deferred statements.
+        self.map.clone_from(macros);
+        self.in_scope_values.clear_all();
+        for name in imports {
+            self.in_scope_values.define(*name);
+            self.map.remove(name);
+        }
+        for overlay in &mut self.overlays {
+            overlay.changed = false;
+        }
     }
 
     // An unresolved global macro can change later native heads, so defer their bodies while
@@ -454,6 +480,8 @@ impl<'a> Expander<'a> {
             builtin_modules: None,
             module_scoped: false,
             deferred_macros: None,
+            top_level_only: false,
+            native_struct_templates: true,
         }
     }
 
@@ -467,6 +495,7 @@ impl<'a> Expander<'a> {
         global_bindings: GlobalMap<'a>,
         module_globals: &'a mut FxHashSet<InternedString>,
         builtin_modules: &'a ModuleContainer,
+        top_level_only: bool,
     ) -> Result<()> {
         if map.is_empty() {
             return Ok(());
@@ -482,6 +511,7 @@ impl<'a> Expander<'a> {
         );
         expander.module_globals = Some(module_globals);
         expander.builtin_modules = Some(builtin_modules);
+        expander.top_level_only = top_level_only;
         expander.expand(expr)
     }
 
@@ -492,10 +522,9 @@ impl<'a> Expander<'a> {
                 .is_some_and(|globals| globals.contains(name))
     }
 
-    // Whether an identifier from `source` can see `m`. An expansion restricted to one module's
-    // source sees that module's macros only from identifiers originating there.
-    fn visible(&self, source: Option<SourceId>, m: &SteelMacro) -> bool {
-        self.source_id.is_none() || source == m.location.source_id()
+    // Qualified template references already identify their provider, including through imports.
+    fn visible(&self, source: Option<SourceId>, m: &SteelMacro, qualified_template: bool) -> bool {
+        self.source_id.is_none() || source == m.location.source_id() || qualified_template
     }
 
     // A nested macro can bind a global template's free reference as a parameter, which then names
@@ -564,6 +593,10 @@ impl<'a> Expander<'a> {
             stop!(Generic => "macro expansion depth reached!");
         }
 
+        if self.top_level_only && !matches!(expr, ExprKind::Begin(_) | ExprKind::List(_)) {
+            return Ok(());
+        }
+
         match expr {
             ExprKind::If(f) => self.visit_if(f),
             ExprKind::Define(d) => self.visit_define(d),
@@ -578,6 +611,16 @@ impl<'a> Expander<'a> {
             ExprKind::Macro(m) => self.visit_macro(m),
             ExprKind::Atom(a) => self.visit_atom(a),
             ExprKind::List(l) => {
+                let qualified_template = l
+                    .first()
+                    .and_then(ExprKind::atom_syntax_object)
+                    .is_some_and(|syn| {
+                        syn.mark.is_template()
+                            && syn.ty.identifier().is_some_and(|name| {
+                                name.resolve()
+                                    .starts_with(crate::compiler::modules::MACRO_MANGLE_PREFIX)
+                            })
+                    });
                 let source_id = l
                     .args
                     .first()
@@ -594,8 +637,17 @@ impl<'a> Expander<'a> {
                         && self
                             .map
                             .get(name)
-                            .is_some_and(|m| self.visible(source_id, m))
+                            .is_some_and(|m| self.visible(source_id, m, qualified_template))
                 });
+
+                if self.top_level_only
+                    && !l.first().is_some_and(is_begin_head)
+                    && !l
+                        .first_ident()
+                        .is_some_and(|name| self.map.contains_key(name))
+                {
+                    return Ok(());
+                }
 
                 if let Some(deferred) = self.deferred_macros {
                     if l.first()
@@ -910,7 +962,7 @@ impl<'a> Expander<'a> {
                             if applies {
                                 // Template references can bypass local shadowing only when their
                                 // source can see this macro.
-                                if self.visible(source_id, m)
+                                if self.visible(source_id, m, qualified_template)
                                     && (global_template_reference
                                         || *unresolved
                                         || !self.in_scope_values.contains(s))
@@ -929,7 +981,8 @@ impl<'a> Expander<'a> {
                                             .unwrap_or(self.globals),
                                         self.builtin_modules
                                             .map(|modules| (self.map, modules, self.globals)),
-                                        !self.map.contains_key(&*STRUCT_KEYWORD),
+                                        self.native_struct_templates
+                                            && !self.map.contains_key(&*STRUCT_KEYWORD),
                                     )?;
                                     self.changed = true;
 
@@ -970,8 +1023,10 @@ impl<'a> Expander<'a> {
                     _ => {}
                 }
 
-                for expr in l.args.iter_mut() {
-                    self.visit(expr)?;
+                if !self.top_level_only {
+                    for expr in l.args.iter_mut() {
+                        self.visit(expr)?;
+                    }
                 }
 
                 Ok(())
@@ -1141,6 +1196,28 @@ impl<'a> VisitorMutRef for ExpanderMany<'a> {
                         .any(|x| x.map.in_scope_macros.contains_key(name))
                         || self.map.contains_key(name)
                 });
+
+                // Native binding lists stay data until the native lowering pass.
+                if let Some(name) = l.first_ident().copied().filter(|name| {
+                    matches!(name.resolve(), "struct" | "define-values")
+                        && !self.map.contains_key(name)
+                        && !self
+                            .global_macro_map
+                            .is_some_and(|map| map.contains_key(name))
+                        && !self
+                            .overlays
+                            .iter()
+                            .any(|overlay| overlay.map.in_scope_macros.contains_key(name))
+                        && !self.in_scope_values.contains(name)
+                        && !self.globals.actually_contains(name)
+                }) {
+                    if name.resolve() == "define-values" {
+                        for producer in l.args.iter_mut().skip(2) {
+                            self.visit(producer)?;
+                        }
+                    }
+                    return Ok(());
+                }
 
                 match l.first() {
                     // TODO: Come back to this?
@@ -1341,6 +1418,9 @@ impl<'a> VisitorMutRef for ExpanderMany<'a> {
                                 // println!("Expanding many: {}", l);
 
                                 let native_struct = !self.map.contains_key(&*STRUCT_KEYWORD)
+                                    && !self
+                                        .global_macro_map
+                                        .is_some_and(|map| map.contains_key(&*STRUCT_KEYWORD))
                                     && !self.overlays.iter().any(|overlay| {
                                         overlay.map.in_scope_macros.contains_key(&*STRUCT_KEYWORD)
                                     })

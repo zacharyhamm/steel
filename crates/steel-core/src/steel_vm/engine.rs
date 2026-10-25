@@ -3103,6 +3103,205 @@ fn raw_engine_native_binding_lists_are_not_macro_calls() {
 }
 
 #[test]
+fn raw_engine_exported_macros_preserve_import_kinds() {
+    for definition in [
+        "(define-syntax inner (syntax-rules () [(inner) 42]))",
+        "(define (inner) 42)",
+    ] {
+        for (require, invocation) in [
+            ("\"inner-binding\"", "inner"),
+            ("(only-in \"inner-binding\" inner)", "inner"),
+            ("(only-in \"inner-binding\" (inner renamed))", "renamed"),
+            ("(prefix-in dep: \"inner-binding\")", "dep:inner"),
+            (
+                "(prefix-in dep: (only-in \"inner-binding\" (inner renamed)))",
+                "dep:renamed",
+            ),
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine.register_steel_module(
+                "inner-binding".into(),
+                format!("(provide inner) {definition}"),
+            );
+            engine.register_steel_module(
+                "outer-macro".into(),
+                format!(
+                    "(require {require}) (provide outer)
+                     (define-syntax outer (syntax-rules () [(outer) ({invocation})]))"
+                ),
+            );
+            engine.register_steel_module(
+                "outer-consumer".into(),
+                "(require \"outer-macro\") (provide answer)
+                 (outer) (define answer (outer))"
+                    .into(),
+            );
+            for source in [
+                "(require \"outer-consumer\") answer",
+                "(require \"outer-macro\") (outer)",
+            ] {
+                assert_eq!(
+                    engine
+                        .run(source)
+                        .unwrap_or_else(|error| panic!(
+                            "{definition}, {require}, {source}: {error}"
+                        ))
+                        .last(),
+                    Some(&SteelVal::IntV(42)),
+                    "{definition}, {require}, {source}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_struct_fields_preserve_imported_runtime_names() {
+    let mut engine = Engine::new_raw_no_kernel();
+    engine.register_steel_module("field-value".into(), "(provide x) (define x 42)".into());
+    engine.register_steel_module(
+        "field-macro".into(),
+        "(require (only-in \"field-value\" x)) (provide make)
+         (define-syntax make
+           (syntax-rules () [(make)
+             (let () (struct p (x)) (p-x (p x)))]))"
+            .into(),
+    );
+    engine.register_steel_module(
+        "field-consumer".into(),
+        "(require \"field-macro\") (provide answer) (define answer (make))".into(),
+    );
+    for source in [
+        "(require \"field-consumer\") answer",
+        "(require \"field-macro\") (let ((x 7)) (make))",
+    ] {
+        assert_eq!(
+            engine.run(source).unwrap().last(),
+            Some(&SteelVal::IntV(42)),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn raw_engine_struct_call_templates_mangle_runtime_arguments() {
+    for definition in [
+        "(define (struct name value) value)",
+        "(define-syntax struct (syntax-rules () [(struct name value) value]))",
+    ] {
+        let mut engine = Engine::new_raw_no_kernel();
+        engine.register_steel_module(
+            "argument-value".into(),
+            "(provide x) (define (x) 42)".into(),
+        );
+        engine.register_steel_module(
+            "struct-call-macro".into(),
+            format!(
+                "(require (only-in \"argument-value\" x)) (provide call)
+                 {definition}
+                 (define-syntax call (syntax-rules () [(call) (struct #f (x))]))"
+            ),
+        );
+        engine.register_steel_module(
+            "struct-call-consumer".into(),
+            "(require \"struct-call-macro\") (provide answer) (define answer (call))".into(),
+        );
+        for source in [
+            "(require \"struct-call-consumer\") answer",
+            "(require \"struct-call-macro\") (call)",
+        ] {
+            assert_eq!(
+                engine
+                    .run(source)
+                    .unwrap_or_else(|error| panic!("{definition}, {source}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{definition}, {source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_global_native_named_transformers_expand_module_arguments() {
+    let helper = "(define-syntax helper (syntax-rules () [(helper) 42]))";
+    for name in ["struct", "define-values"] {
+        for declaration in [helper, "(require \"argument-macro\")"] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine
+                .run(format!(
+                    "(define-syntax {name}
+                       (syntax-rules () [({name} value binding) (define binding value)]))"
+                ))
+                .unwrap();
+            engine.register_steel_module(
+                "argument-macro".into(),
+                format!("(provide helper) {helper}"),
+            );
+            engine.register_steel_module(
+                "global-transformer-arguments".into(),
+                format!(
+                    "{declaration} (provide answer)
+                     ({name} (helper) answer)
+                     (define (helper) 7)"
+                ),
+            );
+            assert_eq!(
+                engine
+                    .run("(require \"global-transformer-arguments\") answer")
+                    .unwrap_or_else(|error| panic!("{name}, {declaration}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{name}, {declaration}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_module_macros_preserve_native_binding_lists() {
+    for (template, definition, value) in [
+        ("(struct n (x))", "(make point)", "(point-x (point 42))"),
+        ("(define-values (n) (answer))", "(make x)", "x"),
+    ] {
+        for source in [
+            format!("{definition} (define result {value})"),
+            format!("(define result (let () {definition} {value}))"),
+        ] {
+            for imported in [false, true] {
+                let mut engine = Engine::new_raw_no_kernel();
+                let macros = format!(
+                    "(define-syntax x (syntax-rules () [(x) 17]))
+                     (define-syntax answer (syntax-rules () [(answer) 42]))
+                     (define-syntax make (syntax-rules () [(make n) {template}]))"
+                );
+                engine.register_steel_module(
+                    "native-binding-macros".into(),
+                    format!("(provide x make) {macros}"),
+                );
+                let prefix = if imported {
+                    "(require \"native-binding-macros\")"
+                } else {
+                    &macros
+                };
+                engine.register_steel_module(
+                    "native-binding-lists".into(),
+                    format!("{prefix} (provide result) {source}"),
+                );
+                assert_eq!(
+                    engine
+                        .run("(require \"native-binding-lists\") result")
+                        .unwrap_or_else(|error| panic!("{prefix}, {source}: {error}"))
+                        .last(),
+                    Some(&SteelVal::IntV(42)),
+                    "{prefix}, {source}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn raw_engine_native_expansion_preserves_macro_binding_order() {
     let mut engine = Engine::new_raw_no_kernel();
     assert_eq!(
@@ -4436,6 +4635,158 @@ fn raw_engine_transformed_exports_shadow_global_macros() {
 }
 
 #[test]
+fn raw_engine_export_discovery_preserves_private_native_named_functions() {
+    for name in ["struct", "define-values"] {
+        for binding in [
+            format!("(define ({name} a b) b)"),
+            format!("(require (only-in \"private-native-runtime\" {name}))"),
+            format!("(require (only-in \"private-native-runtime\" (identity {name})))"),
+        ] {
+            for (require, invocation) in [
+                ("\"private-native-macros\"", "make-answer"),
+                (
+                    "(only-in \"private-native-macros\" (make-answer renamed))",
+                    "renamed",
+                ),
+            ] {
+                let mut engine = Engine::new_raw_no_kernel();
+                engine.register_steel_module(
+                    "private-native-runtime".into(),
+                    format!("(provide identity {name}) (define (identity a b) b) (define ({name} a b) b)"),
+                );
+                engine.register_steel_module(
+                    "private-native-macros".into(),
+                    format!(
+                        "(provide make-answer) {binding}
+                         (define-syntax make-answer
+                           (syntax-rules () [(make-answer) ({name} #f 42)]))"
+                    ),
+                );
+                // The second consumer discovers the provider through the compiled cache.
+                for consumer in ["private-native-consumer", "cached-private-native-consumer"] {
+                    engine.register_steel_module(
+                        consumer.into(),
+                        format!(
+                            "(require {require}) (provide answer) ({invocation})
+                             (define answer ({invocation}))"
+                        ),
+                    );
+                    assert_eq!(
+                        engine
+                            .run(format!("(require \"{consumer}\") answer"))
+                            .unwrap_or_else(|error| panic!(
+                                "{binding}, {require}, {consumer}: {error}"
+                            ))
+                            .last(),
+                        Some(&SteelVal::IntV(42)),
+                        "{binding}, {require}, {consumer}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_export_discovery_predeclares_initializer_bindings() {
+    for binding in [
+        "(struct tag ())",
+        "(define-values (tag) 0)",
+        "(require \"initializer-tag\")",
+    ] {
+        let mut engine = Engine::new_raw_no_kernel();
+        engine.register_steel_module(
+            "initializer-tag".into(),
+            "(provide tag) (define tag 0)".into(),
+        );
+        engine.register_steel_module(
+            "initializer-literal-scope".into(),
+            format!(
+                "(provide answer)
+                 (define-syntax classify
+                   (syntax-rules (tag)
+                     [(classify tag) (lambda)]
+                     [(classify other) 42]))
+                 (define answer (classify tag)) {binding}"
+            ),
+        );
+        assert_eq!(
+            engine
+                .run("(require \"initializer-literal-scope\") answer")
+                .unwrap_or_else(|error| panic!("{binding}: {error}"))
+                .last(),
+            Some(&SteelVal::IntV(42)),
+            "{binding}"
+        );
+    }
+}
+
+#[test]
+fn raw_engine_export_discovery_prepares_native_heads() {
+    for (definitions, answer) in [
+        (
+            "(struct point (x)) (define (struct a b) b)",
+            "(point-x (point 42))",
+        ),
+        (
+            "(begin (struct point (x)) (begin (define (struct a b) b)))",
+            "(point-x (point 42))",
+        ),
+        ("(define-values (x) 42) (define (define-values a b) b)", "x"),
+    ] {
+        let mut engine = Engine::new_raw_no_kernel();
+        engine.register_steel_module(
+            "native-discovery".into(),
+            format!(
+                "(define-syntax x (syntax-rules () [(x v) v]))
+                 (provide answer) {definitions} (define answer {answer})"
+            ),
+        );
+        assert_eq!(
+            engine
+                .run("(require \"native-discovery\") answer")
+                .unwrap_or_else(|error| panic!("{definitions}: {error}"))
+                .last(),
+            Some(&SteelVal::IntV(42)),
+            "{definitions}"
+        );
+    }
+}
+
+#[test]
+fn raw_engine_export_discovery_preserves_provide_transformers() {
+    for provide in [
+        "(provide (export answer))",
+        "(begin (begin (provide (export answer))))",
+        "(define-syntax exports
+           (syntax-rules () [(exports name) (provide (export name))]))
+         (exports answer)",
+    ] {
+        let mut engine = Engine::new_raw_no_kernel();
+        engine.register_steel_module(
+            "shadowed-provide-transformer".into(),
+            format!(
+                "(define-syntax export (syntax-rules () [(export name) name]))
+                 {provide} (define export 17) (define (answer) 42)"
+            ),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                engine
+                    .run(
+                        "(define-syntax answer (syntax-rules () [(answer) 7]))
+                         (require \"shadowed-provide-transformer\") (answer)"
+                    )
+                    .unwrap_or_else(|error| panic!("{provide}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{provide}"
+            );
+        }
+    }
+}
+
+#[test]
 fn raw_engine_macro_generated_exports_shadow_global_macros() {
     for (require, imported) in [
         ("\"generated-exports\"", "f"),
@@ -4481,6 +4832,180 @@ fn raw_engine_macro_generated_exports_shadow_global_macros() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn raw_engine_global_macro_generated_exports_shadow_global_macros() {
+    for (require, imported) in [
+        ("\"global-generated-exports\"", "answer"),
+        ("(only-in \"global-generated-exports\" (answer f))", "f"),
+        (
+            "(prefix-in imported: \"global-generated-exports\")",
+            "imported:answer",
+        ),
+    ] {
+        let mut engine = Engine::new_raw_no_kernel();
+        engine
+            .run(
+                "(define-syntax generate
+                   (syntax-rules () [(generate name)
+                     (begin (provide name) (define (name x) x))]))",
+            )
+            .unwrap();
+        engine.register_steel_module(
+            "global-generated-exports".into(),
+            "(generate answer)".into(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                engine
+                    .run(format!(
+                        "(define-syntax {imported} (syntax-rules () [({imported} x) 0]))
+                         (require {require}) ({imported} 42)"
+                    ))
+                    .unwrap_or_else(|error| panic!("{require}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{require}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_global_export_discovery_expands_module_macro_arguments() {
+    let initializer = "(define-syntax init (syntax-rules () [(init n) (define (n a b) b)]))";
+    for declaration in [initializer, "(require \"initializer\")"] {
+        let mut engine = Engine::new_raw_no_kernel();
+        engine
+            .run("(define-syntax wrap (syntax-rules () [(wrap e b) (begin e b)]))")
+            .unwrap();
+        engine.register_steel_module(
+            "initializer".into(),
+            format!("(provide init) {initializer}"),
+        );
+        engine.register_steel_module(
+            "wrapped-initializer".into(),
+            format!(
+                "(provide answer) {declaration}
+                 (wrap (init struct) (struct #f 42))
+                 (define answer (struct #f 42))"
+            ),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                engine
+                    .run("(require \"wrapped-initializer\") answer")
+                    .unwrap_or_else(|error| panic!("{declaration}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{declaration}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_global_export_discovery_predeclares_later_bindings() {
+    for binding in [
+        "(define-values (tag) 0)",
+        "(struct tag ())",
+        "(define-syntax bind-tag (syntax-rules () [(bind-tag n) (define-values (n) 0)]))
+         (bind-tag tag)",
+    ] {
+        let mut engine = Engine::new_raw_no_kernel();
+        engine
+            .run(
+                "(define-syntax classify
+                   (syntax-rules (tag)
+                     [(classify tag unbound bound) (provide unbound)]
+                     [(classify other unbound bound) (provide bound)]))",
+            )
+            .unwrap();
+        engine.register_steel_module(
+            "classified-exports".into(),
+            format!(
+                "(classify tag export-name actual) {binding}
+                 (define (export-name x) x) (define actual 0)"
+            ),
+        );
+        engine.register_steel_module(
+            "dependent-exports".into(),
+            "(require \"classified-exports\")
+             (define-syntax export-name (syntax-rules () [(export-name name) (provide name)]))
+             (export-name answer) (define (answer x) x)"
+                .into(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                engine
+                    .run(
+                        "(define-syntax answer (syntax-rules () [(answer x) 0]))
+                         (require \"dependent-exports\") (answer 42)"
+                    )
+                    .unwrap_or_else(|error| panic!("{binding}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{binding}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_global_export_discovery_defers_function_bodies() {
+    let mut engine = Engine::new_raw_no_kernel();
+    engine
+        .run(
+            "(define-syntax generate
+               (syntax-rules () [(generate name)
+                 (begin (provide name)
+                   (define (name value)
+                     (let ((x (lambda () value))) (struct #f (x)))))]))",
+        )
+        .unwrap();
+    engine.register_steel_module("generated-function".into(), "(generate answer)".into());
+    assert_eq!(
+        engine
+            .run("(define (struct name value) value) (require \"generated-function\") (answer 42)")
+            .unwrap()
+            .last(),
+        Some(&SteelVal::IntV(42))
+    );
+}
+
+#[test]
+fn raw_engine_global_export_discovery_respects_value_bindings() {
+    for binding in [
+        "(define (generate) 0)",
+        "(define-values (generate) (lambda () 0))",
+        "(struct generate ())",
+        "(require \"runtime-generator\")",
+    ] {
+        let mut engine = Engine::new_raw_no_kernel();
+        engine
+            .run(
+                "(define-syntax generate
+                   (syntax-rules () [(generate name) (provide name)]))",
+            )
+            .unwrap();
+        engine.register_steel_module(
+            "runtime-generator".into(),
+            "(provide generate) (define (generate) 0)".into(),
+        );
+        engine.register_steel_module(
+            "shadowed-generator".into(),
+            format!("{binding} (generate) (provide answer) (define answer 42)"),
+        );
+        assert_eq!(
+            engine
+                .run("(require \"shadowed-generator\") answer")
+                .unwrap_or_else(|error| panic!("{binding}: {error}"))
+                .last(),
+            Some(&SteelVal::IntV(42)),
+            "{binding}"
+        );
     }
 }
 
@@ -5381,6 +5906,42 @@ fn raw_engine_module_runtime_define_values_does_not_bind_call_arguments() {
 }
 
 #[test]
+fn raw_engine_imported_native_named_calls_expand_arguments_before_shadowing() {
+    for name in ["struct", "define-values"] {
+        for (exported, require) in [
+            (name, "\"native-call-functions\"".to_owned()),
+            (
+                "identity",
+                format!("(only-in \"native-call-functions\" (identity {name}))"),
+            ),
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine.register_steel_module(
+                "native-call-functions".into(),
+                format!("(provide {exported}) (define ({exported} a b) a)"),
+            );
+            engine.register_steel_module(
+                "native-call-arguments".into(),
+                format!(
+                    "(require {require}) (provide answer)
+                     (define-syntax helper (syntax-rules () [(helper) 42]))
+                     (define answer ({name} (helper) 0))
+                     (define (helper) 7)"
+                ),
+            );
+            assert_eq!(
+                engine
+                    .run("(require \"native-call-arguments\") answer")
+                    .unwrap_or_else(|error| panic!("{name}, {require}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{name}, {require}"
+            );
+        }
+    }
+}
+
+#[test]
 fn raw_engine_module_native_forms_respect_runtime_imports() {
     for (name, prefix, suffix) in [
         ("struct", "st", "ruct"),
@@ -5698,6 +6259,359 @@ fn raw_engine_module_deferred_begin_definitions_shadow_macros() {
             );
         }
     }
+}
+
+#[test]
+fn raw_engine_retained_imports_do_not_capture_caller_expressions() {
+    let mut engine = Engine::new_raw_no_kernel();
+    engine.register_steel_module(
+        "helper-provider".into(),
+        "(provide foo) (define-syntax foo (syntax-rules () [(foo) 7]))".into(),
+    );
+    engine.register_steel_module(
+        "helper-importer".into(),
+        "(require \"helper-provider\") (provide bar)
+         (define-syntax bar (syntax-rules () [(bar) 0]))"
+            .into(),
+    );
+    engine.register_steel_module(
+        "helper-caller".into(),
+        "(require \"helper-importer\") (provide answer)
+         (define (foo) 42) (define answer (begin (bar) (foo)))"
+            .into(),
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            engine
+                .run("(require \"helper-caller\") answer")
+                .unwrap()
+                .last(),
+            Some(&SteelVal::IntV(42))
+        );
+    }
+}
+
+#[test]
+fn raw_engine_retained_imports_exclude_unselected_macros() {
+    let mut engine = Engine::new_raw_no_kernel();
+    engine.register_steel_module(
+        "only-helper-provider".into(),
+        "(provide foo unused)
+         (define-syntax foo (syntax-rules () [(foo) 7]))
+         (define-syntax unused (syntax-rules () [(unused) 0]))"
+            .into(),
+    );
+    engine.register_steel_module(
+        "only-helper-importer".into(),
+        "(require (only-in \"only-helper-provider\" unused)) (provide outer)
+         (define-syntax foo (syntax-rules () [(foo) 42]))
+         (define-syntax outer (syntax-rules () [(outer) (foo)]))"
+            .into(),
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            engine
+                .run("(require \"only-helper-importer\") (outer)")
+                .unwrap()
+                .last(),
+            Some(&SteelVal::IntV(42))
+        );
+    }
+}
+
+#[test]
+fn raw_engine_retained_imports_preserve_template_dependencies() {
+    for (require, imported) in [
+        ("\"template-helper\"", "foo"),
+        ("(only-in \"template-helper\" (foo renamed))", "renamed"),
+        ("(prefix-in dep: \"template-helper\")", "dep:foo"),
+        (
+            "(prefix-in dep: (only-in \"template-helper\" (foo renamed)))",
+            "dep:renamed",
+        ),
+    ] {
+        let mut engine = Engine::new_raw_no_kernel();
+        engine.register_steel_module(
+            "template-helper".into(),
+            "(provide foo) (define private-value 7)
+             (define-syntax private-helper (syntax-rules () [(private-helper) private-value]))
+             (define-syntax foo (syntax-rules () [(foo) (private-helper)]))"
+                .into(),
+        );
+        engine.register_steel_module(
+            "template-importer".into(),
+            format!(
+                "(require {require}) (provide bar pass quote-name local native)
+                 (define-syntax bar (syntax-rules () [(bar) ({imported})]))
+                 (define-syntax pass (syntax-rules () [(pass {imported}) {imported}]))
+                 (define-syntax quote-name (syntax-rules () [(quote-name) '{imported}]))
+                 (define-syntax local
+                   (syntax-rules () [(local) (let (({imported} (lambda () 42))) ({imported}))]))
+                 (define-syntax native
+                   (syntax-rules () [(native)
+                     (let () (struct point ({imported})) (point-{imported} (point 42)))]))"
+            ),
+        );
+        engine.register_steel_module(
+            "template-reexport".into(),
+            "(require \"template-importer\") (provide bar pass quote-name local native)".into(),
+        );
+        engine.register_steel_module(
+            "template-caller".into(),
+            "(require \"template-reexport\") (provide answer)
+             (define (private-helper) 42) (define answer (bar))"
+                .into(),
+        );
+        for _ in 0..2 {
+            for (source, expected) in [
+                ("(require \"template-caller\") answer", SteelVal::IntV(7)),
+                ("(require \"template-reexport\") (bar)", SteelVal::IntV(7)),
+                ("(bar)", SteelVal::IntV(7)),
+                ("(pass 42)", SteelVal::IntV(42)),
+                ("(define (foo) 42) (pass (foo))", SteelVal::IntV(42)),
+                ("(quote-name)", SteelVal::SymbolV(imported.into())),
+                ("(local)", SteelVal::IntV(42)),
+                ("(native)", SteelVal::IntV(42)),
+            ] {
+                assert_eq!(
+                    engine
+                        .run(source)
+                        .unwrap_or_else(|error| panic!("{require}, {source}: {error}"))
+                        .last(),
+                    Some(&expected),
+                    "{require}, {source}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_retained_imports_preserve_native_template_locals() {
+    for body in [
+        "(let () (define-values (foo) (lambda () 42)) (foo))",
+        "(let () (struct foo (x)) (foo-x (foo 42)))",
+        "(let () (struct foo (x)) (if (foo? (foo 42)) 42 7))",
+        "(let () (define (read) (foo)) (define-values (foo) (lambda () 42)) (read))",
+    ] {
+        let mut engine = Engine::new_raw_no_kernel();
+        engine.register_steel_module(
+            "native-local-helper".into(),
+            "(provide foo foo? foo-x)
+             (define-syntax foo (syntax-rules () [(foo args ...) 0]))
+             (define-syntax foo? (syntax-rules () [(foo? args ...) #f]))
+             (define-syntax foo-x (syntax-rules () [(foo-x args ...) 0]))"
+                .into(),
+        );
+        engine.register_steel_module(
+            "native-local-template".into(),
+            format!(
+                "(require \"native-local-helper\") (provide bar free)
+                 (define-syntax bar (syntax-rules () [(bar) {body}]))
+                 (define-syntax free (syntax-rules () [(free) (begin {body} (foo))]))"
+            ),
+        );
+        engine.register_steel_module(
+            "native-local-reexport".into(),
+            "(require \"native-local-template\") (provide bar free)".into(),
+        );
+        for module in ["native-local-template", "native-local-reexport"] {
+            for _ in 0..2 {
+                assert_eq!(
+                    engine
+                        .run(format!("(require \"{module}\") (bar)"))
+                        .unwrap_or_else(|error| panic!("{body}: {error}"))
+                        .last(),
+                    Some(&SteelVal::IntV(42)),
+                    "{body}"
+                );
+                assert_eq!(
+                    engine.run("(free)").unwrap().last(),
+                    Some(&SteelVal::IntV(0))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_retained_imports_preserve_literal_identity() {
+    let mut engine = Engine::new_raw_no_kernel();
+    engine.register_steel_module(
+        "literal-tag".into(),
+        "(provide tag) (define-syntax tag (syntax-rules () [(tag) 19]))".into(),
+    );
+    engine.register_steel_module(
+        "literal-template".into(),
+        "(require \"literal-tag\") (provide bar check call-tag)
+         (define-syntax check (syntax-rules (tag) [(check tag) 42] [(check _) 7]))
+         (define-syntax bar (syntax-rules () [(bar) (check tag)]))
+         (define-syntax call-tag (syntax-rules () [(call-tag) (tag)]))"
+            .into(),
+    );
+    engine.register_steel_module(
+        "literal-reexport".into(),
+        "(require \"literal-template\") (provide bar check call-tag)".into(),
+    );
+    for module in ["literal-template", "literal-reexport"] {
+        for _ in 0..2 {
+            engine.run(format!("(require \"{module}\")")).unwrap();
+            for (source, expected) in [
+                ("(bar)", 42),
+                ("(check tag)", 42),
+                ("(check other)", 7),
+                ("(let ((tag 0)) (check tag))", 7),
+                ("(let ((tag 0)) (bar))", 42),
+                ("(call-tag)", 19),
+            ] {
+                assert_eq!(
+                    engine.run(source).unwrap().last(),
+                    Some(&SteelVal::IntV(expected)),
+                    "{module}: {source}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_export_discovery_replays_macro_bindings_in_order() {
+    let declaration = "(define-syntax helper (syntax-rules () [(helper ignored) 42]))";
+    for helper in [declaration, "(require \"ordered-helper\")"] {
+        for prefix in ["", "(ignore)"] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine
+                .run("(define-syntax ignore (syntax-rules () [(ignore) 0]))")
+                .unwrap();
+            engine.register_steel_module(
+                "ordered-helper".into(),
+                format!("(provide helper) {declaration}"),
+            );
+            engine.register_steel_module(
+                "ordered-macros".into(),
+                format!(
+                    "(provide answer helper) {helper} {prefix}
+                 (define-syntax bind (syntax-rules () [(bind name) (define name 7)]))
+                 (define answer (helper (lambda)))
+                 (bind helper)"
+                ),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    engine
+                        .run("(require \"ordered-macros\") answer")
+                        .unwrap_or_else(|error| panic!("{helper}, {prefix}: {error}"))
+                        .last(),
+                    Some(&SteelVal::IntV(42))
+                );
+                assert_eq!(
+                    engine.run("helper").unwrap().last(),
+                    Some(&SteelVal::IntV(7))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_retained_imports_preserve_first_match() {
+    for (first, second) in [(1, 2), (2, 1)] {
+        let mut engine = Engine::new_raw_no_kernel();
+        for value in [1, 2] {
+            engine.register_steel_module(
+                format!("foo-{value}"),
+                format!("(provide foo) (define-syntax foo (syntax-rules () [(foo) {value}]))"),
+            );
+        }
+        engine.register_steel_module(
+            "first-import".into(),
+            format!(
+                "(require \"foo-{first}\" \"foo-{second}\") (provide bar inside)
+                 (define-syntax bar (syntax-rules () [(bar) (foo)]))
+                 (define inside (bar))"
+            ),
+        );
+        engine.register_steel_module(
+            "first-reexport".into(),
+            "(require \"first-import\") (provide bar inside)".into(),
+        );
+        for module in ["first-import", "first-reexport"] {
+            for _ in 0..2 {
+                engine.run(format!("(require \"{module}\")")).unwrap();
+                for source in ["inside", "(bar)"] {
+                    assert_eq!(
+                        engine.run(source).unwrap().last(),
+                        Some(&SteelVal::IntV(first)),
+                        "{module}: {source}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_export_discovery_respects_main_pending_definitions() {
+    for definition in [
+        "(define (struct a b) b)",
+        "(bind struct)",
+        "(begin (bind struct))",
+    ] {
+        for source in [
+            format!("{definition} (require \"native-struct-provider\") answer"),
+            format!("(require \"native-struct-provider\") {definition} answer"),
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine
+                .run("(define-syntax struct (syntax-rules () [(struct) 0]))")
+                .unwrap();
+            engine.register_steel_module(
+                "native-struct-provider".into(),
+                "(provide answer) (struct point (x)) (define answer (point-x (point 42)))".into(),
+            );
+            assert_eq!(
+                engine
+                    .run(format!(
+                        "(define-syntax bind (syntax-rules () [(bind name) (define (name a b) b)]))
+                     {source}"
+                    ))
+                    .unwrap()
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_export_discovery_defers_global_errors_to_compilation() {
+    let mut engine = Engine::new_raw_no_kernel();
+    engine
+        .run("(define-syntax struct (syntax-rules () [(struct) 0]))")
+        .unwrap();
+    engine.register_steel_module(
+        "invalid-global-call".into(),
+        "(provide answer) (struct point (x)) (define answer 42)".into(),
+    );
+    assert!(engine.run("(require \"invalid-global-call\")").is_err());
+
+    engine.register_steel_module(
+        "imported-bind".into(),
+        "(provide bind answer) (struct) (define answer 42)
+         (define-syntax bind (syntax-rules () [(bind name) 0]))"
+            .into(),
+    );
+    assert_eq!(
+        engine
+            .run(
+                "(define-syntax bind (syntax-rules () [(bind name) (define (name a b) b)]))
+             (bind struct) (require \"imported-bind\") answer"
+            )
+            .unwrap()
+            .last(),
+        Some(&SteelVal::IntV(42))
+    );
 }
 
 #[test]
@@ -6309,6 +7223,30 @@ fn raw_engine_struct_macro_template_shadowing_preserves_expressions() {
              (let ((struct (lambda (name value) value)) (x (lambda () 42)))
                (struct #f (x)))])) (m)"
             )
+            .unwrap()
+            .last(),
+        Some(&SteelVal::IntV(42))
+    );
+}
+
+#[test]
+fn raw_engine_module_struct_templates_use_definition_site_bindings() {
+    let mut engine = Engine::new_raw_no_kernel();
+    engine
+        .run(
+            "(define (struct name value) value)
+             (define-syntax make-answer
+               (syntax-rules () [(make-answer)
+                 (let ((x (lambda () 42))) (struct #f (x)))]))",
+        )
+        .unwrap();
+    engine.register_steel_module(
+        "struct-template-scope".into(),
+        "(provide answer) (define answer (make-answer))".into(),
+    );
+    assert_eq!(
+        engine
+            .run("(require \"struct-template-scope\") answer")
             .unwrap()
             .last(),
         Some(&SteelVal::IntV(42))

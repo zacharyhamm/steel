@@ -159,6 +159,7 @@ pub struct SteelMacro {
     pub(crate) cases: Vec<MacroCase>,
     mangled: bool,
     pub(crate) location: Span,
+    // Retained imports are already qualified in their provider's namespace.
     pub(crate) special_mangled: bool,
 }
 
@@ -361,7 +362,7 @@ pub struct MacroCase {
 
     pub(crate) body: ExprKind,
     // Whether `struct` is native is only known when the macro expands.
-    native_struct_body: Option<ExprKind>,
+    pub(crate) native_struct_body: Option<ExprKind>,
 }
 
 struct PatternContext<'a> {
@@ -546,8 +547,13 @@ impl MacroCase {
                         IntroducedByMacro.visit(v);
                     }
 
+                    let template_globals = match global_scope {
+                        Some((_, _, GlobalMap::Scoped(globals, _))) => *globals,
+                        Some((_, _, globals)) => globals,
+                        None => globals,
+                    };
                     let mut body = if native_struct
-                        && !globals.actually_contains(&steel_parser::ast::STRUCT_KEYWORD)
+                        && !template_globals.actually_contains(&steel_parser::ast::STRUCT_KEYWORD)
                     {
                         self.native_struct_body.as_ref().unwrap_or(&self.body)
                     } else {
@@ -1065,6 +1071,20 @@ fn match_rest_pattern(
     }
 }
 
+fn literal_name(syntax: &SyntaxObject) -> Option<InternedString> {
+    let name = *syntax.ty.identifier()?;
+    Some(
+        if name
+            .resolve()
+            .starts_with(crate::compiler::modules::MACRO_MANGLE_PREFIX)
+        {
+            syntax.original_name.unwrap_or(name)
+        } else {
+            name
+        },
+    )
+}
+
 fn match_single_pattern(
     pattern: &MacroPattern,
     expr: &ExprKind,
@@ -1076,17 +1096,11 @@ fn match_single_pattern(
         MacroPattern::Rest(_) => unreachable!(),
         MacroPattern::Single(_) => true,
         MacroPattern::Syntax(v, _) => match expr {
-            ExprKind::Atom(Atom {
-                syn:
-                    SyntaxObject {
-                        ty: TokenType::Identifier(s),
-                        global_reference,
-                        ..
-                    },
-            }) if s == v
-                && (*global_reference || !in_scope.contains(s) && !globals.contains(s)) =>
-            {
-                true
+            ExprKind::Atom(atom) if atom.ident().is_some() => {
+                let name = atom.ident().unwrap();
+                literal_name(&atom.syn) == Some(*v)
+                    && (atom.syn.global_reference
+                        || !in_scope.contains(name) && !globals.contains(name))
             }
             ExprKind::Atom(Atom {
                 syn:
@@ -1298,16 +1312,9 @@ fn collect_bindings(
 
                 let (_, e) = expr_iter.next().ok_or_else(error_func)?;
 
-                if let ExprKind::Atom(Atom {
-                    syn:
-                        SyntaxObject {
-                            ty: TokenType::Identifier(syn),
-                            ..
-                        },
-                }) = e
-                {
-                    if s != syn {
-                        stop!(BadSyntax => "macro expansion expected keyword, found: {}", syn)
+                if let ExprKind::Atom(atom) = e {
+                    if atom.ident().is_some() && literal_name(&atom.syn) != Some(*s) {
+                        stop!(BadSyntax => "macro expansion expected keyword, found: {}", atom.ident().unwrap())
                     }
                 }
             }

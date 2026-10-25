@@ -57,7 +57,7 @@ use super::{
         begin::FlattenBegin,
         mangle::{collect_defines, collect_globals, NameMangler},
     },
-    program::{FOR_SYNTAX, ONLY_IN, PREFIX_IN, REQUIRE_IDENT_SPEC},
+    program::{FOR_SYNTAX, ONLY_IN, PREFIX_IN, REQUIRE_IDENT_SPEC, STRUCT_KEYWORD},
 };
 
 macro_rules! time {
@@ -382,6 +382,7 @@ impl ModuleManager {
 
         let no_kernel = kernel.is_none();
         let mut pending_globals = collect_globals(&exprs);
+        let discovery_macro_map;
         let module_macro_map;
         let mut module_builder = ModuleBuilder::main(
             path,
@@ -403,6 +404,12 @@ impl ModuleManager {
         if no_kernel {
             module_builder.collect_requires()?;
             if !module_builder.require_objects.is_empty() {
+                discovery_macro_map = global_macro_map
+                    .iter()
+                    .filter(|(name, _)| !pending_globals.contains(name))
+                    .map(|(name, value)| (*name, value.clone()))
+                    .collect();
+                module_builder.global_macro_map = &discovery_macro_map;
                 let mut exclusions = HashSet::new();
                 let mut imported_macros = FxHashSet::default();
                 module_builder.predeclare_imports(
@@ -715,6 +722,8 @@ impl ModuleManager {
                     &exclusions,
                     GlobalMap::Set(&name_mangler.globals),
                 );
+                expander.native_struct_templates = !module.macro_map.contains_key(&*STRUCT_KEYWORD)
+                    && !global_macro_map.contains_key(&*STRUCT_KEYWORD);
                 expander.expand(expr)?;
                 let changed = false;
 
@@ -802,56 +811,25 @@ impl ModuleManager {
     ) {
         let module = compiled_modules
             .compiled_modules
-            .get_mut(require_for_syntax)
+            .get(require_for_syntax)
             .unwrap_or_else(|| panic!("Module missing!: {:?}", require_for_syntax));
 
         let prefix = module.prefix();
 
-        // Collect globals and also, anything that is imported
+        // Only runtime bindings need module prefixes; macro names remain expandable.
         let mut globals = collect_globals(&module.ast);
-
-        // Bring in what they provided first, but then if we can't find that, we'll have to
-        // find all of the remaining ones by fetching all of their dependencies, and then
-        // reborrowing
-        globals.extend(
-            module
-                .require_objects
-                .iter()
-                .flat_map(|x| x.as_identifiers()),
-        );
-
-        let modules_to_check = module
-            .require_objects
-            .iter()
-            .filter_map(|x| {
-                if x.idents_to_import.is_empty() {
-                    Some(x.path.get_path().into_owned())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-
-        // drop(module);
-
-        for importing_module in modules_to_check {
-            let other_module = compiled_modules
-                .compiled_modules
-                .get_mut(&importing_module)
-                .unwrap();
-
-            for provide_expr in &other_module.provides {
-                // TODO: Handle provide spec stuff!
-                for provide in &provide_expr.list().unwrap().args[1..] {
-                    if let Some(ident) = provide.atom_identifier() {
-                        globals.insert(*ident);
+        for require in &module.require_objects {
+            let imported = &compiled_modules.compiled_modules[require.path.get_path().as_ref()];
+            imported_bindings(
+                require,
+                &imported.provides,
+                &imported.macro_map,
+                |name, smacro| {
+                    if smacro.is_none() {
+                        globals.insert(name);
                     }
-
-                    if let Some(list) = provide.list().and_then(|x| x.second_ident()) {
-                        globals.insert(*list);
-                    }
-                }
-            }
+                },
+            );
         }
 
         let module = compiled_modules
@@ -882,9 +860,7 @@ impl ModuleManager {
             if should_mangle {
                 for (_, smacro) in Arc::make_mut(&mut module.macro_map).iter_mut() {
                     if !smacro.special_mangled && !smacro.is_mangled() {
-                        for expr in smacro.exprs_mut() {
-                            name_mangler.visit(expr);
-                        }
+                        name_mangler.mangle_macro(smacro);
                         smacro.mark_mangled();
                     }
                 }
@@ -900,7 +876,7 @@ impl ModuleManager {
         // do this for each of the expressions in the file in this loop
         // TODO -> try not cloning this
         // TODO -> do this in the module expansion as well
-        let mut in_scope_macros = module
+        let exported_macros = module
             .provides_for_syntax
             .iter()
             // Chain with just the normal provides!
@@ -919,97 +895,33 @@ impl ModuleManager {
             })
             .collect::<FxHashMap<_, _>>();
 
-        // If the require_object specifically imports things, we should reference it
-
-        if !require_object.idents_to_import.is_empty() {
-            for maybe in &require_object.idents_to_import {
-                match maybe {
-                    MaybeRenamed::Normal(n) => {
-                        if let Some(ident) = n.atom_identifier() {
-                            // If the macro is not provided, we should
-                            // not bring it in
-                            if !in_scope_macros.contains_key(ident) {
-                                continue;
-                            }
-
-                            if let Some(mut m) = module.macro_map.get(ident).cloned() {
-                                for expr in m.exprs_mut() {
-                                    name_mangler.visit(expr);
-                                }
-
-                                if let Some(prefix) = &require_object.prefix {
-                                    in_scope_macros
-                                        .insert((prefix.to_string() + ident.resolve()).into(), m);
-
-                                    in_scope_macros.remove(ident);
-                                } else {
-                                    in_scope_macros.insert(*ident, m);
-                                }
-                            }
-                        }
-                    }
-                    MaybeRenamed::Renamed(from, to) => {
-                        if let Some(ident) = from.atom_identifier() {
-                            if let Some(mut m) = module.macro_map.get(ident).cloned() {
-                                for expr in m.exprs_mut() {
-                                    name_mangler.visit(expr);
-                                }
-                                // TODO: Remove this unwrap
-                                // in_scope_macros.insert(*to.atom_identifier().unwrap(), m);
-
-                                if let Some(ident) = from.atom_identifier() {
-                                    if in_scope_macros.remove(ident).is_none() {
-                                        continue;
-                                    }
-                                }
-
-                                if let Some(prefix) = &require_object.prefix {
-                                    in_scope_macros.insert(
-                                        (prefix.to_string()
-                                            + to.atom_identifier().unwrap().resolve())
-                                        .into(),
-                                        m,
-                                    );
-                                } else {
-                                    in_scope_macros.insert(*to.atom_identifier().unwrap(), m);
-                                }
-                            }
-                        }
-                    }
-                }
+        let mut in_scope_macros = FxHashMap::default();
+        let mut import = |from: &InternedString, to: &InternedString| {
+            if let Some(smacro) = exported_macros.get(from) {
+                let name = match &require_object.prefix {
+                    Some(prefix) => (prefix.clone() + to.resolve()).into(),
+                    None => *to,
+                };
+                in_scope_macros.insert(name, smacro.clone());
+            }
+        };
+        if require_object.idents_to_import.is_empty() {
+            for name in exported_macros.keys() {
+                import(name, name);
             }
         } else {
-            // Pull in all of the macros that the module exposes
-
-            for provide_expr in &module.provides {
-                if let Some(provide_expr) = provide_expr.list() {
-                    for ident in provide_expr.args.split_first().unwrap().1 {
-                        if let Some(ident) = ident.atom_identifier() {
-                            if let Some(mut m) = module.macro_map.get(ident).cloned() {
-                                for expr in m.exprs_mut() {
-                                    name_mangler.visit(expr);
-                                }
-
-                                if let Some(prefix) = &require_object.prefix {
-                                    in_scope_macros
-                                        .insert((prefix.to_string() + ident.resolve()).into(), m);
-
-                                    in_scope_macros.remove(ident);
-                                } else {
-                                    in_scope_macros.insert(*ident, m);
-                                }
-                            }
-                        }
-                    }
-                }
+            for ident in &require_object.idents_to_import {
+                let (from, to) = match ident {
+                    MaybeRenamed::Normal(name) => (name, name),
+                    MaybeRenamed::Renamed(from, to) => (from, to),
+                };
+                import(
+                    from.atom_identifier().unwrap(),
+                    to.atom_identifier().unwrap(),
+                );
             }
         }
 
-        // Check what macros are in scope here
-        // println!(
-        //     "In scope macros: {:#?}",
-        //     in_scope_macros.keys().collect::<Vec<_>>()
-        // );
         (module, in_scope_macros, name_mangler)
     }
 }
@@ -1035,6 +947,7 @@ pub struct CompiledModule {
 }
 
 pub static MANGLER_PREFIX: &str = "##mm";
+pub(crate) const MACRO_MANGLE_PREFIX: &str = "##macro-";
 pub static MODULE_PREFIX: &str = "__module-";
 pub static MANGLED_MODULE_PREFIX: &str = "__module-##mm";
 
@@ -1695,23 +1608,6 @@ pub struct RequireObject {
     pub span: Span,
 }
 
-impl RequireObject {
-    fn as_identifiers(&self) -> Vec<InternedString> {
-        let mut out = Vec::new();
-        for identifier in &self.idents_to_import {
-            if let MaybeRenamed::Normal(n) = identifier {
-                if let Some(ident) = n.atom_identifier() {
-                    if let Some(prefix) = self.prefix.as_ref() {
-                        out.push((prefix.clone() + ident.resolve()).into());
-                    }
-                }
-            }
-        }
-
-        out
-    }
-}
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum PathOrBuiltIn {
     BuiltIn(Cow<'static, str>),
@@ -2067,6 +1963,7 @@ struct ParsedModule {
 struct ModuleExports {
     provides: Vec<ExprKind>,
     macros: Arc<FxHashMap<InternedString, SteelMacro>>,
+    runtime_bindings: FxHashSet<InternedString>,
 }
 
 #[derive(Debug)]
@@ -2076,6 +1973,82 @@ pub struct RequiredModuleMacros {
     pub module_macros: Arc<FxHashMap<InternedString, SteelMacro>>,
     pub in_scope_macros: FxHashMap<InternedString, SteelMacro>,
     pub name_mangler: NameMangler,
+}
+
+fn retain_imported_macros<'a>(
+    macros: &mut Arc<FxHashMap<InternedString, SteelMacro>>,
+    required: &[RequiredModuleMacros],
+    shadowed: &FxHashSet<InternedString>,
+    module: &PathBuf,
+    provided: impl Iterator<Item = &'a InternedString>,
+) {
+    if required.is_empty() {
+        return;
+    }
+    let mut imports = FxHashMap::default();
+    let mut dependencies = FxHashMap::default();
+    for required in required {
+        if !required
+            .in_scope_macros
+            .keys()
+            .any(|name| !shadowed.contains(name))
+        {
+            continue;
+        }
+        let prefix = CompactString::new(MACRO_MANGLE_PREFIX)
+            + &path_to_prefix_name(required.module_key.clone());
+        let mut mangler = NameMangler::new(
+            required
+                .module_macros
+                .keys()
+                .filter(|name| !name.resolve().starts_with(MACRO_MANGLE_PREFIX))
+                .copied()
+                .collect(),
+            prefix.clone(),
+        );
+        let mut qualify = |smacro: &SteelMacro| {
+            let mut smacro = smacro.clone();
+            if !smacro.special_mangled {
+                mangler.mangle_macro(&mut smacro);
+                smacro.special_mangled = true;
+            }
+            smacro
+        };
+        // Keep the provider's private dependencies under names only its templates reference.
+        for (name, smacro) in required.module_macros.iter() {
+            let name = if name.resolve().starts_with(MACRO_MANGLE_PREFIX) {
+                *name
+            } else {
+                (prefix.clone() + name.resolve()).into()
+            };
+            dependencies.insert(name, qualify(smacro));
+        }
+        for (name, smacro) in &required.in_scope_macros {
+            if !shadowed.contains(name) {
+                imports.entry(*name).or_insert_with(|| qualify(smacro));
+            }
+        }
+    }
+    if imports.is_empty() {
+        return;
+    }
+    let prefix = CompactString::new(MACRO_MANGLE_PREFIX) + &path_to_prefix_name(module.clone());
+    let mut mangler = NameMangler::new(imports.keys().copied().collect(), prefix.clone());
+    let macros = Arc::make_mut(macros);
+    for smacro in macros.values_mut() {
+        mangler.mangle_macro(smacro);
+    }
+    for name in provided {
+        if let Some(smacro) = imports.get(name) {
+            macros.insert(*name, smacro.clone());
+        }
+    }
+    macros.extend(
+        imports
+            .into_iter()
+            .map(|(name, smacro)| ((prefix.clone() + name.resolve()).into(), smacro)),
+    );
+    macros.extend(dependencies);
 }
 
 fn imported_bindings(
@@ -2321,9 +2294,25 @@ impl<'a> ModuleBuilder<'a> {
         }
         if self.cached_exports_are_current(required) {
             let module = &self.compiled_modules.compiled_modules[&path];
+            let mut runtime_bindings = collect_globals(&module.ast);
+            for require in &module.require_objects {
+                let imported =
+                    &self.compiled_modules.compiled_modules[require.path.get_path().as_ref()];
+                imported_bindings(
+                    require,
+                    &imported.provides,
+                    &imported.macro_map,
+                    |name, smacro| {
+                        if smacro.is_none() {
+                            runtime_bindings.insert(name);
+                        }
+                    },
+                );
+            }
             let exports = ModuleExports {
                 provides: module.provides.clone(),
                 macros: module.macro_map.clone(),
+                runtime_bindings,
             };
             discovered.insert(path, exports.clone());
             return Ok(exports);
@@ -2341,12 +2330,22 @@ impl<'a> ModuleBuilder<'a> {
             module.collect_requires()?;
             module.collect_provides()?;
             module.extract_macro_defs()?;
-            let module_globals = collect_globals(&module.source_ast);
-            let globals = GlobalMap::Set(&module_globals);
+            let mut module_globals = collect_globals(&module.source_ast);
             let mut required_macros = Vec::new();
             let mut shadowed = FxHashSet::default();
             for require in module.require_objects.clone() {
-                let exports = module.discover_exports(&require.path, discovered)?;
+                let mut exports = module.discover_exports(&require.path, discovered)?;
+                let mut name_mangler = NameMangler::new(
+                    exports.runtime_bindings,
+                    path_to_prefix_name(require.path.get_path().into_owned()).into(),
+                );
+                // Imported templates retain their provider's private runtime bindings.
+                for smacro in Arc::make_mut(&mut exports.macros).values_mut() {
+                    if !smacro.special_mangled && !smacro.is_mangled() {
+                        name_mangler.mangle_macro(smacro);
+                        smacro.mark_mangled();
+                    }
+                }
                 let mut imported_macros = FxHashMap::default();
                 imported_bindings(
                     &require,
@@ -2365,10 +2364,25 @@ impl<'a> ModuleBuilder<'a> {
                     module_name: require.path.get_path().to_str().unwrap().to_owned(),
                     module_macros: exports.macros,
                     in_scope_macros: imported_macros,
-                    // Discovery keeps names unmangled until compilation.
-                    name_mangler: NameMangler::new(FxHashSet::default(), CompactString::default()),
+                    name_mangler,
                 });
             }
+            module_globals.extend(shadowed.iter().copied());
+            predeclare_native_bindings(
+                &module.source_ast,
+                module.global_bindings,
+                &shadowed,
+                &mut module_globals,
+                &|name| {
+                    module.macro_map.contains_key(name)
+                        || module.global_macro_map.contains_key(name)
+                        || required_macros
+                            .iter()
+                            .any(|required| required.in_scope_macros.contains_key(name))
+                },
+                &module.builtin_modules,
+            );
+            let globals = GlobalMap::Set(&module_globals);
             let overlays = required_macros
                 .iter_mut()
                 .map(|map| RequiredMacroMap {
@@ -2376,16 +2390,109 @@ impl<'a> ModuleBuilder<'a> {
                     changed: false,
                 })
                 .collect();
+            // Provides use the transformers available before runtime definitions shadow them.
+            let provide_macros = module.macro_map.clone();
             let mut expander =
                 ExpanderMany::new(Arc::make_mut(&mut module.macro_map), overlays, globals);
+            expander.global_macro_map = Some(module.global_macro_map);
+            let imported_bindings = shadowed.clone();
+            let mut definitions = FxHashSet::default();
             // Top-level macros can produce exports; ordinary bodies need not expand yet.
             for expr in &mut module.source_ast {
                 expander.expand_top_level(expr, &mut shadowed)?;
+                predeclare_native_bindings(
+                    std::slice::from_ref(expr),
+                    module.global_bindings,
+                    &shadowed,
+                    &mut definitions,
+                    &|name| {
+                        module.global_macro_map.contains_key(name)
+                            || expander.map.contains_key(name)
+                            || expander
+                                .overlays
+                                .iter()
+                                .any(|overlay| overlay.map.in_scope_macros.contains_key(name))
+                    },
+                    &module.builtin_modules,
+                );
+                collect_defines(std::slice::from_ref(expr), &mut |name| {
+                    definitions.insert(name);
+                });
+                shadowed.extend(definitions.drain());
+            }
+            flatten_module_begins(&mut module.source_ast)?;
+            expander.reset_for_replay(&provide_macros, &imported_bindings);
+            let mut shadowed = imported_bindings;
+            let mut global_shadows = collect_globals(&module.source_ast);
+            global_shadows.extend(shadowed.iter().copied());
+            let is_macro = |name: &InternedString| module.global_macro_map.contains_key(name);
+            // Match compilation: global macro literals see later native and module definitions.
+            predeclare_native_bindings(
+                &module.source_ast,
+                module.global_bindings,
+                &shadowed,
+                &mut global_shadows,
+                &is_macro,
+                &module.builtin_modules,
+            );
+            let mut prepared = 0;
+            for index in 0..module.source_ast.len() {
+                if index >= prepared {
+                    prepared = prepare_native_heads(
+                        &mut module.source_ast,
+                        index,
+                        module.global_bindings,
+                        &mut shadowed,
+                        &mut global_shadows,
+                        &is_macro,
+                    )?;
+                }
+                let expr = &mut module.source_ast[index];
+                expander.expand_in_scope(expr)?;
+                for overlay in &mut expander.overlays {
+                    if overlay.changed {
+                        expand_module_scoped(expr, &overlay.map.module_macros, globals)?;
+                        overlay.changed = false;
+                    }
+                }
+                let mut expanded = expr.clone();
+                // Main can still generate bindings that shadow these macros; compilation validates them.
+                if Expander::expand_global_macros(
+                    &mut expanded,
+                    module.global_macro_map,
+                    module.global_bindings,
+                    &mut global_shadows,
+                    &module.builtin_modules,
+                    true,
+                )
+                .is_ok()
+                {
+                    *expr = expanded;
+                }
+                if index >= prepared {
+                    prepared = prepare_native_heads(
+                        &mut module.source_ast,
+                        index,
+                        module.global_bindings,
+                        &mut shadowed,
+                        &mut global_shadows,
+                        &is_macro,
+                    )?;
+                }
+                collect_defines(
+                    std::slice::from_ref(&module.source_ast[index]),
+                    &mut |name| {
+                        shadowed.insert(name);
+                        global_shadows.insert(name);
+                        expander.in_scope_values.define(name);
+                        expander.map.remove(&name);
+                    },
+                );
             }
             flatten_module_begins(&mut module.source_ast)?;
             module.collect_provides()?;
             for provide in &mut module.provides {
-                expand(provide, &module.macro_map, globals)?;
+                expand(provide, &provide_macros, globals)?;
             }
             for required in &required_macros {
                 for provide in &mut module.provides {
@@ -2398,12 +2505,28 @@ impl<'a> ModuleBuilder<'a> {
                     }
                 }
             }
+            retain_imported_macros(
+                &mut module.macro_map,
+                &required_macros,
+                &global_shadows,
+                &module.name,
+                module
+                    .provides_for_syntax
+                    .iter()
+                    .filter_map(ExprKind::atom_identifier)
+                    .chain(module.provides.iter().flat_map(|provide| {
+                        provide.list().unwrap().args[1..]
+                            .iter()
+                            .filter_map(ExprKind::atom_identifier)
+                    })),
+            );
             parsed.requires = module.parsed_requires;
             Ok((
                 parsed,
                 ModuleExports {
                     provides: module.provides,
                     macros: module.macro_map,
+                    runtime_bindings: global_shadows,
                 },
             ))
         });
@@ -2758,6 +2881,7 @@ impl<'a> ModuleBuilder<'a> {
             );
         }
         let mut global_defs = collect_globals(&ast);
+        global_defs.extend(native_heads.iter().copied());
         // Native definitions are module globals too, so module macro templates can reference
         // them, unless an import or an earlier definition shadows their head.
         let no_kernel = self.kernel.is_none();
@@ -2775,7 +2899,6 @@ impl<'a> ModuleBuilder<'a> {
             },
         );
         let mut native_globals = global_defs.clone();
-        native_globals.extend(native_heads.iter().copied());
         let imported_bindings = native_heads.clone();
         let globals = GlobalMap::Set(&global_defs);
 
@@ -2904,7 +3027,9 @@ impl<'a> ModuleBuilder<'a> {
             })
             .collect::<Vec<_>>();
 
+        let replay_macros = macro_map.clone();
         let mut many_expander = ExpanderMany::new(macro_map, overlays, globals);
+        many_expander.global_macro_map = Some(self.global_macro_map);
         let is_macro = |expander: &ExpanderMany, name: &InternedString| {
             expander.map.contains_key(name)
                 || self.global_macro_map.contains_key(name)
@@ -3006,11 +3131,7 @@ impl<'a> ModuleBuilder<'a> {
 
         if self.kernel.is_none() {
             flatten_module_begins(&mut ast)?;
-            many_expander.in_scope_values.clear_all();
-            for name in &imported_bindings {
-                many_expander.in_scope_values.define(*name);
-                many_expander.map.remove(name);
-            }
+            many_expander.reset_for_replay(&replay_macros, &imported_bindings);
             // Later module and imported macros can define names that shadow global macros.
             collect_defines(&ast, &mut |name| {
                 native_globals.insert(name);
@@ -3051,6 +3172,7 @@ impl<'a> ModuleBuilder<'a> {
                     self.global_bindings,
                     &mut native_globals,
                     &self.builtin_modules,
+                    false,
                 )?;
                 if index >= prepared {
                     prepared = prepare_native_heads(
@@ -3093,6 +3215,20 @@ impl<'a> ModuleBuilder<'a> {
                 }
             }
         }
+        retain_imported_macros(
+            &mut self.macro_map,
+            &required_macros,
+            &native_globals,
+            &self.name,
+            self.provides_for_syntax
+                .iter()
+                .filter_map(ExprKind::atom_identifier)
+                .chain(provides.iter().flat_map(|provide| {
+                    provide.list().unwrap().args[1..]
+                        .iter()
+                        .filter_map(ExprKind::atom_identifier)
+                })),
+        );
 
         // TODO: Check HERE for whether there are more requires than were previously found.
         // If so, we should go back and compile the module again

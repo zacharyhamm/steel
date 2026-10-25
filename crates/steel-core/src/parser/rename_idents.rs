@@ -3,7 +3,7 @@ use steel_parser::ast::{
     STRUCT_KEYWORD, UNQUOTE, UNQUOTE_COMMA, UNQUOTE_SPLICING,
 };
 
-use crate::compiler::passes::mangle::{collect_define_syntax, collect_defines};
+use crate::compiler::passes::mangle::{collect_define_syntax, collect_defines, NameMangler};
 use crate::compiler::passes::VisitorMutRefUnit;
 use crate::compiler::program::{DATUM_SYNTAX, LAMBDA_SYMBOL};
 use crate::parser::ast::ExprKind;
@@ -76,6 +76,7 @@ pub struct RenameIdentifiersVisitor<'a> {
     syntax: &'a [InternedString],
     preserve_struct_fields: bool,
     preserved_struct_fields: bool,
+    mangler: Option<&'a mut NameMangler>,
     global_scope: Option<(
         &'a FxHashMap<InternedString, SteelMacro>,
         &'a ModuleContainer,
@@ -91,6 +92,7 @@ impl<'a> RenameIdentifiersVisitor<'a> {
             syntax,
             preserve_struct_fields: false,
             preserved_struct_fields: false,
+            mangler: None,
             global_scope: None,
         }
     }
@@ -113,6 +115,17 @@ impl<'a> RenameIdentifiersVisitor<'a> {
         self.preserved_struct_fields
     }
 
+    pub(crate) fn mangle_template(
+        expr: &mut ExprKind,
+        mangler: &'a mut NameMangler,
+        native_struct: bool,
+    ) {
+        let mut visitor = Self::new(&[], &[]);
+        visitor.mangler = Some(mangler);
+        visitor.preserve_struct_fields = native_struct;
+        visitor.rename_identifiers(expr);
+    }
+
     pub(crate) fn mark_global_references(
         expr: &mut ExprKind,
         macros: &'a FxHashMap<InternedString, SteelMacro>,
@@ -130,7 +143,23 @@ impl<'a> RenameIdentifiersVisitor<'a> {
     }
 
     fn visit_body(&mut self, exprs: &mut [ExprKind]) {
-        if let Some((macros, builtin_modules, globals)) = self.global_scope {
+        if let Some(mangler) = self.mangler.as_deref() {
+            let mut definitions = Vec::new();
+            predeclare_native_definitions(
+                exprs,
+                &|name| self.introduced_identifiers.contains(name),
+                GlobalMap::Set(&mangler.globals),
+                &|name| {
+                    mangler.globals.contains(name)
+                        || (!self.preserve_struct_fields && *name == *STRUCT_KEYWORD)
+                },
+                None,
+                &mut |name| definitions.push(name),
+            );
+            for name in definitions {
+                self.add(name);
+            }
+        } else if let Some((macros, builtin_modules, globals)) = self.global_scope {
             // Heads see only the bindings before the body, so introduce its definitions after.
             let mut definitions = Vec::new();
             predeclare_native_definitions(
@@ -162,7 +191,7 @@ impl<'a> RenameIdentifiersVisitor<'a> {
                 if !self.pattern_variables.contains(&name) {
                     self.add(name);
                 }
-                if self.global_scope.is_some() {
+                if self.global_scope.is_some() || self.mangler.is_some() {
                     return;
                 }
                 *syntax = SyntaxObject::default(TokenType::Identifier(
@@ -289,6 +318,12 @@ impl<'a> VisitorMutRef for RenameIdentifiersVisitor<'a> {
     fn visit_atom(&mut self, a: &mut super::ast::Atom) -> Self::Output {
         let token = a.syn.ty.clone();
         if let TokenType::Identifier(s) = token {
+            if let Some(mangler) = &mut self.mangler {
+                if !self.introduced_identifiers.contains(&s) {
+                    mangler.visit_atom(a);
+                }
+                return;
+            }
             if self.global_scope.is_some() {
                 a.syn.unresolved = !self.introduced_identifiers.contains(&s);
                 a.syn.global_reference |= a.syn.unresolved;

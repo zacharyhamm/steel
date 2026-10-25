@@ -175,7 +175,7 @@ pub struct RawSyntaxObject<T> {
     // Free reference from a global macro expanded before module names are mangled.
     #[serde(skip)]
     pub global_reference: bool,
-    // Source spelling for derived names when a native struct constructor is renamed.
+    // Source spelling for native struct names and qualified macro literal references.
     #[serde(default)]
     pub original_name: Option<InternedString>,
 }

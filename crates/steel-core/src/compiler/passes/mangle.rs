@@ -1,16 +1,18 @@
 use compact_str::CompactString;
 use rustc_hash::{FxHashMap, FxHashSet};
 use steel_parser::ast::{
-    List, DEFINE, QUASIQUOTE, QUOTE, RAW_QUOTE, RAW_UNQUOTE, RAW_UNQUOTE_SPLICING, UNQUOTE,
-    UNQUOTE_COMMA, UNQUOTE_SPLICING,
+    List, DEFINE, QUASIQUOTE, QUOTE, RAW_QUOTE, RAW_UNQUOTE, RAW_UNQUOTE_SPLICING, STRUCT_KEYWORD,
+    UNQUOTE, UNQUOTE_COMMA, UNQUOTE_SPLICING,
 };
 
 use crate::{
     compiler::{modules::MANGLER_PREFIX, program::BEGIN},
     parser::{
         ast::{Atom, ExprKind, Quote},
+        expander::SteelMacro,
         interner::InternedString,
         parser::SyntaxObject,
+        rename_idents::RenameIdentifiersVisitor,
         tokens::TokenType,
     },
 };
@@ -165,6 +167,19 @@ impl NameMangler {
         }
     }
 
+    pub(crate) fn mangle_macro(&mut self, smacro: &mut SteelMacro) {
+        for case in &mut smacro.cases {
+            // A qualified `struct` names a module binding, whose arguments are expressions.
+            if self.globals.contains(&*STRUCT_KEYWORD) {
+                case.native_struct_body = None;
+            }
+            RenameIdentifiersVisitor::mangle_template(&mut case.body, self, false);
+            if let Some(body) = &mut case.native_struct_body {
+                RenameIdentifiersVisitor::mangle_template(body, self, true);
+            }
+        }
+    }
+
     fn visit_quasiquoted(&mut self, expr: &mut ExprKind, depth: usize) {
         match expr {
             ExprKind::List(l) => {
@@ -203,11 +218,7 @@ fn is_unquote(head: &InternedString) -> bool {
 pub fn mangle_vars_with_prefix(prefix: CompactString, exprs: &mut [ExprKind]) {
     let globals = collect_globals(exprs);
 
-    let mut name_mangler = NameMangler {
-        globals,
-        prefix,
-        mangle_cache: FxHashMap::default(),
-    };
+    let mut name_mangler = NameMangler::new(globals, prefix);
 
     for expr in exprs {
         name_mangler.visit(expr);
@@ -219,6 +230,12 @@ impl VisitorMutRefUnit for NameMangler {
     fn visit_atom(&mut self, a: &mut Atom) {
         if let TokenType::Identifier(i) = &mut a.syn.ty {
             if !a.syn.global_reference && self.globals.contains(i) {
+                if self
+                    .prefix
+                    .starts_with(crate::compiler::modules::MACRO_MANGLE_PREFIX)
+                {
+                    a.syn.original_name.get_or_insert(*i);
+                }
                 if let Some(new) = self.mangle_cache.get(i) {
                     *i = *new;
                 } else {
