@@ -124,25 +124,21 @@ pub fn expand(
     map: &FxHashMap<InternedString, SteelMacro>,
     globals: GlobalMap,
 ) -> Result<ScopeSet<InternedString, FxBuildHasher>> {
+    expand_with_literal_globals(expr, map, globals, globals).map(|(scope, _)| scope)
+}
+
+pub(crate) fn expand_with_literal_globals(
+    expr: &mut ExprKind,
+    map: &FxHashMap<InternedString, SteelMacro>,
+    globals: GlobalMap,
+    literal_globals: GlobalMap,
+) -> Result<(ScopeSet<InternedString, FxBuildHasher>, bool)> {
     let exclusions = HashSet::new();
-    let mut expander = Expander {
-        depth: 0,
-        map,
-        changed: false,
-        in_scope_values: ScopeSet::default(),
-        source_id: SourceId::none(),
-        exclusions: &exclusions,
-        globals,
-        module_globals: None,
-        builtin_modules: None,
-        module_scoped: false,
-        deferred_macros: None,
-        top_level_only: false,
-        native_struct_templates: true,
-    };
+    let mut expander = Expander::new(map, &exclusions, globals);
+    expander.literal_globals = literal_globals;
     expander.visit(expr)?;
 
-    Ok(expander.in_scope_values)
+    Ok((expander.in_scope_values, expander.changed))
 }
 
 // Expand a module's own or imported macros. They cannot capture a global template's free
@@ -173,6 +169,7 @@ pub fn expand_with_source_id(
         source_id,
         exclusions,
         globals,
+        literal_globals: globals,
         module_globals: None,
         builtin_modules: None,
         module_scoped: false,
@@ -318,6 +315,8 @@ pub struct Expander<'a> {
     map: &'a FxHashMap<InternedString, SteelMacro>,
     exclusions: &'a HashSet<InternedString>,
     globals: GlobalMap<'a>,
+    // Native predeclarations affect literals before they can shadow statement heads.
+    pub(crate) literal_globals: GlobalMap<'a>,
     module_globals: Option<&'a FxHashSet<InternedString>>,
     builtin_modules: Option<&'a ModuleContainer>,
     // Expands a module's own or imported macros, which never claim global template references.
@@ -479,6 +478,7 @@ impl<'a> Expander<'a> {
             depth: 0,
             exclusions,
             globals,
+            literal_globals: globals,
             module_globals: None,
             builtin_modules: None,
             module_scoped: false,
@@ -1008,7 +1008,7 @@ impl<'a> Expander<'a> {
                                         &self.in_scope_values,
                                         self.module_globals
                                             .map(GlobalMap::Set)
-                                            .unwrap_or(self.globals),
+                                            .unwrap_or(self.literal_globals),
                                         self.builtin_modules
                                             .map(|modules| (self.map, modules, self.globals)),
                                         self.native_struct_templates

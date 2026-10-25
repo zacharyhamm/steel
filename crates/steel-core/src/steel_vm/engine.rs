@@ -4579,19 +4579,72 @@ fn raw_engine_module_global_macros_respect_pending_native_named_functions() {
 }
 
 #[test]
+fn raw_engine_imported_macros_preserve_caller_native_named_functions() {
+    for name in ["struct", "define-values"] {
+        for separate_run in [false, true] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine.register_value("list", SteelVal::FuncV(crate::primitives::lists::new));
+            engine.register_steel_module(
+                "caller-native-macro".into(),
+                "(provide m) (define-syntax m (syntax-rules () [(m) 42]))".into(),
+            );
+            let definition = format!("(define ({name} x) x)");
+            let definition = if separate_run {
+                engine.run(definition).unwrap();
+                String::new()
+            } else {
+                definition
+            };
+            assert_eq!(
+                engine
+                    .run(format!(
+                        "{definition} (require \"caller-native-macro\")
+                         (list (m) ({name} 7))"
+                    ))
+                    .unwrap_or_else(|error| panic!("{name}, separate run {separate_run}: {error}"))
+                    .last(),
+                Some(&SteelVal::ListV(
+                    vec![SteelVal::IntV(42), SteelVal::IntV(7)].into()
+                )),
+                "{name}, separate run {separate_run}"
+            );
+        }
+    }
+}
+
+#[test]
 fn raw_engine_pending_bindings_preserve_imported_macro_precedence() {
-    let mut engine = Engine::new_raw_no_kernel();
-    engine.register_steel_module(
-        "pending-macro".into(),
-        "(provide m) (define-syntax m (syntax-rules () [(m) 42]))".into(),
-    );
-    assert_eq!(
-        engine
-            .run("(define-syntax m (syntax-rules () [(m) 1])) (require \"pending-macro\") (m)")
-            .unwrap()
-            .last(),
-        Some(&SteelVal::IntV(42)),
-    );
+    for provide in ["m", "(for-syntax m)"] {
+        for (require, imported) in [
+            ("\"pending-macro\"", "m"),
+            ("(only-in \"pending-macro\" m)", "m"),
+            ("(only-in \"pending-macro\" (m renamed))", "renamed"),
+            ("(prefix-in dep: \"pending-macro\")", "dep:m"),
+            (
+                "(prefix-in dep: (only-in \"pending-macro\" (m renamed)))",
+                "dep:renamed",
+            ),
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine.register_steel_module(
+                "pending-macro".into(),
+                format!("(provide {provide}) (define-syntax m (syntax-rules () [(m) 42]))"),
+            );
+            for run in 0..2 {
+                assert_eq!(
+                    engine
+                        .run(format!(
+                            "(define-syntax {imported} (syntax-rules () [({imported}) 1]))
+                             (require {require}) ({imported})"
+                        ))
+                        .unwrap_or_else(|error| panic!("{provide}, {require}, run {run}: {error}"))
+                        .last(),
+                    Some(&SteelVal::IntV(42)),
+                    "{provide}, {require}, run {run}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -5623,6 +5676,198 @@ fn raw_engine_macro_literals_preserve_pending_global_bindings() {
                 Some(&SteelVal::IntV(expected)),
                 "{require}, {expression}"
             );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_macro_literals_see_top_level_native_bindings() {
+    for require in ["", "(require \"unused-module\")"] {
+        for (definition, literal) in [
+            ("(define tag 0)", "tag"),
+            ("(define-values (tag) 0)", "tag"),
+            ("(struct tag ())", "tag"),
+            ("(struct point (x))", "point?"),
+            ("(struct point (x))", "point-x"),
+            (
+                "(define-values (define-values) (lambda (x) x))",
+                "define-values",
+            ),
+            ("(struct struct (x))", "struct"),
+        ] {
+            for body in [
+                format!("{definition} (classify {literal})"),
+                format!("(define answer (classify {literal})) {definition} answer"),
+                format!(
+                    "(bind-name unrelated) (define answer (classify {literal})) {definition} answer"
+                ),
+            ] {
+                for (source, separate_run) in [body.clone(), format!("(begin (begin {body}))")]
+                    .into_iter()
+                    .flat_map(|source| {
+                        [false, true].map(|separate_run| (source.clone(), separate_run))
+                    })
+                {
+                    let mut engine = Engine::new_raw_no_kernel();
+                    let macros = format!(
+                        "(define-syntax bind-name (syntax-rules () [(bind-name name) (define name 0)]))
+                         (define-syntax classify
+                           (syntax-rules ({literal})
+                             [(classify {literal}) 1] [(classify other) 2]))"
+                    );
+                    let macros = if separate_run {
+                        engine.run(macros).unwrap();
+                        String::new()
+                    } else {
+                        macros
+                    };
+                    engine.register_steel_module(
+                        "unused-module".into(),
+                        "(provide unused) (define unused 0)".into(),
+                    );
+                    assert_eq!(
+                        engine
+                            .run(format!("{macros} {require} {source}"))
+                            .unwrap_or_else(|error| {
+                                panic!("{require}, {source}, separate run {separate_run}: {error}")
+                            })
+                            .last(),
+                        Some(&SteelVal::IntV(if separate_run { 2 } else { 1 })),
+                        "{require}, {source}, separate run {separate_run}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_imported_macro_literals_are_not_rebound_with_program_macros() {
+    let mut engine = Engine::new_raw_no_kernel();
+    engine.register_steel_module(
+        "literal-provider".into(),
+        "(provide classify)
+         (define-syntax classify
+           (syntax-rules (tag) [(classify tag) 1] [(classify other) 2]))"
+            .into(),
+    );
+    engine
+        .run(
+            "(define-syntax classify (syntax-rules () [(classify other) 3]))
+             (require \"literal-provider\")
+             (define-values (tag) 0)",
+        )
+        .unwrap();
+    assert_eq!(
+        engine.run("(define tag 1) (classify tag)").unwrap().last(),
+        Some(&SteelVal::IntV(2)),
+    );
+}
+
+#[test]
+fn raw_engine_macro_literals_refresh_after_generated_native_head_bindings() {
+    for require in ["", "(require \"unused-module\")"] {
+        for (name, definitions, call, literal) in [
+            (
+                "struct",
+                "(define tag 0) (define (fields) 7)",
+                "(struct tag (fields))",
+                "tag-fields",
+            ),
+            (
+                "define-values",
+                "(define-syntax tag (syntax-rules () [(tag) 0]))",
+                "(define-values (tag) 7)",
+                "tag",
+            ),
+        ] {
+            for body in [
+                format!("(bind-name {name}) {call} (classify {literal})"),
+                format!("(begin (begin (bind-name {name})) {call} (classify {literal}))"),
+            ] {
+                for separate_run in [false, true] {
+                    let mut engine = Engine::new_raw_no_kernel();
+                    let macros = format!(
+                        "(define-syntax bind-name
+                           (syntax-rules () [(bind-name name) (define (name a b) b)]))
+                         (define-syntax classify
+                           (syntax-rules ({literal})
+                             [(classify {literal}) 1] [(classify other) 2]))"
+                    );
+                    let macros = if separate_run {
+                        engine.run(macros).unwrap();
+                        String::new()
+                    } else {
+                        macros
+                    };
+                    engine.register_steel_module(
+                        "unused-module".into(),
+                        "(provide unused) (define unused 0)".into(),
+                    );
+                    assert_eq!(
+                        engine
+                            .run(format!("{macros} {require} {definitions} {body}"))
+                            .unwrap_or_else(|error| {
+                                panic!("{require}, {body}, separate run {separate_run}: {error}")
+                            })
+                            .last(),
+                        Some(&SteelVal::IntV(1)),
+                        "{require}, {body}, separate run {separate_run}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn raw_engine_macro_literals_ignore_shadowed_top_level_native_heads() {
+    for require in ["", "(require \"unused-module\")"] {
+        for (definitions, call) in [
+            (
+                "(define (struct a b) b) (define tag 0) (define (fields) 7)",
+                "(struct tag (fields))",
+            ),
+            (
+                "(define (define-values a b) b) (define (tag) 0)",
+                "(define-values (tag) 7)",
+            ),
+            (
+                "(define-syntax struct (syntax-rules () [(struct a b) 7]))",
+                "(struct tag ())",
+            ),
+            (
+                "(define-syntax define-values (syntax-rules () [(define-values a b) 7]))",
+                "(define-values (tag) 0)",
+            ),
+        ] {
+            for source in [
+                format!("{call} (classify tag)"),
+                format!("(begin {call} (classify tag))"),
+            ] {
+                let mut engine = Engine::new_raw_no_kernel();
+                engine
+                    .run(format!(
+                        "{definitions}
+                         (define-syntax classify
+                           (syntax-rules (tag) [(classify tag) 1] [(classify other) 2]))"
+                    ))
+                    .unwrap();
+                engine.register_steel_module(
+                    "unused-module".into(),
+                    "(provide unused) (define unused 0)".into(),
+                );
+                assert_eq!(
+                    engine
+                        .run(format!("{require} {source}"))
+                        .unwrap_or_else(|error| panic!(
+                            "{definitions}, {require}, {source}: {error}"
+                        ))
+                        .last(),
+                    Some(&SteelVal::IntV(1)),
+                    "{definitions}, {require}, {source}"
+                );
+            }
         }
     }
 }

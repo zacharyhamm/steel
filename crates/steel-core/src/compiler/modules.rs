@@ -48,7 +48,9 @@ use crate::stop;
 
 use crate::time::SystemTime;
 
-use crate::parser::expand_visitor::{expand, expand_module_scoped, extract_macro_defs};
+use crate::parser::expand_visitor::{
+    expand, expand_module_scoped, expand_with_literal_globals, extract_macro_defs,
+};
 
 use super::{
     compiler::KernelDefMacroSpec,
@@ -378,11 +380,23 @@ impl ModuleManager {
         // For instance, (cond) is global, but (define-syntax blagh) might be local to main
         // if a module then defines a function (blagh) that is used inside its scope, this would expand the macro in that scope
         // which we do not want
+        let mut program_macros = exprs
+            .iter()
+            .filter_map(|expr| match expr {
+                ExprKind::Macro(m) => m.name.atom_identifier().copied(),
+                _ => None,
+            })
+            .collect::<FxHashSet<_>>();
         extract_macro_defs(&mut exprs, global_macro_map, global_map)?;
 
         let no_kernel = kernel.is_none();
         let mut pending_globals = collect_globals(&exprs);
-        let discovery_macro_map;
+        let mut literal_globals = pending_globals.clone();
+        let discovery_macro_map = global_macro_map
+            .iter()
+            .filter(|(name, _)| !no_kernel || !pending_globals.contains(name))
+            .map(|(name, value)| (*name, value.clone()))
+            .collect();
         let module_macro_map;
         let mut module_builder = ModuleBuilder::main(
             path,
@@ -392,8 +406,8 @@ impl ModuleManager {
             &mut self.file_metadata,
             sources,
             kernel,
-            builtin_modules,
-            global_macro_map,
+            builtin_modules.clone(),
+            &discovery_macro_map,
             GlobalMap::Map(global_map),
             &self.custom_builtins,
             search_dirs,
@@ -403,23 +417,30 @@ impl ModuleManager {
 
         if no_kernel {
             module_builder.collect_requires()?;
+            let mut exclusions = HashSet::new();
+            let mut imported_macros = FxHashSet::default();
+            let mut shadowed = FxHashSet::default();
+            let mut refresh_literals = true;
             if !module_builder.require_objects.is_empty() {
-                discovery_macro_map = global_macro_map
-                    .iter()
-                    .filter(|(name, _)| !pending_globals.contains(name))
-                    .map(|(name, value)| (*name, value.clone()))
-                    .collect();
-                module_builder.global_macro_map = &discovery_macro_map;
-                let mut exclusions = HashSet::new();
-                let mut imported_macros = FxHashSet::default();
                 module_builder.predeclare_imports(
                     &mut pending_globals,
                     &mut exclusions,
                     &mut imported_macros,
                 )?;
-                let mut shadowed = FxHashSet::default();
+                flatten_module_begins(&mut module_builder.source_ast)?;
                 // Keep these expansions: required modules must see the bindings they introduce.
-                for expr in &mut module_builder.source_ast {
+                for index in 0..module_builder.source_ast.len() {
+                    if refresh_literals {
+                        literal_globals = refresh_main_literals(
+                            &module_builder.source_ast,
+                            global_macro_map,
+                            &program_macros,
+                            global_map,
+                            &pending_globals,
+                            &imported_macros,
+                            &builtin_modules,
+                        );
+                    }
                     let mut expander = Expander::new(
                         global_macro_map,
                         &exclusions,
@@ -427,7 +448,10 @@ impl ModuleManager {
                     );
                     // Imported macros expand later and may quote or bind their arguments.
                     expander.deferred_macros = Some(&imported_macros);
+                    expander.literal_globals = GlobalMap::Layered(global_map, &literal_globals);
+                    let expr = &mut module_builder.source_ast[index];
                     expander.expand(expr)?;
+                    refresh_literals = expander.changed;
                     collect_defines(std::slice::from_ref(expr), &mut |name| {
                         pending_globals.insert(name);
                         shadowed.insert(name);
@@ -435,25 +459,26 @@ impl ModuleManager {
                         imported_macros.remove(&name);
                     });
                 }
-                module_macro_map = global_macro_map
-                    .iter()
-                    .filter(|(name, _)| !shadowed.contains(name))
-                    .map(|(name, value)| (*name, value.clone()))
-                    .collect();
-                module_builder.global_macro_map = &module_macro_map;
-                predeclare_native_definitions(
+            }
+            if refresh_literals {
+                literal_globals = refresh_main_literals(
                     &module_builder.source_ast,
-                    &|_| false,
-                    GlobalMap::Map(global_map),
-                    &|name| module_macro_map.contains_key(name),
-                    Some(&module_builder.builtin_modules),
-                    &mut |name| {
-                        pending_globals.insert(name);
-                    },
+                    global_macro_map,
+                    &program_macros,
+                    global_map,
+                    &pending_globals,
+                    &imported_macros,
+                    &builtin_modules,
                 );
             }
+            module_macro_map = global_macro_map
+                .iter()
+                .filter(|(name, _)| !shadowed.contains(name))
+                .map(|(name, value)| (*name, value.clone()))
+                .collect();
+            module_builder.global_macro_map = &module_macro_map;
         }
-        module_builder.global_bindings = GlobalMap::Layered(global_map, &pending_globals);
+        module_builder.global_bindings = GlobalMap::Layered(global_map, &literal_globals);
         let mut module_statements = module_builder.compile()?;
         let compiled_module_count = module_statements.len();
 
@@ -683,6 +708,8 @@ impl ModuleManager {
             // dbg!(&kernel_macros_in_scope);
 
             let module_name = module.name.to_str().unwrap().to_string();
+            let mut native_globals = name_mangler.globals.clone();
+            native_globals.extend(pending_globals.iter().copied());
 
             if let Some(kernel) = kernel.as_mut() {
                 if kernel.exported_defmacros(&module_name).is_some() {
@@ -745,7 +772,11 @@ impl ModuleManager {
                         // We don't need to expand those here
                         ModuleContainer::default(),
                         &module_name,
-                        GlobalMap::Set(&name_mangler.globals),
+                        if no_kernel {
+                            GlobalMap::Layered(global_map, &native_globals)
+                        } else {
+                            GlobalMap::Set(&name_mangler.globals)
+                        },
                     )?;
 
                     if changed {
@@ -758,6 +789,7 @@ impl ModuleManager {
             // post expansion in the target environment, which means we can't _just_
             // extend the global macro map with the target in scope macros, we need to
             // do something like the two pass expansion
+            program_macros.retain(|name| !in_scope_macros.contains_key(name));
             global_macro_map.extend(in_scope_macros);
 
             lifted_macro_environments.insert(module.name.clone(), Default::default());
@@ -766,8 +798,12 @@ impl ModuleManager {
         // Include the defines from the modules now imported
         module_statements.append(&mut require_defines);
 
+        if no_kernel {
+            flatten_module_begins(&mut ast)?;
+        }
         module_statements.append(&mut ast);
 
+        let mut refresh_literals = true;
         time!("Top level macro evaluation time", {
             // Kernel-backed modules may still need prelude macros, but must not see main's macros.
             if !no_kernel {
@@ -777,14 +813,41 @@ impl ModuleManager {
                 }
             }
 
-            for expr in &mut module_statements[compiled_module_count..] {
+            for index in compiled_module_count..module_statements.len() {
+                if no_kernel && refresh_literals {
+                    literal_globals = refresh_main_literals(
+                        &module_statements[compiled_module_count..],
+                        global_macro_map,
+                        &program_macros,
+                        global_map,
+                        &pending_globals,
+                        &FxHashSet::default(),
+                        &builtin_modules,
+                    );
+                }
+                let expr = &mut module_statements[index];
                 let globals = if no_kernel {
                     GlobalMap::Layered(global_map, &pending_globals)
                 } else {
                     GlobalMap::Map(global_map)
                 };
-                let found_in_scope = expand(expr, global_macro_map, globals)?;
+                let (found_in_scope, changed) = expand_with_literal_globals(
+                    expr,
+                    global_macro_map,
+                    globals,
+                    if no_kernel {
+                        GlobalMap::Layered(global_map, &literal_globals)
+                    } else {
+                        globals
+                    },
+                )?;
+                refresh_literals = changed;
 
+                if no_kernel {
+                    collect_defines(std::slice::from_ref(expr), &mut |name| {
+                        pending_globals.insert(name);
+                    });
+                }
                 for item in found_in_scope.iter() {
                     global_macro_map.remove(item);
 
@@ -796,6 +859,17 @@ impl ModuleManager {
             }
         });
 
+        if no_kernel && refresh_literals {
+            refresh_main_literals(
+                &module_statements[compiled_module_count..],
+                global_macro_map,
+                &program_macros,
+                global_map,
+                &pending_globals,
+                &FxHashSet::default(),
+                &builtin_modules,
+            );
+        }
         Ok((module_statements, compiled_module_count))
     }
 
@@ -823,6 +897,7 @@ impl ModuleManager {
             imported_bindings(
                 require,
                 &imported.provides,
+                &imported.provides_for_syntax,
                 &imported.macro_map,
                 |name, smacro| {
                     if smacro.is_none() {
@@ -1962,6 +2037,7 @@ struct ParsedModule {
 #[derive(Clone)]
 struct ModuleExports {
     provides: Vec<ExprKind>,
+    provides_for_syntax: Vec<InternedString>,
     macros: Arc<FxHashMap<InternedString, SteelMacro>>,
     runtime_bindings: FxHashSet<InternedString>,
 }
@@ -2054,6 +2130,7 @@ fn retain_imported_macros<'a>(
 fn imported_bindings(
     require: &RequireObject,
     provides: &[ExprKind],
+    provides_for_syntax: &[InternedString],
     macros: &FxHashMap<InternedString, SteelMacro>,
     mut define: impl FnMut(InternedString, Option<&SteelMacro>),
 ) {
@@ -2069,7 +2146,12 @@ fn imported_bindings(
                 list.second_ident()
             }
             _ => None,
-        });
+        })
+        .chain(
+            provides_for_syntax
+                .iter()
+                .filter(|name| macros.contains_key(name)),
+        );
     let mut import = |from: &InternedString, to: &InternedString| {
         let imported = match &require.prefix {
             Some(prefix) => (prefix.clone() + to.resolve()).into(),
@@ -2095,6 +2177,35 @@ fn imported_bindings(
             }
         }
     }
+}
+
+fn refresh_main_literals(
+    ast: &[ExprKind],
+    macros: &mut FxHashMap<InternedString, SteelMacro>,
+    program_macros: &FxHashSet<InternedString>,
+    global_map: &FxHashMap<InternedString, usize>,
+    pending_globals: &FxHashSet<InternedString>,
+    deferred_macros: &FxHashSet<InternedString>,
+    builtin_modules: &ModuleContainer,
+) -> FxHashSet<InternedString> {
+    // Rebuild speculative bindings: an earlier expansion can turn a native form into a call.
+    let mut literal_globals = pending_globals.clone();
+    predeclare_native_definitions(
+        ast,
+        &|name| pending_globals.contains(name),
+        GlobalMap::Map(global_map),
+        &|name| macros.contains_key(name) || deferred_macros.contains(name),
+        Some(builtin_modules),
+        &mut |name| {
+            literal_globals.insert(name);
+        },
+    );
+    for name in program_macros {
+        if let Some(smacro) = macros.get_mut(name) {
+            smacro.bind_global_literals(GlobalMap::Layered(global_map, &literal_globals));
+        }
+    }
+    literal_globals
 }
 
 // Bodies can expand before a native definition after a macro call is prepared, so predeclare the
@@ -2243,7 +2354,13 @@ impl<'a> ModuleBuilder<'a> {
         let mut discovered = FxHashMap::default();
         for require in self.require_objects.clone() {
             let exports = self.discover_exports(&require.path, &mut discovered)?;
-            imported_bindings(&require, &exports.provides, &exports.macros, &mut record);
+            imported_bindings(
+                &require,
+                &exports.provides,
+                &exports.provides_for_syntax,
+                &exports.macros,
+                &mut record,
+            );
         }
         Ok(())
     }
@@ -2294,6 +2411,7 @@ impl<'a> ModuleBuilder<'a> {
                 imported_bindings(
                     require,
                     &imported.provides,
+                    &imported.provides_for_syntax,
                     &imported.macro_map,
                     |name, smacro| {
                         if smacro.is_none() {
@@ -2304,6 +2422,7 @@ impl<'a> ModuleBuilder<'a> {
             }
             let exports = ModuleExports {
                 provides: module.provides.clone(),
+                provides_for_syntax: module.provides_for_syntax.clone(),
                 macros: module.macro_map.clone(),
                 runtime_bindings,
             };
@@ -2343,6 +2462,7 @@ impl<'a> ModuleBuilder<'a> {
                 imported_bindings(
                     &require,
                     &exports.provides,
+                    &exports.provides_for_syntax,
                     &exports.macros,
                     |name, smacro| {
                         if let Some(smacro) = smacro {
@@ -2518,6 +2638,12 @@ impl<'a> ModuleBuilder<'a> {
                 parsed,
                 ModuleExports {
                     provides: module.provides,
+                    provides_for_syntax: module
+                        .provides_for_syntax
+                        .iter()
+                        .filter_map(ExprKind::atom_identifier)
+                        .copied()
+                        .collect(),
                     macros: module.macro_map,
                     runtime_bindings: global_shadows,
                 },
@@ -2865,6 +2991,7 @@ impl<'a> ModuleBuilder<'a> {
             imported_bindings(
                 require,
                 &module.provides,
+                &module.provides_for_syntax,
                 &module.macro_map,
                 |name, smacro| {
                     if smacro.is_none() {
