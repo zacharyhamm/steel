@@ -4436,6 +4436,55 @@ fn raw_engine_transformed_exports_shadow_global_macros() {
 }
 
 #[test]
+fn raw_engine_macro_generated_exports_shadow_global_macros() {
+    for (require, imported) in [
+        ("\"generated-exports\"", "f"),
+        ("(only-in \"generated-exports\" (f g))", "g"),
+        ("(prefix-in imported: \"generated-exports\")", "imported:f"),
+        (
+            "(prefix-in imported: (only-in \"generated-exports\" (f g)))",
+            "imported:g",
+        ),
+    ] {
+        for export in [
+            "(define-syntax export (syntax-rules () [(export name) (provide name)])) (export f)",
+            "(define-syntax export (syntax-rules () [(export name) (begin (provide name))])) (export f)",
+            "(require \"export-macros\") (export-name f)",
+            "(require (only-in \"export-macros\" (export-name export))) (export f)",
+            "(require (prefix-in e: \"export-macros\")) (e:export-name f)",
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine.register_steel_module(
+                "export-macros".into(),
+                "(provide export-name)
+                 (define-syntax private-export
+                   (syntax-rules () [(private-export name) (provide name)]))
+                 (define-syntax export-name
+                   (syntax-rules () [(export-name name) (private-export name)]))"
+                    .into(),
+            );
+            engine.register_steel_module(
+                "generated-exports".into(),
+                format!("(define (f x) x) {export}"),
+            );
+            for _ in 0..2 {
+                assert_eq!(
+                    engine
+                        .run(format!(
+                            "(define-syntax {imported} (syntax-rules () [({imported} x) 7]))
+                             (require {require}) ({imported} 42)"
+                        ))
+                        .unwrap_or_else(|error| panic!("{require}, {export}: {error}"))
+                        .last(),
+                    Some(&SteelVal::IntV(42)),
+                    "{require}, {export}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn raw_engine_imported_provide_transformers_shadow_global_macros() {
     for (require, imported) in [
         ("\"imports\"", "f"),
@@ -4510,52 +4559,65 @@ fn raw_engine_provide_discovery_detects_cycles() {
 
 #[test]
 fn raw_engine_imported_provide_transformer_cache_invalidation() {
-    let directory = std::env::temp_dir().join(format!(
-        "steel-provide-transformer-{}-{}",
-        std::process::id(),
-        u32::from(crate::parser::parser::SyntaxObjectId::fresh()),
-    ));
-    std::fs::create_dir(&directory).unwrap();
-    let transformer = directory.join("exports.scm");
-    let imports = directory.join("imports.scm");
-    std::fs::write(
-        &imports,
-        "(require \"exports.scm\") (provide (export-name f g))
-         (define (f x) x) (define (g x) x)",
-    )
-    .unwrap();
-    let mut engine = Engine::new_raw_no_kernel();
-    let result = (|| {
-        for (index, name) in ["f", "g"].into_iter().enumerate() {
-            std::fs::write(
-                &transformer,
-                format!(
-                    "(provide export-name)
-                         (define-syntax export-name (syntax-rules () [(export-name f g) {name}]))"
-                ),
-            )
-            .unwrap();
-            std::fs::File::options()
-                .write(true)
-                .open(&transformer)
-                .unwrap()
-                .set_modified(
-                    std::time::SystemTime::now() + std::time::Duration::from_secs(index as u64 + 1),
+    for (provide, generated) in [
+        ("(provide (export-name f g))", false),
+        ("(export-name f g)", true),
+    ] {
+        let directory = std::env::temp_dir().join(format!(
+            "steel-provide-transformer-{}-{}",
+            std::process::id(),
+            u32::from(crate::parser::parser::SyntaxObjectId::fresh()),
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let transformer = directory.join("exports.scm");
+        let imports = directory.join("imports.scm");
+        std::fs::write(
+            &imports,
+            format!(
+                "(require \"exports.scm\") {provide}
+                 (define (f x) x) (define (g x) x)"
+            ),
+        )
+        .unwrap();
+        let mut engine = Engine::new_raw_no_kernel();
+        let result = (|| {
+            for (index, name) in ["f", "g"].into_iter().enumerate() {
+                let exported = if generated {
+                    format!("(provide {name})")
+                } else {
+                    name.to_owned()
+                };
+                std::fs::write(
+                    &transformer,
+                    format!(
+                        "(provide export-name)
+                             (define-syntax export-name (syntax-rules () [(export-name f g) {exported}]))"
+                    ),
                 )
                 .unwrap();
-            for _ in 0..2 {
-                let result = engine.run(format!(
-                    "(define-syntax {name} (syntax-rules () [({name} x) 7]))
-                     (require \"{}\") ({name} 42)",
-                    imports.display().to_string().replace('\\', "\\\\"),
-                ))?;
-                assert_eq!(result.last(), Some(&SteelVal::IntV(42)), "{name}");
+                std::fs::File::options()
+                    .write(true)
+                    .open(&transformer)
+                    .unwrap()
+                    .set_modified(
+                        std::time::SystemTime::now()
+                            + std::time::Duration::from_secs(index as u64 + 1),
+                    )
+                    .unwrap();
+                for _ in 0..2 {
+                    let result = engine.run(format!(
+                        "(define-syntax {name} (syntax-rules () [({name} x) 7]))
+                         (require \"{}\") ({name} 42)",
+                        imports.display().to_string().replace('\\', "\\\\"),
+                    ))?;
+                    assert_eq!(result.last(), Some(&SteelVal::IntV(42)), "{name}");
+                }
             }
-        }
-        crate::rvals::Result::Ok(())
-    })();
-    std::fs::remove_dir_all(directory).unwrap();
-    result.unwrap();
+            crate::rvals::Result::Ok(())
+        })();
+        std::fs::remove_dir_all(directory).unwrap();
+        result.unwrap();
+    }
 }
 
 #[test]
@@ -4900,6 +4962,38 @@ fn raw_engine_module_global_macros_preserve_template_binding_scope() {
                     .last(),
                 Some(&SteelVal::IntV(expected)),
                 "{require}, {template}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_macro_literals_preserve_existing_global_bindings() {
+    for require in ["", "(require \"unused-module\")"] {
+        let mut engine = Engine::new_raw_no_kernel();
+        engine
+            .run(
+                "(define tag 0)
+                 (define-syntax classify
+                   (syntax-rules (tag) [(classify tag) 1] [(classify other) 2]))",
+            )
+            .unwrap();
+        engine.register_steel_module(
+            "unused-module".into(),
+            "(provide unused) (define unused 0)".into(),
+        );
+        for (expression, expected) in [
+            ("(classify tag)", 1),
+            ("(let ((tag 0)) (classify tag))", 2),
+            ("((lambda (tag) (classify tag)) 0)", 2),
+        ] {
+            assert_eq!(
+                engine
+                    .run(format!("{require} {expression}"))
+                    .unwrap()
+                    .last(),
+                Some(&SteelVal::IntV(expected)),
+                "{require}, {expression}"
             );
         }
     }

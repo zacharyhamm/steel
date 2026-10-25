@@ -97,10 +97,10 @@ pub enum GlobalMap<'a> {
 impl<'a> GlobalMap<'a> {
     pub fn contains(&self, i: &InternedString) -> bool {
         match self {
-            // TODO: Fix this so that we can actually leverage it!
+            // Existing globals are definition-site bindings, not expansion-site shadows.
             GlobalMap::Map(_) => false,
             GlobalMap::Set(hash_set) => hash_set.contains(i),
-            GlobalMap::Layered(map, set) => map.contains_key(i) || set.contains(i),
+            GlobalMap::Layered(_, set) => set.contains(i),
             GlobalMap::Scoped(_, set) => set.contains(i),
         }
     }

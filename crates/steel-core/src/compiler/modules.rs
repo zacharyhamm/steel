@@ -2343,9 +2343,8 @@ impl<'a> ModuleBuilder<'a> {
             module.extract_macro_defs()?;
             let module_globals = collect_globals(&module.source_ast);
             let globals = GlobalMap::Set(&module_globals);
-            for provide in &mut module.provides {
-                expand(provide, &module.macro_map, globals)?;
-            }
+            let mut required_macros = Vec::new();
+            let mut shadowed = FxHashSet::default();
             for require in module.require_objects.clone() {
                 let exports = module.discover_exports(&require.path, discovered)?;
                 let mut imported_macros = FxHashMap::default();
@@ -2356,15 +2355,46 @@ impl<'a> ModuleBuilder<'a> {
                     |name, smacro| {
                         if let Some(smacro) = smacro {
                             imported_macros.insert(name, smacro.clone());
+                        } else {
+                            shadowed.insert(name);
                         }
                     },
                 );
+                required_macros.push(RequiredModuleMacros {
+                    module_key: require.path.get_path().into_owned(),
+                    module_name: require.path.get_path().to_str().unwrap().to_owned(),
+                    module_macros: exports.macros,
+                    in_scope_macros: imported_macros,
+                    // Discovery keeps names unmangled until compilation.
+                    name_mangler: NameMangler::new(FxHashSet::default(), CompactString::default()),
+                });
+            }
+            let overlays = required_macros
+                .iter_mut()
+                .map(|map| RequiredMacroMap {
+                    map,
+                    changed: false,
+                })
+                .collect();
+            let mut expander =
+                ExpanderMany::new(Arc::make_mut(&mut module.macro_map), overlays, globals);
+            // Top-level macros can produce exports; ordinary bodies need not expand yet.
+            for expr in &mut module.source_ast {
+                expander.expand_top_level(expr, &mut shadowed)?;
+            }
+            flatten_module_begins(&mut module.source_ast)?;
+            module.collect_provides()?;
+            for provide in &mut module.provides {
+                expand(provide, &module.macro_map, globals)?;
+            }
+            for required in &required_macros {
                 for provide in &mut module.provides {
                     let exclusions = HashSet::new();
-                    let mut expander = Expander::new(&imported_macros, &exclusions, globals);
+                    let mut expander =
+                        Expander::new(&required.in_scope_macros, &exclusions, globals);
                     expander.expand(provide)?;
                     if expander.changed {
-                        expand(provide, &exports.macros, globals)?;
+                        expand(provide, &required.module_macros, globals)?;
                     }
                 }
             }
