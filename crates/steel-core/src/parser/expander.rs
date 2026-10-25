@@ -209,6 +209,26 @@ impl SteelMacro {
         self.mangled
     }
 
+    pub(crate) fn bind_global_literals(&mut self, globals: GlobalMap) {
+        fn bind(pattern: &mut MacroPattern, globals: GlobalMap) {
+            match pattern {
+                MacroPattern::Syntax(name, bound) => *bound = globals.actually_contains(name),
+                MacroPattern::Many(pattern) | MacroPattern::Rest(pattern) => bind(pattern, globals),
+                MacroPattern::Nested(patterns, _) => {
+                    for pattern in &mut patterns.args {
+                        bind(pattern, globals);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for case in &mut self.cases {
+            for pattern in &mut case.args.args {
+                bind(pattern, globals);
+            }
+        }
+    }
+
     pub fn parse_from_ast_macro(mut ast_macro: Box<Macro>) -> Result<Self> {
         // HACK: Parse the token as a specific kind of identifier
         if let Some(ident) = ast_macro.name.atom_syntax_object_mut() {
@@ -614,13 +634,7 @@ impl MacroCase {
 pub enum MacroPattern {
     Rest(Box<MacroPattern>),
     Single(InternedString),
-    // TODO: We need to encode
-    // the global offset, or at least something
-    // related to the scope identifier for this
-    // value such that we can do more macro things.
-    //
-    // This is so that we can see if something has
-    // already been bound.
+    // Whether the literal has a definition-site runtime global binding.
     Syntax(InternedString, bool),
     Many(Box<MacroPattern>),
     Nested(PatternList, bool),
@@ -1095,12 +1109,15 @@ fn match_single_pattern(
         MacroPattern::Many(_) => unreachable!(),
         MacroPattern::Rest(_) => unreachable!(),
         MacroPattern::Single(_) => true,
-        MacroPattern::Syntax(v, _) => match expr {
+        MacroPattern::Syntax(v, bound) => match expr {
             ExprKind::Atom(atom) if atom.ident().is_some() => {
                 let name = atom.ident().unwrap();
+                // Pending program globals share the definition's binding; module locals do not.
                 literal_name(&atom.syn) == Some(*v)
                     && (atom.syn.global_reference
-                        || !in_scope.contains(name) && !globals.contains(name))
+                        || !in_scope.contains(name)
+                            && (!globals.contains(name)
+                                || *bound && matches!(globals, GlobalMap::Layered(..))))
             }
             ExprKind::Atom(Atom {
                 syn:

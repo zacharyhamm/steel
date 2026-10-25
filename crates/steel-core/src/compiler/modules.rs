@@ -2057,25 +2057,10 @@ fn imported_bindings(
     macros: &FxHashMap<InternedString, SteelMacro>,
     mut define: impl FnMut(InternedString, Option<&SteelMacro>),
 ) {
-    let explicit_imports = require
-        .idents_to_import
-        .iter()
-        .map(|ident| {
-            let (from, to) = match ident {
-                MaybeRenamed::Normal(name) => (name, name),
-                MaybeRenamed::Renamed(from, to) => (from, to),
-            };
-            (
-                *from.atom_identifier().unwrap(),
-                *to.atom_identifier().unwrap(),
-            )
-        })
-        .collect::<FxHashMap<_, _>>();
-    for provide in provides
+    let provided = provides
         .iter()
         .flat_map(|expr| &expr.list().unwrap().args[1..])
-    {
-        let name = match provide {
+        .filter_map(|provide| match provide {
             ExprKind::Atom(_) => provide.atom_identifier(),
             ExprKind::List(list)
                 if list.first_ident() == Some(&*REQUIRE_IDENT_SPEC)
@@ -2084,23 +2069,31 @@ fn imported_bindings(
                 list.second_ident()
             }
             _ => None,
-        };
-        let Some(name) = name else {
-            continue;
-        };
-        let imported = if explicit_imports.is_empty() {
-            *name
-        } else {
-            let Some(imported) = explicit_imports.get(name) else {
-                continue;
-            };
-            *imported
-        };
+        });
+    let mut import = |from: &InternedString, to: &InternedString| {
         let imported = match &require.prefix {
-            Some(prefix) => (prefix.clone() + imported.resolve()).into(),
-            None => imported,
+            Some(prefix) => (prefix.clone() + to.resolve()).into(),
+            None => *to,
         };
-        define(imported, macros.get(name));
+        define(imported, macros.get(from));
+    };
+    if require.idents_to_import.is_empty() {
+        for name in provided {
+            import(name, name);
+        }
+    } else {
+        let provided = provided.collect::<FxHashSet<_>>();
+        // Match compilation's import order: keep every alias, with later destinations winning.
+        for ident in &require.idents_to_import {
+            let (from, to) = match ident {
+                MaybeRenamed::Normal(name) => (name, name),
+                MaybeRenamed::Renamed(from, to) => (from, to),
+            };
+            let from = from.atom_identifier().unwrap();
+            if provided.contains(from) {
+                import(from, to.atom_identifier().unwrap());
+            }
+        }
     }
 }
 

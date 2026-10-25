@@ -10,7 +10,7 @@ use steel_parser::parser::SourceId;
 use steel_parser::tokens::NumberLiteral;
 
 use crate::compiler::modules::RequiredModuleMacros;
-use crate::compiler::passes::mangle::{collect_define_syntax, collect_defines};
+use crate::compiler::passes::mangle::{collect_define_syntax, collect_defines, collect_globals};
 use crate::compiler::program::{BEGIN, LAMBDA, LAMBDA_SYMBOL, LET, STRUCT_KEYWORD};
 use crate::parser::ast::ExprKind;
 use crate::parser::parser::SyntaxObject;
@@ -37,8 +37,10 @@ static REST_ARG: &str = "##%list-args";
 pub fn extract_macro_defs(
     exprs: &mut Vec<ExprKind>,
     macro_map: &mut FxHashMap<InternedString, SteelMacro>,
-    _global_map: &FxHashMap<InternedString, usize>,
+    global_map: &FxHashMap<InternedString, usize>,
 ) -> Result<()> {
+    let pending_globals = collect_globals(exprs);
+    let globals = GlobalMap::Layered(global_map, &pending_globals);
     let mut error = None;
 
     exprs.retain_mut(|expr| {
@@ -54,7 +56,8 @@ pub fn extract_macro_defs(
 
             if let ExprKind::Macro(m) = taken_expr {
                 match SteelMacro::parse_from_ast_macro(m) {
-                    Ok(generated_macro) => {
+                    Ok(mut generated_macro) => {
+                        generated_macro.bind_global_literals(globals);
                         let name = generated_macro.name();
                         macro_map.insert(*name, generated_macro);
                     }
@@ -541,20 +544,24 @@ impl<'a> Expander<'a> {
     }
 
     fn visit_body(&mut self, exprs: &mut [ExprKind]) -> Result<()> {
-        if self.module_globals.is_none() {
-            collect_defines(exprs, &mut |name| self.in_scope_values.define(name));
-            return exprs.iter_mut().try_for_each(|expr| self.visit(expr));
-        }
         // Bodies see later definitions, but statement heads retain their sequential scope.
         let mut heads = self.in_scope_values.clone();
         predeclare_native_definitions(
             exprs,
             &|name| heads.contains(name),
             self.globals,
-            &|name| self.map.contains_key(name),
+            &|name| {
+                self.map.contains_key(name)
+                    || self
+                        .deferred_macros
+                        .is_some_and(|macros| macros.contains(name))
+            },
             self.builtin_modules,
             &mut |name| self.in_scope_values.define(name),
         );
+        if self.module_globals.is_none() {
+            collect_defines(exprs, &mut |name| self.in_scope_values.define(name));
+        }
         self.visit_body_with_native_heads(exprs, &mut heads)
     }
 
@@ -565,7 +572,7 @@ impl<'a> Expander<'a> {
     ) -> Result<()> {
         let mut prepared = 0;
         for index in 0..exprs.len() {
-            if index >= prepared {
+            if self.module_globals.is_some() && index >= prepared {
                 let (_, count) =
                     lower_native_definitions(&mut exprs[index..], self.globals, heads, &|name| {
                         self.map.contains_key(name)
@@ -576,7 +583,29 @@ impl<'a> Expander<'a> {
                 });
             }
             self.visit_with_native_heads(&mut exprs[index], Some(heads))?;
-            resolve_template_bindings(exprs, index..index + 1);
+            if self.module_globals.is_some() {
+                resolve_template_bindings(exprs, index..index + 1);
+            } else {
+                // Ordinary expansion records native bindings without lowering ahead of macros.
+                let mut bindings = SmallVec::<[_; 4]>::new();
+                predeclare_native_definitions(
+                    &exprs[index..index + 1],
+                    &|name| heads.contains(name),
+                    self.globals,
+                    &|name| {
+                        self.map.contains_key(name)
+                            || self
+                                .deferred_macros
+                                .is_some_and(|macros| macros.contains(name))
+                    },
+                    self.builtin_modules,
+                    &mut |name| bindings.push(name),
+                );
+                for name in bindings {
+                    heads.define(name);
+                    self.in_scope_values.define(name);
+                }
+            }
             collect_defines(std::slice::from_ref(&exprs[index]), &mut |name| {
                 heads.define(name);
             });
@@ -678,21 +707,22 @@ impl<'a> Expander<'a> {
                             return self.visit_with_native_heads(expr, native_heads);
                         }
                     }
-                    if l.first().is_some_and(is_begin_head) {
-                        return match native_heads {
-                            Some(heads) => {
-                                self.visit_body_with_native_heads(&mut l.args[1..], heads)
-                            }
-                            None => self.visit_body(&mut l.args[1..]),
-                        };
-                    }
+                }
+                if l.first().is_some_and(is_begin_head) {
+                    return match native_heads {
+                        Some(heads) => self.visit_body_with_native_heads(&mut l.args[1..], heads),
+                        None => self.visit_body(&mut l.args[1..]),
+                    };
                 }
 
                 // Native binding lists are data; their lowering waits until macros are expanded.
                 if let Some(name) = l.first_ident().copied().filter(|name| {
                     matches!(name.resolve(), "struct" | "define-values")
                         && !self.map.contains_key(name)
-                        && !self.in_scope_values.contains(name)
+                        && !native_heads
+                            .as_deref()
+                            .unwrap_or(&self.in_scope_values)
+                            .contains(name)
                         && !self.globals.actually_contains(name)
                 }) {
                     if name.resolve() == "define-values" {
@@ -2885,6 +2915,34 @@ mod expansion_tests {
 
     fn ellipses() -> ExprKind {
         ExprKind::Atom(Atom::new(SyntaxObject::default(TokenType::Ellipses)))
+    }
+
+    #[test]
+    fn nested_macro_literals_preserve_definition_site_globals() {
+        let existing = FxHashMap::default();
+        let pending = ["tag".into()].into_iter().collect();
+        let globals = GlobalMap::Layered(&existing, &pending);
+        for (pattern, argument) in [
+            ("(tag)", "(tag)"),
+            ("#(tag)", "#(tag)"),
+            ("((tag) ...)", "((tag) (tag))"),
+            ("(value . tag)", "(0 . tag)"),
+        ] {
+            let mut ast = steel_parser::parser::Parser::parse(&format!(
+                "(define tag 0)
+                 (define-syntax classify
+                   (syntax-rules (tag) [(classify {pattern}) 1] [(classify other) 2]))
+                 (classify {argument})"
+            ))
+            .unwrap();
+            let mut macros = FxHashMap::default();
+            extract_macro_defs(&mut ast, &mut macros, &existing).unwrap();
+            for (scope, expected) in [(globals, "1"), (GlobalMap::Set(&pending), "2")] {
+                let mut expr = ast.last().unwrap().clone();
+                expand(&mut expr, &macros, scope).unwrap();
+                assert_eq!(expr.to_string(), expected, "{pattern}, {scope:?}");
+            }
+        }
     }
 
     #[test]
