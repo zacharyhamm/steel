@@ -11,7 +11,7 @@ use steel_parser::tokens::NumberLiteral;
 
 use crate::compiler::modules::RequiredModuleMacros;
 use crate::compiler::passes::mangle::{collect_define_syntax, collect_defines, collect_globals};
-use crate::compiler::program::{BEGIN, LAMBDA, LAMBDA_SYMBOL, LET, STRUCT_KEYWORD};
+use crate::compiler::program::{BEGIN, DEFINE_VALUES, LAMBDA, LAMBDA_SYMBOL, LET, STRUCT_KEYWORD};
 use crate::parser::ast::ExprKind;
 use crate::parser::parser::SyntaxObject;
 use crate::parser::rename_idents::{resolve_template_bindings, TemplateBindings};
@@ -176,6 +176,7 @@ pub fn expand_with_source_id(
         deferred_macros: None,
         top_level_only: false,
         native_struct_templates: true,
+        marked_native_heads: Vec::new(),
     };
 
     expander.visit(expr)
@@ -330,6 +331,8 @@ pub struct Expander<'a> {
     pub(crate) changed: bool,
     // We're going to actually check if the macro is in scope
     in_scope_values: ScopeSet<InternedString, FxBuildHasher>,
+    // Template-marked bindings of native heads that were put in scope.
+    marked_native_heads: Vec<InternedString>,
     source_id: Option<SourceId>,
     depth: usize,
 }
@@ -485,6 +488,7 @@ impl<'a> Expander<'a> {
             deferred_macros: None,
             top_level_only: false,
             native_struct_templates: true,
+            marked_native_heads: Vec::new(),
         }
     }
 
@@ -543,9 +547,28 @@ impl<'a> Expander<'a> {
         Some(bindings)
     }
 
+    // Outside a module, heads are only asked about native heads, so a body copies just those
+    // bindings instead of its whole scope.
+    fn native_heads_in_scope(&self) -> ScopeSet<InternedString, FxBuildHasher> {
+        let mut heads = ScopeSet::default();
+        for name in [*STRUCT_KEYWORD, *DEFINE_VALUES]
+            .iter()
+            .chain(&self.marked_native_heads)
+        {
+            if self.in_scope_values.contains(name) {
+                heads.define(*name);
+            }
+        }
+        heads
+    }
+
     fn visit_body(&mut self, exprs: &mut [ExprKind]) -> Result<()> {
         // Bodies see later definitions, but statement heads retain their sequential scope.
-        let mut heads = self.in_scope_values.clone();
+        let mut heads = if self.module_globals.is_some() {
+            self.in_scope_values.clone()
+        } else {
+            self.native_heads_in_scope()
+        };
         predeclare_native_definitions(
             exprs,
             &|name| heads.contains(name),
@@ -557,7 +580,12 @@ impl<'a> Expander<'a> {
                         .is_some_and(|macros| macros.contains(name))
             },
             self.builtin_modules,
-            &mut |name| self.in_scope_values.define(name),
+            &mut |name| {
+                if is_marked_native_head(name) {
+                    self.marked_native_heads.push(name);
+                }
+                self.in_scope_values.define(name)
+            },
         );
         if self.module_globals.is_none() {
             collect_defines(exprs, &mut |name| self.in_scope_values.define(name));
@@ -602,6 +630,9 @@ impl<'a> Expander<'a> {
                     &mut |name| bindings.push(name),
                 );
                 for name in bindings {
+                    if is_marked_native_head(name) {
+                        self.marked_native_heads.push(name);
+                    }
                     heads.define(name);
                     self.in_scope_values.define(name);
                 }
@@ -716,21 +747,15 @@ impl<'a> Expander<'a> {
                 }
 
                 // Native binding lists are data; their lowering waits until macros are expanded.
-                if let Some(name) = l.first_ident().copied().filter(|name| {
-                    matches!(name.resolve(), "struct" | "define-values")
-                        && !self.map.contains_key(name)
-                        && !native_heads
+                if let Some(producers) = native_form_expressions(l, |name| {
+                    self.map.contains_key(name)
+                        || native_heads
                             .as_deref()
                             .unwrap_or(&self.in_scope_values)
                             .contains(name)
-                        && !self.globals.actually_contains(name)
+                        || self.globals.actually_contains(name)
                 }) {
-                    if name.resolve() == "define-values" {
-                        for producer in l.args.iter_mut().skip(2) {
-                            self.visit(producer)?;
-                        }
-                    }
-                    return Ok(());
+                    return producers.iter_mut().try_for_each(|expr| self.visit(expr));
                 }
 
                 match l.first() {
@@ -1228,25 +1253,19 @@ impl<'a> VisitorMutRef for ExpanderMany<'a> {
                 });
 
                 // Native binding lists stay data until the native lowering pass.
-                if let Some(name) = l.first_ident().copied().filter(|name| {
-                    matches!(name.resolve(), "struct" | "define-values")
-                        && !self.map.contains_key(name)
-                        && !self
+                if let Some(producers) = native_form_expressions(l, |name| {
+                    self.map.contains_key(name)
+                        || self
                             .global_macro_map
                             .is_some_and(|map| map.contains_key(name))
-                        && !self
+                        || self
                             .overlays
                             .iter()
                             .any(|overlay| overlay.map.in_scope_macros.contains_key(name))
-                        && !self.in_scope_values.contains(name)
-                        && !self.globals.actually_contains(name)
+                        || self.in_scope_values.contains(name)
+                        || self.globals.actually_contains(name)
                 }) {
-                    if name.resolve() == "define-values" {
-                        for producer in l.args.iter_mut().skip(2) {
-                            self.visit(producer)?;
-                        }
-                    }
-                    return Ok(());
+                    return producers.iter_mut().try_for_each(|expr| self.visit(expr));
                 }
 
                 match l.first() {
@@ -2225,8 +2244,38 @@ fn lower_native_form(
     }
 }
 
+// The expressions of a list headed by a native `struct` or `define-values` that `is_shadowed`
+// does not shadow: only a `define-values` producer, since binding lists are data.
+fn native_form_expressions(
+    l: &mut List,
+    is_shadowed: impl FnOnce(&InternedString) -> bool,
+) -> Option<&mut [ExprKind]> {
+    let name = *l.first_ident()?;
+    if (name != *STRUCT_KEYWORD && name != *DEFINE_VALUES) || is_shadowed(&name) {
+        return None;
+    }
+    Some(if name == *DEFINE_VALUES {
+        l.args.get_mut(2..).unwrap_or_default()
+    } else {
+        &mut []
+    })
+}
+
+// Whether a binding is a template's marked binding of `struct` or `define-values`.
+pub(crate) fn is_marked_native_head(name: InternedString) -> bool {
+    name.resolve().strip_prefix("##").is_some_and(|marked| {
+        [STRUCT_KEYWORD.resolve(), DEFINE_VALUES.resolve()]
+            .into_iter()
+            .any(|head| {
+                marked
+                    .strip_prefix(head)
+                    .is_some_and(|mark| mark.starts_with('#'))
+            })
+    })
+}
+
 // Native bindings have not passed through hygienic renaming yet.
-fn native_binding_name(name: InternedString, syntax: &SyntaxObject) -> InternedString {
+pub(crate) fn native_binding_name(name: InternedString, syntax: &SyntaxObject) -> InternedString {
     if syntax.mark.is_template() {
         crate::compiler::passes::hygiene::marked_binding_name(name, syntax.mark)
     } else {

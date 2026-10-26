@@ -4,7 +4,7 @@ use smallvec::SmallVec;
 use thin_vec::ThinVec;
 
 use crate::compiler::passes::{VisitorMutControlFlow, VisitorMutRefUnit};
-use crate::compiler::program::{ELLIPSES_SYMBOL, STRUCT_KEYWORD, SYNTAX_SPAN};
+use crate::compiler::program::{DEFINE_VALUES, ELLIPSES_SYMBOL, STRUCT_KEYWORD, SYNTAX_SPAN};
 use crate::parser::expand_visitor::GlobalMap;
 use crate::parser::parser::{ExpansionMark, SyntaxObject};
 use crate::parser::span::Span;
@@ -677,7 +677,8 @@ impl<'a> VisitorMutRef for ReplaceExpressions<'a> {
                         && !a.syn.introduced_via_macro
                         && !self.globals.actually_contains(s)
                         // Native lowering resolves marked heads without capturing caller bindings.
-                        && !matches!(s.resolve(), "struct" | "define-values")
+                        && *s != *STRUCT_KEYWORD
+                        && *s != *DEFINE_VALUES
                     {
                         *s = ("##".to_string() + s.resolve()).into();
                     }

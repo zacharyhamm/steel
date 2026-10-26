@@ -1,6 +1,6 @@
-use crate::compiler::passes::VisitorMutRefUnit;
-use crate::compiler::program::{BEGIN, DEFINE, ELLIPSES_SYMBOL, IF, LAMBDA};
-use crate::parser::ast::{Atom, ExprKind, List, Macro, PatternPair, Vector};
+use crate::compiler::passes::{VisitorMutRefUnit, VisitorMutUnit};
+use crate::compiler::program::{BEGIN, DEFINE, ELLIPSES_SYMBOL, IF, LAMBDA, STRUCT_KEYWORD};
+use crate::parser::ast::{Atom, ExprKind, LambdaFunction, List, Macro, PatternPair, Vector};
 use crate::parser::expand_visitor::GlobalMap;
 use crate::parser::parser::{ExpansionMark, SyntaxObject};
 use crate::parser::rename_idents::RenameIdentifiersVisitor;
@@ -374,6 +374,33 @@ pub struct PatternListRef<'a> {
     improper: bool,
 }
 
+// Whether a template has a list headed by `struct`, the only form a native template keeps apart.
+struct HasStructForm(bool);
+
+impl HasStructForm {
+    fn find(template: &ExprKind) -> bool {
+        let mut found = HasStructForm(false);
+        found.visit(template);
+        found.0
+    }
+}
+
+impl VisitorMutUnit for HasStructForm {
+    fn visit_lambda_function(&mut self, lambda_function: &LambdaFunction) {
+        lambda_function.args.iter().for_each(|arg| self.visit(arg));
+        self.visit(&lambda_function.body);
+    }
+
+    fn visit_list(&mut self, l: &List) {
+        self.0 |= l.first_ident() == Some(&*STRUCT_KEYWORD);
+        l.args.iter().for_each(|expr| self.visit(expr));
+    }
+
+    fn visit_vector(&mut self, v: &Vector) {
+        v.args.iter().for_each(|expr| self.visit(expr));
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MacroCase {
     // TODO: Label this as an improper list
@@ -462,9 +489,12 @@ impl MacroCase {
         let template_parser = MacroTemplate::new(ctx.bindings);
         template_parser.verify(&body)?;
 
-        let mut native_struct_body = body.clone();
-        let has_native_struct = RenameIdentifiersVisitor::new(&args_str, special_forms)
-            .rename_native_struct_template(&mut native_struct_body);
+        let native_struct_body = HasStructForm::find(&body).then(|| {
+            let mut native_struct_body = body.clone();
+            RenameIdentifiersVisitor::new(&args_str, special_forms)
+                .rename_native_struct_template(&mut native_struct_body)
+                .then_some(native_struct_body)
+        });
         RenameIdentifiersVisitor::new(&args_str, special_forms).rename_identifiers(&mut body);
 
         args.iter_mut().for_each(|x| x.mangle(special_forms));
@@ -475,7 +505,7 @@ impl MacroCase {
         Ok(MacroCase {
             args: PatternList::new(args).with_improper(improper),
             body,
-            native_struct_body: has_native_struct.then_some(native_struct_body),
+            native_struct_body: native_struct_body.flatten(),
         })
     }
 

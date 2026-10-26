@@ -32,6 +32,9 @@ pub(crate) fn marked_binding_name(name: InternedString, mark: ExpansionMark) -> 
 #[derive(Default)]
 pub struct ResolveExpansionMarks {
     scope: Vec<Binder>,
+    // The indices in `scope` of each name's binders, innermost last. A top-level expansion binds
+    // every definition of a module, so lookups must not scan the whole scope.
+    by_name: FxHashMap<InternedString, Vec<usize>>,
     // How many of the binders in scope were introduced by a template
     template_binders: usize,
     next_id: usize,
@@ -72,6 +75,10 @@ impl ResolveExpansionMarks {
             self.template_binders += 1;
         }
 
+        self.by_name
+            .entry(*name)
+            .or_default()
+            .push(self.scope.len());
         self.scope.push(Binder {
             name: *name,
             mark,
@@ -90,11 +97,25 @@ impl ResolveExpansionMarks {
             if binder.mark.is_template() {
                 self.template_binders -= 1;
             }
+            // Every binder being removed is above those that remain, so its index is among the
+            // innermost ones for its name.
+            if let Some(indices) = self.by_name.get_mut(&binder.name) {
+                indices.pop();
+            }
         }
     }
 
+    // The binders of `name`, innermost first.
+    fn binders(&self, name: InternedString) -> impl Iterator<Item = &Binder> {
+        self.by_name
+            .get(&name)
+            .into_iter()
+            .flat_map(|indices| indices.iter().rev())
+            .map(|&index| &self.scope[index])
+    }
+
     fn innermost(&self, name: InternedString) -> Option<&Binder> {
-        self.scope.iter().rev().find(|b| b.name == name)
+        self.binders(name).next()
     }
 
     // Internal defines are in scope for the entire body they appear in
@@ -170,13 +191,12 @@ impl VisitorMutRefUnit for ResolveExpansionMarks {
         if mark == ExpansionMark::NONE {
             // The template binders between this reference and its binder have to be renamed
             if !self.renaming && self.template_binders > 0 {
-                for binder in self.scope.iter().rev().filter(|b| b.name == *name) {
-                    if !binder.mark.is_template() {
-                        break;
-                    }
-
-                    self.conflicts.insert(binder.id);
-                }
+                let conflicts = self
+                    .binders(*name)
+                    .take_while(|binder| binder.mark.is_template())
+                    .map(|binder| binder.id)
+                    .collect::<Vec<_>>();
+                self.conflicts.extend(conflicts);
             }
 
             return;
@@ -185,10 +205,7 @@ impl VisitorMutRefUnit for ResolveExpansionMarks {
         let by_mark = if mark == ExpansionMark::UNKNOWN {
             None
         } else {
-            self.scope
-                .iter()
-                .rev()
-                .find(|b| b.name == *name && b.mark == mark)
+            self.binders(*name).find(|b| b.mark == mark)
         };
 
         if !self.renaming {
