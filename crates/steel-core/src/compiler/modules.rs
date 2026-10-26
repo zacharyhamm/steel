@@ -880,7 +880,7 @@ impl ModuleManager {
                 } else {
                     GlobalMap::Map(global_map)
                 };
-                let (found_in_scope, _) = expand_with_literal_globals(
+                let (found_in_scope, expanded) = expand_with_literal_globals(
                     expr,
                     global_macro_map,
                     globals,
@@ -893,7 +893,8 @@ impl ModuleManager {
                 refresh_literals = false;
 
                 let mut changed = false;
-                if let Some(previous_bindings) = previous_bindings {
+                // An unchanged statement's bindings and definitions are already recorded.
+                if let Some(previous_bindings) = previous_bindings.filter(|_| expanded) {
                     let bindings = collect_main_literal_bindings(
                         std::slice::from_ref(expr),
                         global_map,

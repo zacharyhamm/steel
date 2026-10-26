@@ -47,8 +47,7 @@ impl ResolveExpansionMarks {
     pub fn resolve(expr: &mut ExprKind) {
         let mut pass = Self::default();
 
-        pass.bind_internal_defines(expr);
-        pass.visit(expr);
+        pass.visit_body(expr);
         pass.exit_scope(0);
 
         if pass.conflicts.is_empty() {
@@ -57,8 +56,7 @@ impl ResolveExpansionMarks {
 
         pass.renaming = true;
         pass.next_id = 0;
-        pass.bind_internal_defines(expr);
-        pass.visit(expr);
+        pass.visit_body(expr);
     }
 
     fn bind(&mut self, syn: &mut SyntaxObject) {
@@ -120,7 +118,26 @@ impl ResolveExpansionMarks {
 
     // Internal defines are in scope for the entire body they appear in
     fn visit_body(&mut self, body: &mut ExprKind) {
+        let start = self.scope.len();
         self.bind_internal_defines(body);
+        // One body can define a name from several expansions, such as a template's
+        // `define-values` binding beside its caller's. They are distinct variables, so the
+        // template binders are renamed even when no reference picks the wrong one.
+        if !self.renaming {
+            let conflicts = self.scope[start..]
+                .iter()
+                .filter(|binder| {
+                    binder.mark.is_template()
+                        && self.by_name[&binder.name]
+                            .iter()
+                            .rev()
+                            .take_while(|&&index| index >= start)
+                            .any(|&index| self.scope[index].mark != binder.mark)
+                })
+                .map(|binder| binder.id)
+                .collect::<Vec<_>>();
+            self.conflicts.extend(conflicts);
+        }
         self.visit(body);
     }
 

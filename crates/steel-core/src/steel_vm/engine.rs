@@ -7851,6 +7851,36 @@ fn raw_engine_native_bindings_preserve_expansion_identity() {
 }
 
 #[test]
+fn raw_engine_native_bindings_distinguish_same_body_definitions() {
+    let macros = "(define-syntax m (syntax-rules () [(m out) (define-values (tmp out) '(1 42))]))";
+    for scope in ["main", "module"] {
+        for body in [
+            "(m tmp) (define answer tmp)",
+            "(begin (m tmp) (define answer tmp))",
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            let source = if scope == "main" {
+                format!("{macros} {body} answer")
+            } else {
+                engine.register_steel_module(
+                    "same-body-definitions".into(),
+                    format!("{macros} (provide answer) {body}"),
+                );
+                "(require \"same-body-definitions\") answer".to_owned()
+            };
+            assert_eq!(
+                engine
+                    .run(source)
+                    .unwrap_or_else(|error| panic!("{scope}, {body}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{scope}, {body}"
+            );
+        }
+    }
+}
+
+#[test]
 fn raw_engine_native_template_heads_escape_caller_bindings() {
     for (name, body) in [
         ("define-values", "(define-values (x) 42) x"),
