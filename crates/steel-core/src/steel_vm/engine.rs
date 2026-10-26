@@ -7881,6 +7881,41 @@ fn raw_engine_native_bindings_distinguish_same_body_definitions() {
 }
 
 #[test]
+fn raw_engine_top_level_template_bindings_resolve_by_name() {
+    // Top-level template definitions resolve the same way in one statement, across statements,
+    // and in a module, where the module body and its provides are a single expansion.
+    let macros = "(define-syntax make-value (syntax-rules () [(_) (define-values (value) 42)]))
+                  (define-syntax make-point (syntax-rules () [(_) (struct point (x))]))";
+    for body in [
+        "(make-value) (define answer value)",
+        "(begin (make-value) (define answer value))",
+        "(make-point) (define answer (point-x (point 42)))",
+        "(begin (make-point) (define answer (point-x (point 42))))",
+    ] {
+        for scope in ["main", "module"] {
+            let mut engine = Engine::new_raw_no_kernel();
+            let source = if scope == "main" {
+                format!("{macros} {body} answer")
+            } else {
+                engine.register_steel_module(
+                    "top-level-template-bindings".into(),
+                    format!("{macros} (provide answer) {body}"),
+                );
+                "(require \"top-level-template-bindings\") answer".to_owned()
+            };
+            assert_eq!(
+                engine
+                    .run(source)
+                    .unwrap_or_else(|error| panic!("{scope}, {body}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{scope}, {body}"
+            );
+        }
+    }
+}
+
+#[test]
 fn raw_engine_native_template_heads_escape_caller_bindings() {
     for (name, body) in [
         ("define-values", "(define-values (x) 42) x"),
@@ -7980,4 +8015,40 @@ fn raw_engine_define_values_preserves_definitions_and_module_exports() {
     engine.run("(require \"fresh-values\")").unwrap();
     assert_eq!(engine.run("left").unwrap()[0], SteelVal::IntV(10));
     assert_eq!(engine.run("right").unwrap()[0], SteelVal::IntV(11));
+}
+
+#[test]
+fn raw_engine_top_level_begin_result_count() {
+    // Each top-level statement produces one result, however its nested begins are expanded.
+    let two = "(define-syntax two (syntax-rules () [(_) (begin 1 2)]))";
+    for require in ["", "(require \"begin-results\")"] {
+        for (body, count, last) in [
+            ("(begin 1 2)", 1, 2),
+            ("(begin (define x 1) x 3)", 1, 3),
+            ("(begin (begin 1 2) 3) 4", 2, 4),
+            ("(two)", 1, 2),
+            ("(begin (two) 3) (two)", 2, 2),
+            ("(begin (define a 1) (define-values (b) a)) b", 2, 1),
+        ] {
+            let mut engine = Engine::new_raw_no_kernel();
+            engine.register_steel_module(
+                "begin-results".into(),
+                "(provide one) (define one 1)".into(),
+            );
+            engine.run(two).unwrap();
+            let source = format!("{require} {body}");
+            let results = engine
+                .run(source.clone())
+                .unwrap_or_else(|error| panic!("{source}: {error}"));
+            // A require also returns the results of the module statements it compiles.
+            let mut fresh = Engine::new_raw_no_kernel();
+            fresh.register_steel_module(
+                "begin-results".into(),
+                "(provide one) (define one 1)".into(),
+            );
+            let required = fresh.run(require).unwrap().len();
+            assert_eq!(results.len(), required + count, "{source}");
+            assert_eq!(results.last(), Some(&SteelVal::IntV(last)), "{source}");
+        }
+    }
 }

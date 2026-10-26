@@ -432,7 +432,7 @@ impl ModuleManager {
                     &mut exclusions,
                     &mut imported_macros,
                 )?;
-                flatten_module_begins(&mut module_builder.source_ast)?;
+                let shapes = flatten_main_begins(&mut module_builder.source_ast)?;
                 // Keep these expansions: required modules must see the bindings they introduce.
                 for index in 0..module_builder.source_ast.len() {
                     if refresh_literals {
@@ -495,6 +495,7 @@ impl ModuleManager {
                         );
                     }
                 }
+                regroup_main_begins(&mut module_builder.source_ast, shapes);
             }
             if refresh_literals {
                 literal_globals = refresh_main_literals(
@@ -838,9 +839,12 @@ impl ModuleManager {
         // Include the defines from the modules now imported
         module_statements.append(&mut require_defines);
 
-        if no_kernel {
-            flatten_module_begins(&mut ast)?;
-        }
+        let main_start = module_statements.len();
+        let shapes = if no_kernel {
+            Some(flatten_main_begins(&mut ast)?)
+        } else {
+            None
+        };
         module_statements.append(&mut ast);
 
         let mut refresh_literals = true;
@@ -940,6 +944,11 @@ impl ModuleManager {
                 &builtin_modules,
             );
         }
+        if let Some(shapes) = shapes {
+            let mut main_statements = module_statements.split_off(main_start);
+            regroup_main_begins(&mut main_statements, shapes);
+            module_statements.append(&mut main_statements);
+        }
         Ok((module_statements, compiled_module_count))
     }
 
@@ -1021,51 +1030,18 @@ impl ModuleManager {
         // do this for each of the expressions in the file in this loop
         // TODO -> try not cloning this
         // TODO -> do this in the module expansion as well
-        let exported_macros = module
-            .provides_for_syntax
-            .iter()
-            // Chain with just the normal provides!
-            .chain(module.provides.iter().flat_map(|x| {
-                x.list().unwrap().args[1..]
-                    .iter()
-                    .filter_map(|x| x.atom_identifier())
-            }))
-            .filter_map(|x| {
-                let smacro = module.macro_map.get(x);
-                if let Some(smacro) = smacro {
-                    Some((*x, smacro.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect::<FxHashMap<_, _>>();
-
         let mut in_scope_macros = FxHashMap::default();
-        let mut import = |from: &InternedString, to: &InternedString| {
-            if let Some(smacro) = exported_macros.get(from) {
-                let name = match &require_object.prefix {
-                    Some(prefix) => (prefix.clone() + to.resolve()).into(),
-                    None => *to,
-                };
-                in_scope_macros.insert(name, smacro.clone());
-            }
-        };
-        if require_object.idents_to_import.is_empty() {
-            for name in exported_macros.keys() {
-                import(name, name);
-            }
-        } else {
-            for ident in &require_object.idents_to_import {
-                let (from, to) = match ident {
-                    MaybeRenamed::Normal(name) => (name, name),
-                    MaybeRenamed::Renamed(from, to) => (from, to),
-                };
-                import(
-                    from.atom_identifier().unwrap(),
-                    to.atom_identifier().unwrap(),
-                );
-            }
-        }
+        imported_bindings(
+            require_object,
+            &module.provides,
+            &module.provides_for_syntax,
+            &module.macro_map,
+            |name, smacro| {
+                if let Some(smacro) = smacro {
+                    in_scope_macros.insert(name, smacro.clone());
+                }
+            },
+        );
 
         (module, in_scope_macros, name_mangler)
     }
@@ -2458,27 +2434,72 @@ fn prepare_native_heads(
     Ok(index + count)
 }
 
+// A flattened top-level begin: its emptied wrapper and the shapes of its children.
+enum BeginShape {
+    Leaf,
+    Group(ExprKind, Vec<BeginShape>),
+}
+
 // The deferred pass must process nested top-level begins in statement order too.
 fn flatten_module_begins(ast: &mut Vec<ExprKind>) -> Result<()> {
-    let mut pending = core::mem::take(ast);
-    pending.reverse();
-    while let Some(expr) = pending.pop() {
-        match expr {
-            ExprKind::Begin(begin) if !begin.exprs.is_empty() => {
-                pending.extend(begin.exprs.into_iter().rev());
+    flatten_main_begins(ast).map(drop)
+}
+
+// Main regroups afterwards with regroup_main_begins, since each statement returns one result.
+fn flatten_main_begins(ast: &mut Vec<ExprKind>) -> Result<Vec<BeginShape>> {
+    fn flatten(expr: ExprKind, leaves: &mut Vec<ExprKind>) -> Result<BeginShape> {
+        let (wrapper, children) = match expr {
+            ExprKind::Begin(mut begin) if !begin.exprs.is_empty() => {
+                let children = core::mem::take(&mut begin.exprs);
+                (ExprKind::Begin(begin), children)
             }
-            ExprKind::List(list) if list.len() > 1 && list.first().is_some_and(is_begin_head) => {
-                pending.extend(
-                    list.args_proper(TokenType::Begin)?
-                        .into_iter()
-                        .skip(1)
-                        .rev(),
-                );
+            ExprKind::List(mut list)
+                if list.len() > 1 && list.first().is_some_and(is_begin_head) =>
+            {
+                if list.improper {
+                    stop!(BadSyntax => "begin expression requires a proper list"; list.location);
+                }
+                let children = list.args.split_off(1).into_iter().collect();
+                (ExprKind::List(list), children)
             }
-            expr => ast.push(expr),
+            expr => {
+                leaves.push(expr);
+                return Ok(BeginShape::Leaf);
+            }
+        };
+        let children = children
+            .into_iter()
+            .map(|child| flatten(child, leaves))
+            .collect::<Result<_>>()?;
+        Ok(BeginShape::Group(wrapper, children))
+    }
+
+    let exprs = core::mem::take(ast);
+    exprs.into_iter().map(|expr| flatten(expr, ast)).collect()
+}
+
+fn regroup_main_begins(ast: &mut Vec<ExprKind>, shapes: Vec<BeginShape>) {
+    fn regroup(shape: BeginShape, leaves: &mut std::vec::IntoIter<ExprKind>) -> ExprKind {
+        match shape {
+            BeginShape::Leaf => leaves.next().expect("flattened statement count changed"),
+            BeginShape::Group(mut wrapper, children) => {
+                let children = children.into_iter().map(|child| regroup(child, leaves));
+                match &mut wrapper {
+                    ExprKind::Begin(begin) => begin.exprs.extend(children),
+                    ExprKind::List(list) => list.args.extend(children),
+                    _ => unreachable!("begin wrappers are begins or lists"),
+                }
+                wrapper
+            }
         }
     }
-    Ok(())
+
+    let mut leaves = core::mem::take(ast).into_iter();
+    *ast = shapes
+        .into_iter()
+        .map(|shape| regroup(shape, &mut leaves))
+        .collect();
+    debug_assert!(leaves.next().is_none(), "flattened statement count changed");
 }
 
 impl<'a> ModuleBuilder<'a> {
@@ -3970,6 +3991,9 @@ impl<'a> ModuleBuilder<'a> {
                         for remaining in &l.args[2..] {
                             match remaining {
                                 ExprKind::Atom(_) => {
+                                    if remaining.atom_identifier().is_none() {
+                                        stop!(BadSyntax => "only-in expected an identifier to import"; remaining.span());
+                                    }
                                     require_object
                                         .idents_to_import
                                         .push(MaybeRenamed::Normal(remaining.clone()));

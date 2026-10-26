@@ -22,6 +22,9 @@ struct Binder {
     name: InternedString,
     mark: ExpansionMark,
     id: usize,
+    // Top-level definitions stay globals that references resolve by name, as they do across
+    // top-level statements; only a same-body binder with another mark forces a rename.
+    top_level: bool,
 }
 
 // The name a template binder takes when resolving it by name would pick another binder.
@@ -41,13 +44,14 @@ pub struct ResolveExpansionMarks {
     conflicts: FxHashSet<usize>,
     renamed: FxHashMap<usize, InternedString>,
     renaming: bool,
+    binding_top_level: bool,
 }
 
 impl ResolveExpansionMarks {
     pub fn resolve(expr: &mut ExprKind) {
         let mut pass = Self::default();
 
-        pass.visit_body(expr);
+        pass.visit_body_binding(expr, true);
         pass.exit_scope(0);
 
         if pass.conflicts.is_empty() {
@@ -56,7 +60,7 @@ impl ResolveExpansionMarks {
 
         pass.renaming = true;
         pass.next_id = 0;
-        pass.visit_body(expr);
+        pass.visit_body_binding(expr, true);
     }
 
     fn bind(&mut self, syn: &mut SyntaxObject) {
@@ -81,6 +85,7 @@ impl ResolveExpansionMarks {
             name: *name,
             mark,
             id,
+            top_level: self.binding_top_level,
         });
 
         if self.renaming && self.conflicts.contains(&id) {
@@ -118,8 +123,14 @@ impl ResolveExpansionMarks {
 
     // Internal defines are in scope for the entire body they appear in
     fn visit_body(&mut self, body: &mut ExprKind) {
+        self.visit_body_binding(body, false);
+    }
+
+    fn visit_body_binding(&mut self, body: &mut ExprKind, top_level: bool) {
         let start = self.scope.len();
+        self.binding_top_level = top_level;
         self.bind_internal_defines(body);
+        self.binding_top_level = false;
         // One body can define a name from several expansions, such as a template's
         // `define-values` binding beside its caller's. They are distinct variables, so the
         // template binders are renamed even when no reference picks the wrong one.
@@ -210,7 +221,7 @@ impl VisitorMutRefUnit for ResolveExpansionMarks {
             if !self.renaming && self.template_binders > 0 {
                 let conflicts = self
                     .binders(*name)
-                    .take_while(|binder| binder.mark.is_template())
+                    .take_while(|binder| binder.mark.is_template() && !binder.top_level)
                     .map(|binder| binder.id)
                     .collect::<Vec<_>>();
                 self.conflicts.extend(conflicts);

@@ -176,7 +176,7 @@ pub fn expand_with_source_id(
         deferred_macros: None,
         top_level_only: false,
         native_struct_templates: true,
-        marked_native_heads: Vec::new(),
+        marked_native_heads: FxHashSet::default(),
     };
 
     expander.visit(expr)
@@ -332,7 +332,7 @@ pub struct Expander<'a> {
     // We're going to actually check if the macro is in scope
     in_scope_values: ScopeSet<InternedString, FxBuildHasher>,
     // Template-marked bindings of native heads that were put in scope.
-    marked_native_heads: Vec<InternedString>,
+    marked_native_heads: FxHashSet<InternedString>,
     source_id: Option<SourceId>,
     depth: usize,
 }
@@ -488,7 +488,7 @@ impl<'a> Expander<'a> {
             deferred_macros: None,
             top_level_only: false,
             native_struct_templates: true,
-            marked_native_heads: Vec::new(),
+            marked_native_heads: FxHashSet::default(),
         }
     }
 
@@ -582,7 +582,7 @@ impl<'a> Expander<'a> {
             self.builtin_modules,
             &mut |name| {
                 if is_marked_native_head(name) {
-                    self.marked_native_heads.push(name);
+                    self.marked_native_heads.insert(name);
                 }
                 self.in_scope_values.define(name)
             },
@@ -631,7 +631,7 @@ impl<'a> Expander<'a> {
                 );
                 for name in bindings {
                     if is_marked_native_head(name) {
-                        self.marked_native_heads.push(name);
+                        self.marked_native_heads.insert(name);
                     }
                     heads.define(name);
                     self.in_scope_values.define(name);
