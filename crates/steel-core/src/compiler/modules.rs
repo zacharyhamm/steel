@@ -2337,7 +2337,7 @@ fn update_main_literals(
     let mut changed = false;
     for name in bindings.difference(previous_bindings) {
         refresh |=
-            native_heads_shadowed && !definitions.contains(name) || shadows_native_head(*name);
+            (native_heads_shadowed && !definitions.contains(name)) || shadows_native_head(*name);
         changed |= literal_globals.insert(*name);
     }
     collect_defines(std::slice::from_ref(statement), &mut |name| {
@@ -2395,13 +2395,13 @@ fn raw_engine_native_definitions_do_not_refresh_main_literals() {
             ("(make-struct point{})", "(point0-x (point0 42))"),
             ("(make-values value{})", "value0"),
         ] {
-            let refresh_counts = [1, 32].map(|count| {
+            let refresh_counts = [1, 32].map(|definition_count| {
                 let mut engine = Engine::new_raw_no_kernel();
                 engine.register_steel_module(
                     "unused-module".into(),
                     "(provide unused) (define unused 0)".into(),
                 );
-                let definitions = (0..count)
+                let definitions = (0..definition_count)
                     .map(|index| definition.replace("{}", &index.to_string()))
                     .collect::<Vec<_>>()
                     .join("\n");
