@@ -392,6 +392,8 @@ impl ModuleManager {
         let no_kernel = kernel.is_none();
         let mut pending_globals = collect_globals(&exprs);
         let mut literal_globals = pending_globals.clone();
+        // Whether a known binding shadows a native head; set by every literal refresh.
+        let mut native_heads_shadowed = true;
         // Without a kernel, main's expansion updates the global macros while modules compile
         // against them, so required modules see a snapshot. Without requires, none compile.
         let no_macros = FxHashMap::default();
@@ -445,6 +447,7 @@ impl ModuleManager {
                             &imported_macros,
                             &builtin_modules,
                         );
+                        native_heads_shadowed = shadows_any_native_head(&literal_globals);
                     }
                     let mut expander = Expander::new(
                         global_macro_map,
@@ -478,6 +481,7 @@ impl ModuleManager {
                         expr,
                         &previous_bindings,
                         &bindings,
+                        native_heads_shadowed,
                         &mut pending_globals,
                         &mut literal_globals,
                     );
@@ -749,8 +753,8 @@ impl ModuleManager {
             // dbg!(&kernel_macros_in_scope);
 
             let module_name = module.name.to_str().unwrap().to_string();
-            let mut native_globals = name_mangler.globals.clone();
-            native_globals.extend(pending_globals.iter().copied());
+            // Built on the first expansion that needs it, since most requires expand nothing.
+            let mut native_globals: Option<FxHashSet<InternedString>> = None;
 
             if let Some(kernel) = kernel.as_mut() {
                 if kernel.exported_defmacros(&module_name).is_some() {
@@ -814,13 +818,23 @@ impl ModuleManager {
                         ModuleContainer::default(),
                         &module_name,
                         if no_kernel {
-                            GlobalMap::Layered(global_map, &native_globals)
+                            GlobalMap::Layered(
+                                global_map,
+                                native_globals.get_or_insert_with(|| {
+                                    let mut globals = name_mangler.globals.clone();
+                                    globals.extend(pending_globals.iter().copied());
+                                    globals
+                                }),
+                            )
                         } else {
                             GlobalMap::Set(&name_mangler.globals)
                         },
                     )?;
 
-                    if changed {
+                    // Without a kernel, `changed` only reports native lowering of main's own
+                    // forms, and imported templates are already mangled, so mangling here would
+                    // capture main's references to the provider's private names.
+                    if changed && !no_kernel {
                         name_mangler.visit(expr);
                     }
                 }
@@ -868,6 +882,7 @@ impl ModuleManager {
                         &FxHashSet::default(),
                         &builtin_modules,
                     );
+                    native_heads_shadowed = shadows_any_native_head(&literal_globals);
                 }
                 let expr = &mut module_statements[index];
                 let previous_bindings = no_kernel.then(|| {
@@ -910,6 +925,7 @@ impl ModuleManager {
                         expr,
                         &previous_bindings,
                         &bindings,
+                        native_heads_shadowed,
                         &mut pending_globals,
                         &mut literal_globals,
                     );
@@ -2292,13 +2308,22 @@ fn shadows_native_head(name: InternedString) -> bool {
     name == *STRUCT_KEYWORD || name == *DEFINE_VALUES || is_marked_native_head(name)
 }
 
+fn shadows_any_native_head(literal_globals: &FxHashSet<InternedString>) -> bool {
+    literal_globals
+        .iter()
+        .any(|name| shadows_native_head(*name))
+}
+
 // Merge a statement's expansion into the literal bindings. Return whether they must instead be
 // rebuilt from the whole program, and whether they changed. Plain definitions bind the same names
-// in any context, so only native forms, or names that can shadow native heads, need a rebuild.
+// in any context, so only names that can shadow native heads need a rebuild. A native form's
+// bindings depend on the earlier bindings of its head, which this statement alone sees only when
+// `native_heads_shadowed` says that no known binding shadows a native head.
 fn update_main_literals(
     statement: &ExprKind,
     previous_bindings: &FxHashSet<InternedString>,
     bindings: &FxHashSet<InternedString>,
+    native_heads_shadowed: bool,
     pending_globals: &mut FxHashSet<InternedString>,
     literal_globals: &mut FxHashSet<InternedString>,
 ) -> (bool, bool) {
@@ -2311,7 +2336,8 @@ fn update_main_literals(
         .any(|name| !bindings.contains(name));
     let mut changed = false;
     for name in bindings.difference(previous_bindings) {
-        refresh |= !definitions.contains(name) || shadows_native_head(*name);
+        refresh |=
+            native_heads_shadowed && !definitions.contains(name) || shadows_native_head(*name);
         changed |= literal_globals.insert(*name);
     }
     collect_defines(std::slice::from_ref(statement), &mut |name| {
@@ -2349,6 +2375,52 @@ fn raw_engine_binding_free_expansions_do_not_refresh_main_literals() {
             MAIN_LITERAL_REFRESH_COUNT.with(|count| count.get())
         });
         assert_eq!(refresh_counts[0], refresh_counts[1], "{require}");
+    }
+}
+
+#[test]
+fn raw_engine_native_definitions_do_not_refresh_main_literals() {
+    use crate::{steel_vm::engine::Engine, SteelVal};
+
+    // A native form, written out or generated, binds the same names in any context unless a
+    // binding shadows its head. Each lowering also names its private temporary afresh, which is
+    // not a changed binding.
+    let macros = "(define-syntax make-struct (syntax-rules () [(_ name) (struct name (x))]))
+                  (define-syntax make-values
+                    (syntax-rules () [(_ name) (define-values (name) '(42))]))";
+    for require in ["", "(require \"unused-module\")"] {
+        for (definition, read) in [
+            ("(struct point{} (x))", "(point0-x (point0 42))"),
+            ("(define-values (value{}) '(42))", "value0"),
+            ("(make-struct point{})", "(point0-x (point0 42))"),
+            ("(make-values value{})", "value0"),
+        ] {
+            let refresh_counts = [1, 32].map(|count| {
+                let mut engine = Engine::new_raw_no_kernel();
+                engine.register_steel_module(
+                    "unused-module".into(),
+                    "(provide unused) (define unused 0)".into(),
+                );
+                let definitions = (0..count)
+                    .map(|index| definition.replace("{}", &index.to_string()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                MAIN_LITERAL_REFRESH_COUNT.with(|count| count.set(0));
+                assert_eq!(
+                    engine
+                        .run(format!("{require} {macros} {definitions} {read}"))
+                        .unwrap()
+                        .last(),
+                    Some(&SteelVal::IntV(42)),
+                    "{require}, {definition}"
+                );
+                MAIN_LITERAL_REFRESH_COUNT.with(|count| count.get())
+            });
+            assert_eq!(
+                refresh_counts[0], refresh_counts[1],
+                "{require}, {definition}"
+            );
+        }
     }
 }
 

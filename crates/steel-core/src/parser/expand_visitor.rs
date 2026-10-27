@@ -747,14 +747,17 @@ impl<'a> Expander<'a> {
                 }
 
                 // Native binding lists are data; their lowering waits until macros are expanded.
-                if let Some(producers) = native_form_expressions(l, |name| {
-                    self.map.contains_key(name)
-                        || native_heads
+                if let Some(producers) = native_form_expressions(
+                    l,
+                    |name| self.map.contains_key(name),
+                    self.globals,
+                    |name| {
+                        native_heads
                             .as_deref()
                             .unwrap_or(&self.in_scope_values)
                             .contains(name)
-                        || self.globals.actually_contains(name)
-                }) {
+                    },
+                ) {
                     return producers.iter_mut().try_for_each(|expr| self.visit(expr));
                 }
 
@@ -1253,18 +1256,21 @@ impl<'a> VisitorMutRef for ExpanderMany<'a> {
                 });
 
                 // Native binding lists stay data until the native lowering pass.
-                if let Some(producers) = native_form_expressions(l, |name| {
-                    self.map.contains_key(name)
-                        || self
-                            .global_macro_map
-                            .is_some_and(|map| map.contains_key(name))
-                        || self
-                            .overlays
-                            .iter()
-                            .any(|overlay| overlay.map.in_scope_macros.contains_key(name))
-                        || self.in_scope_values.contains(name)
-                        || self.globals.actually_contains(name)
-                }) {
+                if let Some(producers) = native_form_expressions(
+                    l,
+                    |name| {
+                        self.map.contains_key(name)
+                            || self
+                                .global_macro_map
+                                .is_some_and(|map| map.contains_key(name))
+                            || self
+                                .overlays
+                                .iter()
+                                .any(|overlay| overlay.map.in_scope_macros.contains_key(name))
+                    },
+                    self.globals,
+                    |name| self.in_scope_values.contains(name),
+                ) {
                     return producers.iter_mut().try_for_each(|expr| self.visit(expr));
                 }
 
@@ -2218,20 +2224,7 @@ fn lower_native_form(
     is_bound: impl Fn(&InternedString) -> bool,
 ) -> Result<Option<ExprKind>> {
     let head = list.first().and_then(ExprKind::atom_syntax_object);
-    let is_bound = |name| {
-        if head.is_some_and(|syntax| syntax.global_reference) {
-            // Global template heads resolve at their definition site, outside module bindings.
-            match globals {
-                GlobalMap::Map(_) | GlobalMap::Layered(_, _) => globals.actually_contains(name),
-                GlobalMap::Set(_) => false,
-                GlobalMap::Scoped(globals, _) => globals.actually_contains(name),
-            }
-        } else {
-            is_bound(&head.map_or(*name, |syntax| native_binding_name(*name, syntax)))
-                || (head.is_some_and(|syntax| !syntax.unresolved) && is_bound(name))
-                || globals.actually_contains(name)
-        }
-    };
+    let is_bound = |name| native_head_is_bound(head, name, globals, &is_bound);
     // Check the head's name before its bindings, since nearly every list is neither form.
     match list.first_ident() {
         Some(name) if name.resolve() == "define-values" && !is_bound(name) => {
@@ -2244,14 +2237,45 @@ fn lower_native_form(
     }
 }
 
-// The expressions of a list headed by a native `struct` or `define-values` that `is_shadowed`
-// does not shadow: only a `define-values` producer, since binding lists are data.
-fn native_form_expressions(
-    l: &mut List,
-    is_shadowed: impl FnOnce(&InternedString) -> bool,
-) -> Option<&mut [ExprKind]> {
+// Whether a binding shadows `name` as the native form headed by `head`.
+fn native_head_is_bound(
+    head: Option<&SyntaxObject>,
+    name: &InternedString,
+    globals: GlobalMap,
+    is_bound: impl Fn(&InternedString) -> bool,
+) -> bool {
+    if head.is_some_and(|syntax| syntax.global_reference) {
+        // Global template heads resolve at their definition site, outside module bindings.
+        match globals {
+            GlobalMap::Map(_) | GlobalMap::Layered(_, _) => globals.actually_contains(name),
+            GlobalMap::Set(_) => false,
+            GlobalMap::Scoped(globals, _) => globals.actually_contains(name),
+        }
+    } else {
+        is_bound(&head.map_or(*name, |syntax| native_binding_name(*name, syntax)))
+            || (head.is_some_and(|syntax| !syntax.unresolved) && is_bound(name))
+            || globals.actually_contains(name)
+    }
+}
+
+// The expressions of a list headed by a native `struct` or `define-values`, resolved as the
+// native lowering resolves it: only a `define-values` producer, since binding lists are data.
+fn native_form_expressions<'l>(
+    l: &'l mut List,
+    is_macro: impl FnOnce(&InternedString) -> bool,
+    globals: GlobalMap<'_>,
+    is_bound: impl Fn(&InternedString) -> bool,
+) -> Option<&'l mut [ExprKind]> {
     let name = *l.first_ident()?;
-    if (name != *STRUCT_KEYWORD && name != *DEFINE_VALUES) || is_shadowed(&name) {
+    if (name != *STRUCT_KEYWORD && name != *DEFINE_VALUES)
+        || is_macro(&name)
+        || native_head_is_bound(
+            l.first().and_then(ExprKind::atom_syntax_object),
+            &name,
+            globals,
+            is_bound,
+        )
+    {
         return None;
     }
     Some(if name == *DEFINE_VALUES {
@@ -2305,6 +2329,7 @@ pub(crate) fn predeclare_native_definitions(
         define: &mut impl FnMut(InternedString),
     ) {
         for expr in exprs {
+            let mut native = false;
             let lowered = match expr {
                 ExprKind::Begin(begin) => {
                     walk(
@@ -2336,15 +2361,22 @@ pub(crate) fn predeclare_native_definitions(
                         .and_then(|modules| expand_require_builtin(&list.args[1..], modules).ok())
                 }
                 ExprKind::List(list) => {
+                    native = true;
                     lower_native_form(list, globals, |name| is_head(name) || scope.contains(name))
                         .ok()
                         .flatten()
                 }
                 _ => None,
             };
+            // A native form first defines its private temporary, which every lowering names
+            // afresh, so it is not a binding that callers can compare or see.
+            let mut temporary = native && lowered.is_some();
             collect_define_syntax(
                 std::slice::from_ref(lowered.as_ref().unwrap_or(expr)),
                 &mut |name, syntax| {
+                    if core::mem::take(&mut temporary) {
+                        return;
+                    }
                     let name = native_binding_name(name, syntax);
                     scope.define(name);
                     define(name);

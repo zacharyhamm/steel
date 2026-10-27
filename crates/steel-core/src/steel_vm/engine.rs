@@ -7945,6 +7945,66 @@ fn raw_engine_native_template_heads_escape_caller_bindings() {
 }
 
 #[test]
+fn raw_engine_native_template_binding_lists_escape_caller_bindings() {
+    // The caller's binding doesn't shadow the template's native head, so its binding list stays
+    // data even when a name in it is also a macro.
+    for (name, body) in [
+        ("define-values", "(define-values (x) '(42)) x"),
+        ("struct", "(struct p (x)) (p-x (p 42))"),
+    ] {
+        let macros = format!(
+            "(define-syntax x (syntax-rules () [(x) 0]))
+             (define-syntax m (syntax-rules () [(m) (begin {body})]))"
+        );
+        let call = format!("(let (({name} #f)) (m))");
+        for scope in ["main", "module"] {
+            let mut engine = Engine::new_raw_no_kernel();
+            let source = if scope == "main" {
+                format!("{macros} {call}")
+            } else {
+                engine.register_steel_module(
+                    "caller-native-heads".into(),
+                    format!("{macros} (provide answer) (define answer {call})"),
+                );
+                "(require \"caller-native-heads\") answer".to_owned()
+            };
+            assert_eq!(
+                engine
+                    .run(source)
+                    .unwrap_or_else(|error| panic!("{scope}, {name}: {error}"))
+                    .last(),
+                Some(&SteelVal::IntV(42)),
+                "{scope}, {name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_engine_imported_macro_statements_keep_main_bindings_after_native_lowering() {
+    for native in ["(struct point (x))", "(define-values (x) '(0))"] {
+        let mut engine = Engine::new_raw_no_kernel();
+        engine.register_steel_module(
+            "private-helper".into(),
+            "(provide m) (define (helper) 0) (define-syntax m (syntax-rules () [(m) 1]))".into(),
+        );
+        assert_eq!(
+            engine
+                .run(format!(
+                    "(require \"private-helper\")
+                     (define (helper) 42)
+                     (define (run) {native} (m) (helper))
+                     (run)"
+                ))
+                .unwrap_or_else(|error| panic!("{native}: {error}"))
+                .last(),
+            Some(&SteelVal::IntV(42)),
+            "{native}"
+        );
+    }
+}
+
+#[test]
 fn raw_engine_define_values_has_fresh_bindings_and_private_helpers() {
     let mut engine = Engine::new_raw_no_kernel();
     engine.run("(define-values (a b) '(1 2)) (define-values (c) 3) (define-values () '()) (define-values () '())").unwrap();
